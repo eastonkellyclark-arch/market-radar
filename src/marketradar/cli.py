@@ -10,14 +10,39 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from datetime import date
+from pathlib import Path
 
 from marketradar import __version__
 
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_IMPLEMENTED = 2
+
+
+def load_dotenv(path: Path | None = None) -> int:
+    """Load .env into the environment if present. Never overrides a real var.
+
+    Kept deliberately tiny rather than taking a dependency: it reads one file
+    at the I/O boundary and does nothing clever. Existing environment values
+    win, so Actions secrets are never shadowed by a stray local file.
+    """
+    path = path or Path.cwd() / ".env"
+    if not path.is_file():
+        return 0
+    loaded = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name, value = name.strip(), value.strip().strip("\"'")
+        if name and name not in os.environ:
+            os.environ[name] = value
+            loaded += 1
+    return loaded
 
 
 def _iso_date(value: str) -> date:
@@ -119,9 +144,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "manifest":
         return _cmd_manifest()
 
+    if args.command == "selftest":
+        from marketradar import selftest
+
+        load_dotenv()
+        try:
+            return selftest.run(inject_staleness=args.inject_staleness)
+        except selftest.SelftestError as exc:
+            print(f"mr selftest: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
     pending = {
         "prices": "Weekend 1 (T9)",
-        "selftest": "Weekend 1 (T6)",
         "screens": "Weekend 2",
         "digest": "Weekend 2",
         "backfill": "Weekend 3",

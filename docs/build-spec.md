@@ -33,6 +33,14 @@ your source choices.
       to be listed-only (see §2), so this now tests Tiingo alone. If Tiingo's
       OTC coverage is thin, the sub-$1 bucket needs a different source and you
       want to know now. **Still open — blocks trusting the sub-$1 band.**
+- [ ] **Rotate the SAM.gov API key.** *Deferred 2026-09-06, deliberately.*
+      It was exposed in a tool transcript by an early version of
+      `scripts/scan_secrets.py`, which classified secrets by variable name
+      and printed anything it judged non-secret. The key is read-only access
+      to public federal contract data and is not used until Weekend 4, so the
+      rotation was deferred rather than skipped. **Rotate before
+      `sources/usaspending.py` is written.** Cloudflare R2 and Finnhub keys
+      exposed by the same bug were rotated on the day.
 - [ ] **State bulk files.** For your target states, check whether the
       Secretary of State publishes or sells bulk entity data, and whether UCC
       filings are available in bulk. Only write a scraper where no bulk option

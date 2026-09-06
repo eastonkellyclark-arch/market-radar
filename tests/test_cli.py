@@ -14,11 +14,26 @@ def test_every_planned_command_is_registered() -> None:
     assert EXPECTED_COMMANDS <= set(actions[0].choices)
 
 
-@pytest.mark.parametrize("command", sorted(EXPECTED_COMMANDS - {"manifest"}))
+# Implemented commands are excluded: `manifest` reads the real manifest, and
+# `selftest` publishes to R2 and GitHub for real. Neither belongs in a suite
+# that must run offline.
+IMPLEMENTED = {"manifest", "selftest"}
+
+
+@pytest.mark.parametrize("command", sorted(EXPECTED_COMMANDS - IMPLEMENTED))
 def test_unimplemented_commands_exit_non_zero(command: str, capsys) -> None:
     """Stubs must fail loudly, not silently do nothing."""
     assert main([command]) == EXIT_NOT_IMPLEMENTED
     assert "not implemented" in capsys.readouterr().err
+
+
+def test_selftest_is_wired_up_and_not_a_stub() -> None:
+    """Registered, flagged, and routed away from the not-implemented path."""
+    import inspect
+
+    from marketradar import cli
+
+    assert "selftest" not in inspect.getsource(cli.main).split("pending = ")[1]
 
 
 def test_bare_invocation_prints_help(capsys) -> None:

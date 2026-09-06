@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Final
 
 import duckdb
@@ -30,6 +31,11 @@ ENV_R2_ACCOUNT: Final[str] = "MR_R2_ACCOUNT_ID"
 ENV_R2_KEY_ID: Final[str] = "MR_R2_ACCESS_KEY_ID"
 ENV_R2_SECRET: Final[str] = "MR_R2_SECRET_ACCESS_KEY"
 ENV_PG_DSN: Final[str] = "MR_POSTGRES_DSN"
+
+# A value copied straight from .env.example is not a configured service.
+_PLACEHOLDER: Final[re.Pattern[str]] = re.compile(
+    r"dummy|example|changeme|your-|localhost", re.I
+)
 
 
 class StorageError(RuntimeError):
@@ -64,11 +70,30 @@ def connect(
         _configure_r2(con)
 
     if attach_postgres is None:
-        attach_postgres = bool(os.environ.get(ENV_PG_DSN))
-    if attach_postgres:
+        # Auto-detect. A placeholder DSN copied from .env.example counts as
+        # "not configured" — otherwise every fresh checkout tries to attach a
+        # database at localhost and dies before doing any work.
+        attach_postgres = postgres_configured()
+        if attach_postgres:
+            try:
+                _attach_postgres(con, read_only=read_only_pg)
+            except StorageError as exc:
+                # Auto-detected, so degrade rather than crash. Anything that
+                # genuinely needs Postgres checks postgres_attached() first.
+                log.warning("Postgres not attached: %s", exc)
+    elif attach_postgres:
+        # Explicitly requested: failing silently would hide a real problem.
         _attach_postgres(con, read_only=read_only_pg)
 
     return con
+
+
+def postgres_configured() -> bool:
+    """True when MR_POSTGRES_DSN holds something that looks real."""
+    dsn = os.environ.get(ENV_PG_DSN, "")
+    if not dsn:
+        return False
+    return not _PLACEHOLDER.search(dsn)
 
 
 def _enable_httpfs(con: duckdb.DuckDBPyConnection) -> None:
@@ -135,7 +160,12 @@ def _attach_postgres(con: duckdb.DuckDBPyConnection, *, read_only: bool) -> None
         con.execute("INSTALL postgres")
         con.execute("LOAD postgres")
         suffix = ", READ_ONLY" if read_only else ""
-        con.execute(f"ATTACH ? AS {PG_ALIAS} (TYPE postgres{suffix})", [dsn])
+        # ATTACH does not accept a bound parameter, so the DSN is inlined.
+        # Single quotes are doubled; a DSN cannot legally contain one, but
+        # building SQL by concatenation without escaping is how that stops
+        # being true.
+        escaped = dsn.replace("'", "''")
+        con.execute(f"ATTACH '{escaped}' AS {PG_ALIAS} (TYPE postgres{suffix})")
     except duckdb.Error as exc:
         raise StorageError(f"Could not attach Postgres as {PG_ALIAS}: {exc}") from exc
 

@@ -29,8 +29,19 @@ _LEAKY_ENV = (
 
 @pytest.fixture(autouse=True)
 def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Strip credentials, and stop the CLI from putting them back.
+
+    Clearing the environment is not enough on its own: ``mr`` calls
+    ``load_dotenv()``, which reads the developer's real ``.env`` off disk and
+    repopulates everything this fixture just removed. That let a CLI test
+    fire the real selftest at R2 and GitHub. Neutering the loader is what
+    actually makes "no network, no credentials" true.
+    """
+    from marketradar import cli
+
     for name in _LEAKY_ENV:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(cli, "load_dotenv", lambda path=None: 0)
     manifest.clear_cache()
 
 

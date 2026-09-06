@@ -4,6 +4,10 @@
 # The repo is public. A leaked key is public the instant it is pushed, and
 # rotating is the only real remedy — so the cheap check runs every time.
 #
+# This hook NEVER prints a matched value. It reports the file, the line
+# number, and the shape only. Printing the secret to catch the secret just
+# moves it into terminal scrollback and CI logs.
+#
 # Enabled by: git config core.hooksPath .githooks
 # Bypass (only when you are certain): git commit --no-verify
 
@@ -16,8 +20,21 @@ staged=$(git diff --cached --name-only --diff-filter=ACM)
 [ -z "$staged" ] && exit 0
 
 fail=0
-
 note() { printf "${RED}BLOCKED${RESET} %s\n" "$1" >&2; fail=1; }
+
+# Placeholders stay committable so .env.example and docs work.
+PLACEHOLDER='dummy|example|placeholder|changeme|your-|xxxx|<[a-z_]*>|\.\.\.'
+
+# Explicit, greppable escape hatch for a line that must look like a
+# credential to do its job — a test fixture asserting that a real-shaped DSN
+# is recognised as real, for instance. Preferred over loosening a rule,
+# because it stays visible in review:
+#     "postgresql://u:p@host/db"  # pragma: allowlist secret
+ALLOWLIST='pragma:[[:space:]]*allowlist[[:space:]]*secret'
+
+# Vendor prefixes must not match mid-identifier: "test_bare_invocation..."
+# contains "re_" and is not a Resend key.
+B='(^|[^A-Za-z0-9_])'
 
 # --- 1. files that must never be committed at all -------------------------
 for f in $staged; do
@@ -30,39 +47,72 @@ for f in $staged; do
   esac
 done
 
-# --- 2. credential-shaped content ----------------------------------------
-# Placeholders are allowed so .env.example and docs stay committable.
-PLACEHOLDER='dummy|example|placeholder|changeme|your-|xxxx|<[a-z_]*>|\.\.\.'
-
+# --- 2. known credential shapes ------------------------------------------
+# Reported by line number and label only; the value is never echoed.
 scan() {
   pattern="$1"; label="$2"
   for f in $staged; do
     case "$f" in .env.example) continue ;; esac
     [ -f "$f" ] || continue
-    # -e is required: some patterns start with "-" and would parse as flags.
-    hits=$(git show ":$f" 2>/dev/null \
+    lines=$(git show ":$f" 2>/dev/null \
       | grep -nEi -e "$pattern" \
       | grep -vEi -e "$PLACEHOLDER" \
-      | head -5)
-    if [ -n "$hits" ]; then
-      note "$f — possible $label:"
-      printf '%s\n' "$hits" | sed 's/^/        /' >&2
+      | grep -vEi -e "$ALLOWLIST" \
+      | cut -d: -f1 \
+      | head -5 | tr '\n' ' ')
+    if [ -n "$lines" ]; then
+      note "$f — possible $label at line(s): $lines"
     fi
   done
 }
 
-scan 'AKIA[0-9A-Z]{16}'                              'AWS access key id'
-scan '(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}'         'GitHub token'
-scan 'github_pat_[A-Za-z0-9_]{22,}'                  'GitHub fine-grained PAT'
-scan '-----BEGIN [A-Z ]*PRIVATE KEY-----'            'private key'
-scan 'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}'     'JWT / Supabase key'
+# generic
+scan 'AKIA[0-9A-Z]{16}'                               'AWS access key id'
+scan '(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}'          'GitHub token'
+scan 'github_pat_[A-Za-z0-9_]{22,}'                   'GitHub fine-grained PAT'
+scan '-----BEGIN [A-Z ]*PRIVATE KEY-----'             'private key'
+scan 'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}'      'JWT / Supabase key'
 scan 'postgres(ql)?://[^:[:space:]]+:[^@[:space:]]+@' 'Postgres DSN with password'
-scan 'https?://[^/[:space:]]*:[^@/[:space:]]+@'      'URL with embedded credentials'
-scan '(api[_-]?key|secret|password|passwd|token|access[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/+_-]{16,}' \
-     'hardcoded secret assignment'
-scan '[a-f0-9]{32}\.r2\.cloudflarestorage\.com'      'R2 account endpoint'
+scan 'https?://[^/[:space:]]*:[^@/[:space:]]+@'       'URL with embedded credentials'
+scan '[a-f0-9]{32}\.r2\.cloudflarestorage\.com'       'R2 account endpoint'
 
-# --- 3. warn on large files ----------------------------------------------
+# vendor prefixes used by this project, anchored so they cannot match
+# mid-identifier
+scan "${B}cfat_[A-Za-z0-9_]{20,}"                     'Cloudflare API token'
+scan "${B}re_[A-Za-z0-9]{15,}"                        'Resend API key'
+scan "${B}gsk_[A-Za-z0-9]{20,}"                       'Groq API key'
+scan "${B}csk-[A-Za-z0-9-]{20,}"                      'Cerebras API key'
+scan "${B}AIza[A-Za-z0-9_-]{30,}"                     'Google AI Studio key'
+scan "${B}SAM-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"    'SAM.gov API key'
+
+# --- 3. high-entropy value on ANY MR_* assignment -------------------------
+# The name can lie. MR_R2_ACCOUNT_ID once held a Cloudflare API token, and no
+# name-based rule would ever have caught it. This one ignores the variable
+# name entirely and judges the value: long, unbroken, mixed letters+digits,
+# not a placeholder. Values and variable names are both withheld from output.
+for f in $staged; do
+  case "$f" in .env.example) continue ;; esac
+  [ -f "$f" ] || continue
+  hits=$(git show ":$f" 2>/dev/null | awk '
+    /^[[:space:]]*#/ { next }
+    /pragma:[ \t]*allowlist[ \t]*secret/ { next }
+    /MR_[A-Z0-9_]+[[:space:]]*=/ {
+      eq = index($0, "=")
+      v  = substr($0, eq + 1)
+      gsub(/^[ \t"'"'"']+/, "", v); gsub(/[ \t"'"'"']+$/, "", v)
+      if (length(v) >= 20 \
+          && v ~ /^[A-Za-z0-9_+\/=.-]+$/ \
+          && v ~ /[0-9]/ && v ~ /[A-Za-z]/ \
+          && tolower(v) !~ /dummy|example|placeholder|changeme|your-/) {
+        printf "%d(%d chars) ", NR, length(v)
+      }
+    }')
+  if [ -n "$hits" ]; then
+    note "$f — high-entropy value on an MR_* assignment at line(s): $hits"
+  fi
+done
+
+# --- 4. warn on large files ----------------------------------------------
 for f in $staged; do
   [ -f "$f" ] || continue
   size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
@@ -76,6 +126,7 @@ if [ "$fail" -ne 0 ]; then
   cat >&2 <<'EOF'
 
 Commit blocked. This repo is public — a pushed secret is a leaked secret.
+Line numbers only are shown above; run `git diff --cached` to inspect.
 
 If this is a false positive, either reword the line or commit with
     git commit --no-verify
