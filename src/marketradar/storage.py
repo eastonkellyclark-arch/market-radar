@@ -1,0 +1,208 @@
+"""DuckDB session, Parquet-over-HTTP, and the optional Postgres attach.
+
+Everything reads through :func:`marketradar.manifest.get`. There is not a
+single literal data URL in this module, and there must never be one — a test
+in ``tests/test_repo_invariants.py`` enforces that for ``sources/``.
+
+Credentials and Postgres are both optional. A connection with neither is fully
+usable against local files, because local dev without Supabase is a hard
+requirement.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Final
+
+import duckdb
+
+from marketradar import manifest
+
+log = logging.getLogger(__name__)
+
+#: Alias the Supabase Postgres database is attached under.
+PG_ALIAS: Final[str] = "pg"
+
+# Environment variables. Real values live in Actions secrets or a local .env
+# that is never committed; see .env.example for the shape.
+ENV_R2_ACCOUNT: Final[str] = "MR_R2_ACCOUNT_ID"
+ENV_R2_KEY_ID: Final[str] = "MR_R2_ACCESS_KEY_ID"
+ENV_R2_SECRET: Final[str] = "MR_R2_SECRET_ACCESS_KEY"
+ENV_PG_DSN: Final[str] = "MR_POSTGRES_DSN"
+
+
+class StorageError(RuntimeError):
+    """Something went wrong setting up or using the query engine."""
+
+
+def connect(
+    *,
+    enable_http: bool = True,
+    attach_postgres: bool | None = None,
+    read_only_pg: bool = False,
+) -> duckdb.DuckDBPyConnection:
+    """Open a configured in-process DuckDB connection.
+
+    Args:
+        enable_http: load ``httpfs`` so remote Parquet can be range-read.
+            Set False in tests to keep the connection provably offline.
+        attach_postgres: attach Supabase under :data:`PG_ALIAS`. Default None
+            means "attach if ``MR_POSTGRES_DSN`` is set", so the same code
+            path works with and without a database.
+        read_only_pg: attach Postgres read-only.
+
+    Neither httpfs nor Postgres failing is fatal here. A missing extension
+    surfaces when a remote read is actually attempted, with DuckDB's own
+    error; a missing database surfaces via :func:`postgres_attached`. Failing
+    at connect time would make every offline unit test require a network.
+    """
+    con = duckdb.connect()
+
+    if enable_http:
+        _enable_httpfs(con)
+        _configure_r2(con)
+
+    if attach_postgres is None:
+        attach_postgres = bool(os.environ.get(ENV_PG_DSN))
+    if attach_postgres:
+        _attach_postgres(con, read_only=read_only_pg)
+
+    return con
+
+
+def _enable_httpfs(con: duckdb.DuckDBPyConnection) -> None:
+    """Load httpfs, installing it only if it is not already cached."""
+    try:
+        con.execute("LOAD httpfs")
+        return
+    except duckdb.Error:
+        pass  # not installed yet; try to fetch it
+
+    try:
+        con.execute("INSTALL httpfs")
+        con.execute("LOAD httpfs")
+    except duckdb.Error as exc:
+        log.warning(
+            "httpfs unavailable (%s). Local files still work; remote reads "
+            "will fail with DuckDB's own error when attempted.",
+            exc,
+        )
+
+
+def _configure_r2(con: duckdb.DuckDBPyConnection) -> None:
+    """Register an R2 secret when all three credentials are present.
+
+    DuckDB 1.5 supports ``TYPE r2`` natively and scopes it to ``r2://``, so a
+    manifest location of ``r2://bucket/key`` resolves without any further
+    configuration.
+    """
+    account = os.environ.get(ENV_R2_ACCOUNT)
+    key_id = os.environ.get(ENV_R2_KEY_ID)
+    secret = os.environ.get(ENV_R2_SECRET)
+
+    if not (account and key_id and secret):
+        missing = [
+            name
+            for name, value in (
+                (ENV_R2_ACCOUNT, account),
+                (ENV_R2_KEY_ID, key_id),
+                (ENV_R2_SECRET, secret),
+            )
+            if not value
+        ]
+        log.debug("R2 not configured; missing %s", ", ".join(missing))
+        return
+
+    try:
+        con.execute(
+            "CREATE OR REPLACE SECRET mr_r2 "
+            "(TYPE r2, KEY_ID ?, SECRET ?, ACCOUNT_ID ?)",
+            [key_id, secret, account],
+        )
+    except duckdb.Error as exc:  # pragma: no cover - needs real credentials
+        raise StorageError(f"Could not register R2 secret: {exc}") from exc
+
+
+def _attach_postgres(con: duckdb.DuckDBPyConnection, *, read_only: bool) -> None:
+    dsn = os.environ.get(ENV_PG_DSN)
+    if not dsn:
+        raise StorageError(
+            f"attach_postgres was requested but {ENV_PG_DSN} is not set."
+        )
+
+    try:
+        con.execute("INSTALL postgres")
+        con.execute("LOAD postgres")
+        suffix = ", READ_ONLY" if read_only else ""
+        con.execute(f"ATTACH ? AS {PG_ALIAS} (TYPE postgres{suffix})", [dsn])
+    except duckdb.Error as exc:
+        raise StorageError(f"Could not attach Postgres as {PG_ALIAS}: {exc}") from exc
+
+
+def postgres_attached(con: duckdb.DuckDBPyConnection) -> bool:
+    """True when Supabase is attached under :data:`PG_ALIAS`."""
+    try:
+        rows = con.execute(
+            "SELECT 1 FROM duckdb_databases() WHERE database_name = ?", [PG_ALIAS]
+        ).fetchall()
+    except duckdb.Error:
+        return False
+    return bool(rows)
+
+
+def read_dataset(
+    dataset: str,
+    partition: str,
+    con: duckdb.DuckDBPyConnection | None = None,
+) -> duckdb.DuckDBPyRelation:
+    """Resolve a dataset through the manifest and return it as a relation.
+
+    The only supported way to read project data. Raises
+    :class:`~marketradar.manifest.UnknownDatasetError` for anything the
+    manifest does not define.
+    """
+    ref = manifest.get(dataset, partition)
+    con = con if con is not None else connect()
+    return read_ref(ref, con)
+
+
+def read_ref(
+    ref: manifest.DatasetRef,
+    con: duckdb.DuckDBPyConnection | None = None,
+) -> duckdb.DuckDBPyRelation:
+    """Read an already-resolved :class:`~marketradar.manifest.DatasetRef`."""
+    con = con if con is not None else connect()
+
+    if ref.backend == "supabase":
+        raise StorageError(
+            f"{ref.dataset}/{ref.partition} lives in Postgres, not Parquet. "
+            f"Query {PG_ALIAS}.{ref.location} directly."
+        )
+
+    try:
+        return con.read_parquet(ref.location)
+    except duckdb.Error as exc:
+        raise StorageError(
+            f"Could not read {ref.dataset}/{ref.partition} from "
+            f"{ref.backend}: {exc}"
+        ) from exc
+
+
+def describe_connection(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
+    """What this connection can actually do. Used by ``mr manifest``."""
+    loaded = {
+        row[0]
+        for row in con.execute(
+            "SELECT extension_name FROM duckdb_extensions() WHERE loaded"
+        ).fetchall()
+    }
+    return {
+        "duckdb_version": duckdb.__version__,
+        "httpfs": "httpfs" in loaded,
+        "postgres": postgres_attached(con),
+        "r2_configured": all(
+            os.environ.get(name)
+            for name in (ENV_R2_ACCOUNT, ENV_R2_KEY_ID, ENV_R2_SECRET)
+        ),
+    }

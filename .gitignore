@@ -1,0 +1,49 @@
+# --- secrets: the repo is public ------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+service-account*.json
+
+# --- data files: never committed ------------------------------------------
+# Parquet goes to R2 or GitHub Releases via the manifest. The repo holds code
+# and SQL only. The one exception is small parser fixtures under
+# tests/fixtures/, which are force-added deliberately.
+*.zip
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.db
+*.sqlite
+*.csv
+*.txt.gz
+*.tsv
+data/
+!tests/fixtures/**
+
+# --- checkpoints and run state --------------------------------------------
+.checkpoints/
+*.checkpoint.json
+
+# --- python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- editors and os -------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

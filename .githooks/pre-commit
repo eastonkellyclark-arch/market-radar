@@ -1,0 +1,87 @@
+#!/bin/sh
+# Block commits that look like they contain a credential.
+#
+# The repo is public. A leaked key is public the instant it is pushed, and
+# rotating is the only real remedy — so the cheap check runs every time.
+#
+# Enabled by: git config core.hooksPath .githooks
+# Bypass (only when you are certain): git commit --no-verify
+
+set -u
+
+RED=''; YELLOW=''; RESET=''
+if [ -t 1 ]; then RED='\033[31m'; YELLOW='\033[33m'; RESET='\033[0m'; fi
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+fail=0
+
+note() { printf "${RED}BLOCKED${RESET} %s\n" "$1" >&2; fail=1; }
+
+# --- 1. files that must never be committed at all -------------------------
+for f in $staged; do
+  case "$f" in
+    .env.example) ;;
+    .env|.env.*|*.pem|*.key|*credentials.json|service-account*.json)
+      note "$f — this file must never be committed." ;;
+    *.zip|*.parquet|*.duckdb|*.db|*.sqlite)
+      note "$f — data files go to R2 or Releases via the manifest, not git." ;;
+  esac
+done
+
+# --- 2. credential-shaped content ----------------------------------------
+# Placeholders are allowed so .env.example and docs stay committable.
+PLACEHOLDER='dummy|example|placeholder|changeme|your-|xxxx|<[a-z_]*>|\.\.\.'
+
+scan() {
+  pattern="$1"; label="$2"
+  for f in $staged; do
+    case "$f" in .env.example) continue ;; esac
+    [ -f "$f" ] || continue
+    # -e is required: some patterns start with "-" and would parse as flags.
+    hits=$(git show ":$f" 2>/dev/null \
+      | grep -nEi -e "$pattern" \
+      | grep -vEi -e "$PLACEHOLDER" \
+      | head -5)
+    if [ -n "$hits" ]; then
+      note "$f — possible $label:"
+      printf '%s\n' "$hits" | sed 's/^/        /' >&2
+    fi
+  done
+}
+
+scan 'AKIA[0-9A-Z]{16}'                              'AWS access key id'
+scan '(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}'         'GitHub token'
+scan 'github_pat_[A-Za-z0-9_]{22,}'                  'GitHub fine-grained PAT'
+scan '-----BEGIN [A-Z ]*PRIVATE KEY-----'            'private key'
+scan 'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}'     'JWT / Supabase key'
+scan 'postgres(ql)?://[^:[:space:]]+:[^@[:space:]]+@' 'Postgres DSN with password'
+scan 'https?://[^/[:space:]]*:[^@/[:space:]]+@'      'URL with embedded credentials'
+scan '(api[_-]?key|secret|password|passwd|token|access[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/+_-]{16,}' \
+     'hardcoded secret assignment'
+scan '[a-f0-9]{32}\.r2\.cloudflarestorage\.com'      'R2 account endpoint'
+
+# --- 3. warn on large files ----------------------------------------------
+for f in $staged; do
+  [ -f "$f" ] || continue
+  size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+  if [ "$size" -gt 1048576 ]; then
+    printf "${YELLOW}WARNING${RESET} %s is %s bytes. Data belongs in R2 or Releases.\n" \
+      "$f" "$size" >&2
+  fi
+done
+
+if [ "$fail" -ne 0 ]; then
+  cat >&2 <<'EOF'
+
+Commit blocked. This repo is public — a pushed secret is a leaked secret.
+
+If this is a false positive, either reword the line or commit with
+    git commit --no-verify
+and say so in the commit message.
+EOF
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,29 @@
+# Dataset locations. Configuration, not observation — row counts and max dates
+# live in Postgres (dataset_stats), written nightly by the loaders.
+#
+# Moving a dataset is an edit here and nothing else. Nothing in the codebase
+# hardcodes a data URL.
+#
+# backend must be one of: r2 | github_release | supabase | local
+#
+# LICENSING BOUNDARY (see CLAUDE.md): anything a vendor touched goes to "r2",
+# which is private. Only public-domain government data may use
+# "github_release", because Release assets on a public repo are world-readable
+# and publishing them is redistribution.
+
+# --- vendor-derived: private, R2 only -------------------------------------
+
+[prices_eod_raw]
+# Raw unadjusted OHLCV from Tiingo. Adjustment happens at query time against
+# corporate_actions, which keeps history immutable and year partitions honest.
+2026 = { location = "r2://market-radar/prices_eod_raw/2026.parquet", backend = "r2" }
+
+[corporate_actions]
+all = { location = "corporate_actions", backend = "supabase" }
+
+# --- public domain: GitHub Releases are fine ------------------------------
+# Populated in Weekends 2-4. Locations are placeholders until the repo exists
+# and the first release is cut; nothing reads them yet.
+
+[sec_company_tickers]
+all = { location = "https://example.invalid/placeholder/company_tickers.parquet", backend = "github_release" }
