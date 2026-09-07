@@ -34,12 +34,15 @@ your source choices.
       OTCCE 10, OTCBB 3. Stooq's US bulk remains listed-only, so Tiingo is the
       only viable source for the sub-$1 OTC band.
 
-      **They are currently excluded, as a decision rather than a gap.**
-      Including them takes the nightly universe from ~14,100 to ~31,700 and
-      roughly doubles sweep time (~95 min to ~211 min at 9,000 req/hour).
-      Turning them on is a one-line change to `LISTED_EXCHANGES`; the codes
-      are already recorded in `OTC_EXCHANGES`. **Open question for Easton:**
-      is the sub-$1 band worth doubling the nightly run?
+      **Decision (2026-09-07): hold OTC off until the listed sweep has run
+      clean for one week, then turn it on.** Deferred deliberately, not
+      forgotten. Cost of enabling: the nightly universe goes from ~14,100 to
+      ~31,700 symbols and the sweep from **~95 min to ~211 min** at 9,000
+      req/hour — still inside the 240-minute job timeout, but only just, so
+      the timeout should be raised at the same time. Turning it on is one
+      line: add `OTC_EXCHANGES` into `LISTED_EXCHANGES` in
+      `sources/tiingo.py`. Revisit once seven consecutive nightly runs are
+      green.
 
       Still worth doing with the ten tickers: confirm *history quality* on
       names actually traded, which a symbol count does not tell us.

@@ -68,6 +68,12 @@ LISTED_EXCHANGES: Final[frozenset[str]] = frozenset(
 )
 
 #: Present in the source file and available if the OTC band is switched on.
+#:
+#: Deferred by decision on 2026-09-07, not by oversight: hold until the listed
+#: sweep has run clean for one week, then fold these into LISTED_EXCHANGES.
+#: Doing so takes the universe from ~14,100 to ~31,700 and the sweep from
+#: ~95 to ~211 minutes, so raise the workflow's timeout-minutes at the same
+#: time. See docs/build-spec.md §0.
 OTC_EXCHANGES: Final[frozenset[str]] = frozenset(
     {"PINK", "OTCMKTS", "OTCQB", "OTCQX", "OTCGREY", "OTCD", "OTCCE", "OTCBB"}
 )
