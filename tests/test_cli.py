@@ -14,10 +14,10 @@ def test_every_planned_command_is_registered() -> None:
     assert EXPECTED_COMMANDS <= set(actions[0].choices)
 
 
-# Implemented commands are excluded: `manifest` reads the real manifest, and
-# `selftest` publishes to R2 and GitHub for real. Neither belongs in a suite
-# that must run offline.
-IMPLEMENTED = {"manifest", "selftest"}
+# Implemented commands are excluded: `manifest` reads the real manifest,
+# `selftest` publishes to R2 and GitHub for real, `migrate` needs Supabase,
+# and `prices` spends Tiingo quota. None belong in a suite that runs offline.
+IMPLEMENTED = {"manifest", "selftest", "migrate", "prices"}
 
 
 @pytest.mark.parametrize("command", sorted(EXPECTED_COMMANDS - IMPLEMENTED))
@@ -27,13 +27,32 @@ def test_unimplemented_commands_exit_non_zero(command: str, capsys) -> None:
     assert "not implemented" in capsys.readouterr().err
 
 
-def test_selftest_is_wired_up_and_not_a_stub() -> None:
-    """Registered, flagged, and routed away from the not-implemented path."""
+@pytest.mark.parametrize("command", sorted(IMPLEMENTED))
+def test_implemented_commands_are_not_stubs(command: str) -> None:
+    """Registered, and routed away from the not-implemented path."""
     import inspect
 
     from marketradar import cli
 
-    assert "selftest" not in inspect.getsource(cli.main).split("pending = ")[1]
+    pending_block = inspect.getsource(cli.main).split("pending = ")[1]
+    assert command not in pending_block
+
+
+def test_prices_checks_credentials_before_touching_the_network(monkeypatch) -> None:
+    """A missing token must fail before the multi-megabyte universe download.
+
+    This test previously reached the network to discover the token was
+    missing, which is exactly the ordering bug it now guards.
+    """
+    from marketradar.sources import tiingo
+
+    monkeypatch.delenv(tiingo.ENV_TOKEN, raising=False)
+
+    def explode(*a, **k):
+        raise AssertionError("fetch_universe called before the token check")
+
+    monkeypatch.setattr(tiingo, "fetch_universe", explode)
+    assert main(["prices"]) == 1
 
 
 def test_bare_invocation_prints_help(capsys) -> None:

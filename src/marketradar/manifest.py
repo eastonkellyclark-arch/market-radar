@@ -27,11 +27,17 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Final, Literal
 
-Backend = Literal["r2", "github_release", "supabase", "local"]
+Backend = Literal["r2", "github_release", "supabase", "local", "vendor_api"]
 
 VALID_BACKENDS: Final[frozenset[str]] = frozenset(
-    {"r2", "github_release", "supabase", "local"}
+    {"r2", "github_release", "supabase", "local", "vendor_api"}
 )
+
+#: Backends that are not storage at all. A ``vendor_api`` entry records where
+#: an upstream API lives, so that source modules can honour the
+#: no-hardcoded-URL rule without pretending an endpoint is a dataset. It is
+#: never read as Parquet.
+NON_STORAGE_BACKENDS: Final[frozenset[str]] = frozenset({"vendor_api"})
 
 # Backends whose contents are vendor-derived and must never be published
 # anywhere public. See the licensing rule in CLAUDE.md.

@@ -68,8 +68,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    p_prices = sub.add_parser("prices", help="load EOD prices for one date")
+    p_prices = sub.add_parser("prices", help="load EOD prices from Tiingo")
     p_prices.add_argument("--date", type=_iso_date, help="trading date (default: latest)")
+    p_prices.add_argument(
+        "--start", type=_iso_date, help="range start (default: --days before end)"
+    )
+    p_prices.add_argument("--days", type=int, default=5, help="lookback window")
+    p_prices.add_argument(
+        "--limit", type=int, help="cap the universe — for proving the mechanism cheaply"
+    )
+    p_prices.add_argument("--chunk-size", type=int, default=100)
+    p_prices.add_argument("--rate-per-hour", type=int, default=9000)
+    p_prices.add_argument(
+        "--dry-run", action="store_true", help="resolve the universe, fetch nothing"
+    )
+    p_prices.add_argument(
+        "--no-publish", action="store_true", help="sweep and stage, do not publish"
+    )
     p_prices.add_argument(
         "--restart",
         action="store_true",
@@ -125,6 +140,91 @@ def _cmd_manifest() -> int:
     return EXIT_OK
 
 
+def _cmd_prices(args: argparse.Namespace) -> int:
+    """Chunked, resumable Tiingo sweep."""
+    import time
+    from pathlib import Path as _Path
+
+    from marketradar import storage
+    from marketradar.sources import tiingo
+
+    end = args.date or __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc
+    ).date()
+    start = args.start or (end - __import__("datetime").timedelta(days=args.days))
+    partition = str(end.year)
+
+    # Validate credentials before downloading anything. The universe zip is
+    # several megabytes, and failing after fetching it wastes time and made a
+    # unit test reach the network to discover a missing token.
+    if not args.dry_run:
+        tiingo._token()
+
+    print(f"universe: fetching supported tickers (free, outside the request budget)")
+    universe = tiingo.fetch_universe()
+    universe_size = len(universe)
+    print(f"  {universe_size:,} US listed stock/ETF symbols currently trading")
+
+    if args.limit:
+        universe = sorted(universe, key=lambda t: t.ticker)[: args.limit]
+        print(f"  limited to {len(universe):,} for this run")
+
+    run_id = f"{partition}-{start.isoformat()}-{end.isoformat()}-{len(universe)}"
+    staging = _Path(".checkpoints") / f"staging-{run_id}"
+
+    print(f"\nwindow  : {start} .. {end}")
+    print(f"chunks  : {len(universe)} tickers / {args.chunk_size} per chunk")
+    print(f"pacing  : {args.rate_per_hour:,} req/hour")
+    if args.dry_run:
+        print("\ndry run — no requests made")
+        return EXIT_OK
+
+    print()
+    result = tiingo.sweep(
+        universe,
+        start,
+        end,
+        staging=staging,
+        run_id=run_id,
+        chunk_size=args.chunk_size,
+        rate_per_hour=args.rate_per_hour,
+        restart=args.restart,
+    )
+
+    print(f"\nattempted {result.attempted:,}  succeeded {result.succeeded:,}  "
+          f"failed {result.failed:,}")
+    print(f"rows {result.rows:,}  corporate actions {result.actions:,}")
+    print(f"retries {result.retries}  429s {result.rate_limited}")
+    print(f"wall time {result.elapsed:.1f}s")
+    fetched_now = result.attempted - result.resumed_attempted
+    if fetched_now and result.elapsed:
+        per = result.elapsed / fetched_now
+        if result.resumed_attempted:
+            print(f"  ({fetched_now:,} fetched this process; "
+                  f"{result.resumed_attempted:,} resumed from checkpoint)")
+        print(f"per ticker {per:.3f}s")
+        for label, n in (("active universe", universe_size), ("full 12,000", 12000)):
+            print(f"  projected {label:<16} = {per * n / 60:6.1f} min "
+                  f"({n:,} requests)")
+    if result.failures:
+        print(f"\nfirst failures ({len(result.failures)} total):")
+        for ticker, why in result.failures[:5]:
+            print(f"  {ticker}: {why}")
+
+    if args.no_publish:
+        print(f"\n--no-publish: {result.rows:,} rows staged in {staging}")
+        return EXIT_OK
+
+    con = storage.connect()
+    observed = tiingo.publish(
+        staging, partition, con=con, min_rows=max(1, result.rows // 2)
+    )
+    print(f"\npublished {observed.row_count:,} rows, max_date {observed.max_date}")
+    n = tiingo.upsert_corporate_actions(staging, con=con)
+    print(f"corporate actions upserted: {n:,}")
+    return EXIT_OK
+
+
 def _not_implemented(command: str, weekend: str) -> int:
     print(
         f"mr {command}: not implemented yet (scheduled for {weekend}).",
@@ -149,6 +249,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "manifest":
         return _cmd_manifest()
 
+    if args.command == "prices":
+        load_dotenv()
+        try:
+            return _cmd_prices(args)
+        except Exception as exc:  # surfaced with a message, not a traceback
+            from marketradar.freshness import StaleDataError
+
+            label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
+            print(f"mr prices: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
     if args.command == "migrate":
         from marketradar import migrate
 
@@ -170,7 +281,6 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_ERROR
 
     pending = {
-        "prices": "Weekend 1 (T9)",
         "screens": "Weekend 2",
         "digest": "Weekend 2",
         "backfill": "Weekend 3",

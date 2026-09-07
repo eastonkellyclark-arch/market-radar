@@ -21,6 +21,18 @@
 [corporate_actions]
 all = { location = "corporate_actions", backend = "supabase" }
 
+# --- vendor endpoints -----------------------------------------------------
+# Not storage. Recorded here so source modules never hold a literal URL, per
+# the hard rule in CLAUDE.md and the test in tests/test_repo_invariants.py.
+
+[tiingo_api]
+base = { location = "https://api.tiingo.com", backend = "vendor_api" }
+
+[tiingo_supported_tickers]
+# Bulk ticker universe: exchange, asset type, and the date range Tiingo holds
+# for each symbol. Free, no quota, not part of the 10k/hour request budget.
+all = { location = "https://apimedia.tiingo.com/docs/tiingo/daily/supported_tickers.zip", backend = "vendor_api" }
+
 # --- public domain: GitHub Releases are fine ------------------------------
 # Populated in Weekends 2-4. Locations are placeholders until the repo exists
 # and the first release is cut; nothing reads them yet.
