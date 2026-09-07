@@ -266,42 +266,124 @@ def _cmd_sec_tickers(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _ticker_variants(ticker: str) -> set[str]:
+    """Spellings of one ticker that different vendors treat as the same symbol.
+
+    Share classes are the whole problem: SEC writes "BRK-B", Tiingo may write
+    "BRK.B", and a bare string compare scores those as two different
+    companies. Used for *diagnosis only* — it separates "we do not know who
+    this is" from "we spell it differently", which are very different amounts
+    of Weekend 4 work. It is never a join key.
+    """
+    out = {ticker}
+    for a, b in (("-", "."), (".", "-")):
+        if a in ticker:
+            out.add(ticker.replace(a, b))
+    out.add(ticker.replace("-", "").replace(".", ""))
+    return out
+
+
 def _reconcile(con, filers) -> int:
-    """Coverage between the SEC filer list and the Tiingo sweep universe."""
+    """Coverage between the SEC filer list and the Tiingo sweep universe.
+
+    The two directions are counted in different units on purpose, because the
+    question each one answers is different.
+
+    Tiingo -> SEC is counted in **tickers**: the nightly sweep is per-ticker,
+    so an unmatched ticker is one symbol whose filings we cannot reach.
+
+    SEC -> Tiingo is counted in **CIKs**, not tickers. A filer is the entity.
+    A CIK carrying three unmatched share classes is one company to resolve by
+    hand, not three, and counting its tickers would treble the apparent size
+    of the Weekend 4 backlog. A CIK counts as covered when *any* of its
+    tickers is in the universe.
+    """
     from marketradar.sources import tiingo
 
     print("\nfetching Tiingo universe for reconciliation")
     universe = tiingo.fetch_universe()
-    tiingo_tickers = {t.ticker for t in universe}
+    meta = {t.ticker: t for t in universe}
+    tiingo_tickers = set(meta)
     sec_tickers = {f.ticker for f in filers}
 
+    by_cik: dict[str, set[str]] = {}
+    names: dict[str, str] = {}
+    for f in filers:
+        by_cik.setdefault(f.cik, set()).add(f.ticker)
+        names.setdefault(f.cik, f.name)
+
     only_tiingo = tiingo_tickers - sec_tickers
-    only_sec = sec_tickers - tiingo_tickers
     both = tiingo_tickers & sec_tickers
+    ciks_uncovered = {c for c, tks in by_cik.items() if not (tks & tiingo_tickers)}
 
     print(f"\nTiingo universe (active listed) : {len(tiingo_tickers):,}")
-    print(f"  SEC tickers                     : {len(sec_tickers):,}")
-    print(f"  matched on ticker               : {len(both):,} "
-          f"({len(both)/len(tiingo_tickers)*100:.1f}% of Tiingo)")
-    print(f"  in Tiingo, no SEC CIK           : {len(only_tiingo):,} "
-          f"({len(only_tiingo)/len(tiingo_tickers)*100:.1f}%)")
-    print(f"  in SEC, not swept by Tiingo     : {len(only_sec):,}")
+    print(f"SEC filers (distinct CIKs)      : {len(by_cik):,}")
+    print(f"SEC (cik, ticker) pairs         : {len(filers):,}")
+
+    print("\n--- direction 1: Tiingo tickers with no SEC CIK ---")
+    print(f"  matched on ticker             : {len(both):,} "
+          f"({len(both) / len(tiingo_tickers) * 100:.1f}% of Tiingo)")
+    print(f"  unmatched                     : {len(only_tiingo):,} "
+          f"({len(only_tiingo) / len(tiingo_tickers) * 100:.1f}%)")
 
     by_type: dict[str, int] = {}
     by_exch: dict[str, int] = {}
-    for t in universe:
-        if t.ticker in only_tiingo:
-            by_type[t.asset_type] = by_type.get(t.asset_type, 0) + 1
-            by_exch[t.exchange] = by_exch.get(t.exchange, 0) + 1
-    print("\nunmatched Tiingo tickers by asset type:")
+    for t in only_tiingo:
+        m = meta[t]
+        by_type[m.asset_type] = by_type.get(m.asset_type, 0) + 1
+        by_exch[m.exchange] = by_exch.get(m.exchange, 0) + 1
+    print("\n  unmatched by asset type:")
     for k, v in sorted(by_type.items(), key=lambda kv: -kv[1]):
-        print(f"    {k:<8} {v:>6,}")
-    print("  unmatched Tiingo tickers by exchange:")
+        print(f"    {k:<10} {v:>6,}")
+    print("  unmatched by exchange:")
     for k, v in sorted(by_exch.items(), key=lambda kv: -kv[1])[:6]:
-        print(f"    {k:<12} {v:>6,}")
-    print("\nsample unmatched:")
-    for t in sorted(only_tiingo)[:12]:
-        print(f"    {t}")
+        print(f"    {k:<10} {v:>6,}")
+    print("\n  sample (ticker / exchange / asset type):")
+    for t in sorted(only_tiingo)[:15]:
+        m = meta[t]
+        print(f"    {t:<12} {m.exchange:<10} {m.asset_type}")
+
+    print("\n--- direction 2: SEC CIKs with no Tiingo ticker ---")
+    covered = len(by_cik) - len(ciks_uncovered)
+    print(f"  covered CIKs                  : {covered:,} "
+          f"({covered / len(by_cik) * 100:.1f}% of filers)")
+    print(f"  uncovered CIKs                : {len(ciks_uncovered):,} "
+          f"({len(ciks_uncovered) / len(by_cik) * 100:.1f}%)")
+    print("\n  sample (cik / tickers / name):")
+    for cik in sorted(ciks_uncovered)[:15]:
+        tks = ",".join(sorted(by_cik[cik]))
+        print(f"    {cik}  {tks:<14} {names[cik][:44]}")
+
+    # How much of the gap is spelling rather than identity. If a large share
+    # of it is punctuation, that is a parsing fix, not manual entity work.
+    variant_hits = {t for t in only_tiingo if _ticker_variants(t) & sec_tickers}
+    sec_variant_index: dict[str, str] = {}
+    for t in sec_tickers:
+        for v in _ticker_variants(t):
+            sec_variant_index.setdefault(v, t)
+    cik_variant_hits = {
+        c for c in ciks_uncovered
+        if any(_ticker_variants(t) & tiingo_tickers for t in by_cik[c])
+    }
+    print("\n--- how much of the gap is spelling, not identity ---")
+    print(f"  unmatched Tiingo tickers hitting a SEC ticker "
+          f"under a separator variant : {len(variant_hits):,}")
+    print(f"  uncovered CIKs hitting the universe "
+          f"under a separator variant            : {len(cik_variant_hits):,}")
+    if variant_hits:
+        print("\n  sample separator collisions (tiingo -> sec):")
+        for t in sorted(variant_hits)[:8]:
+            hit = next(
+                (sec_variant_index[v] for v in _ticker_variants(t)
+                 if v in sec_variant_index),
+                "?",
+            )
+            print(f"    {t:<12} -> {hit}")
+
+    print(f"\nreal identity gap, Tiingo side : "
+          f"{len(only_tiingo) - len(variant_hits):,} tickers")
+    print(f"real identity gap, SEC side    : "
+          f"{len(ciks_uncovered) - len(cik_variant_hits):,} CIKs")
     return EXIT_OK
 
 
