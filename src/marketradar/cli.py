@@ -91,6 +91,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="discard checkpoints and re-sweep from scratch",
     )
 
+    p_sec = sub.add_parser(
+        "sec-tickers", help="load the SEC CIK/ticker map and seed companies"
+    )
+    p_sec.add_argument(
+        "--no-publish", action="store_true", help="upsert only, skip the Release"
+    )
+    p_sec.add_argument(
+        "--reconcile", action="store_true",
+        help="report coverage against the Tiingo universe and exit",
+    )
+
     sub.add_parser("screens", help="rebuild screens from local data")
 
     p_digest = sub.add_parser("digest", help="render the daily email")
@@ -225,6 +236,75 @@ def _cmd_prices(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_sec_tickers(args: argparse.Namespace) -> int:
+    from marketradar import storage
+    from marketradar.sources import sec_company_tickers as sec
+
+    print("fetching SEC company_tickers.json (one request, bulk file)")
+    filers = sec.fetch()
+    ciks = {f.cik for f in filers}
+    print(f"  {len(filers):,} (cik, ticker) pairs across {len(ciks):,} filers")
+
+    multi = len(filers) - len(ciks)
+    print(f"  {multi:,} extra tickers from share classes")
+
+    con = storage.connect()
+
+    if args.reconcile:
+        return _reconcile(con, filers)
+
+    if not args.no_publish:
+        observed = sec.publish(filers, con=con)
+        print(f"\npublished {observed.row_count:,} rows to the GitHub Release")
+
+    print("\nupserting into companies + company_tickers")
+    stats = sec.load(filers, con=con)
+    print(f"  companies : {stats['companies_before']:,} -> {stats['companies_after']:,} "
+          f"(+{stats['companies_inserted']:,})")
+    print(f"  tickers   : {stats['tickers_before']:,} -> {stats['tickers_after']:,} "
+          f"(+{stats['tickers_inserted']:,})")
+    return EXIT_OK
+
+
+def _reconcile(con, filers) -> int:
+    """Coverage between the SEC filer list and the Tiingo sweep universe."""
+    from marketradar.sources import tiingo
+
+    print("\nfetching Tiingo universe for reconciliation")
+    universe = tiingo.fetch_universe()
+    tiingo_tickers = {t.ticker for t in universe}
+    sec_tickers = {f.ticker for f in filers}
+
+    only_tiingo = tiingo_tickers - sec_tickers
+    only_sec = sec_tickers - tiingo_tickers
+    both = tiingo_tickers & sec_tickers
+
+    print(f"\nTiingo universe (active listed) : {len(tiingo_tickers):,}")
+    print(f"  SEC tickers                     : {len(sec_tickers):,}")
+    print(f"  matched on ticker               : {len(both):,} "
+          f"({len(both)/len(tiingo_tickers)*100:.1f}% of Tiingo)")
+    print(f"  in Tiingo, no SEC CIK           : {len(only_tiingo):,} "
+          f"({len(only_tiingo)/len(tiingo_tickers)*100:.1f}%)")
+    print(f"  in SEC, not swept by Tiingo     : {len(only_sec):,}")
+
+    by_type: dict[str, int] = {}
+    by_exch: dict[str, int] = {}
+    for t in universe:
+        if t.ticker in only_tiingo:
+            by_type[t.asset_type] = by_type.get(t.asset_type, 0) + 1
+            by_exch[t.exchange] = by_exch.get(t.exchange, 0) + 1
+    print("\nunmatched Tiingo tickers by asset type:")
+    for k, v in sorted(by_type.items(), key=lambda kv: -kv[1]):
+        print(f"    {k:<8} {v:>6,}")
+    print("  unmatched Tiingo tickers by exchange:")
+    for k, v in sorted(by_exch.items(), key=lambda kv: -kv[1])[:6]:
+        print(f"    {k:<12} {v:>6,}")
+    print("\nsample unmatched:")
+    for t in sorted(only_tiingo)[:12]:
+        print(f"    {t}")
+    return EXIT_OK
+
+
 def _not_implemented(command: str, weekend: str) -> int:
     print(
         f"mr {command}: not implemented yet (scheduled for {weekend}).",
@@ -258,6 +338,17 @@ def main(argv: list[str] | None = None) -> int:
 
             label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
             print(f"mr prices: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "sec-tickers":
+        load_dotenv()
+        try:
+            return _cmd_sec_tickers(args)
+        except Exception as exc:
+            from marketradar.freshness import StaleDataError
+
+            label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
+            print(f"mr sec-tickers: {label}: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "migrate":
