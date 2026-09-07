@@ -218,9 +218,33 @@ def include_row(row: dict[str, Any], cutoff: date | None) -> bool:
     return True
 
 
+def download_universe_rows() -> list[dict[str, Any]]:
+    """Every row of the supported-ticker file, unfiltered.
+
+    Split out from :func:`fetch_universe` because reconciliation has to tell
+    "Tiingo does not carry this symbol" apart from "our own listed-only filter
+    drops it", and the filtered universe erases that distinction. Nothing that
+    sweeps prices should use this — it includes OTC, delisted, funds, and
+    every other row in the file.
+    """
+    url = manifest.get("tiingo_supported_tickers", "all").location
+    try:
+        resp = httpx.get(url, timeout=120.0, follow_redirects=True)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise TiingoError(f"Could not download the ticker universe: {exc}") from exc
+
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        name = zf.namelist()[0]
+        text = zf.read(name).decode("utf-8", errors="replace")
+
+    return list(csv.DictReader(io.StringIO(text)))
+
+
 def fetch_universe(
     active_within_days: int | None = ACTIVE_WITHIN_DAYS,
     today: date | None = None,
+    rows: list[dict[str, Any]] | None = None,
 ) -> list[TickerMeta]:
     """Download the supported-ticker list.
 
@@ -234,18 +258,10 @@ def fetch_universe(
     budget re-confirming that dead tickers are still dead.
 
     Pass ``active_within_days=None`` to get the full historical universe,
-    which is what a backfill wants.
+    which is what a backfill wants. Pass ``rows`` to filter an already
+    downloaded file rather than fetching it again.
     """
-    url = manifest.get("tiingo_supported_tickers", "all").location
-    try:
-        resp = httpx.get(url, timeout=120.0, follow_redirects=True)
-        resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise TiingoError(f"Could not download the ticker universe: {exc}") from exc
-
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-        name = zf.namelist()[0]
-        text = zf.read(name).decode("utf-8", errors="replace")
+    rows = download_universe_rows() if rows is None else rows
 
     cutoff = None
     if active_within_days is not None:
@@ -254,7 +270,7 @@ def fetch_universe(
         )
 
     out: list[TickerMeta] = []
-    for row in csv.DictReader(io.StringIO(text)):
+    for row in rows:
         if not include_row(row, cutoff):
             continue
         out.append(
