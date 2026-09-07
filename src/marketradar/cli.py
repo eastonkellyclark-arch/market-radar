@@ -95,6 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("manifest", help="show dataset locations and engine capabilities")
 
+    p_migrate = sub.add_parser("migrate", help="apply SQL migrations to Supabase")
+    p_migrate.add_argument(
+        "--dry-run", action="store_true", help="list statements, execute nothing"
+    )
+
     return parser
 
 
@@ -143,6 +148,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "manifest":
         return _cmd_manifest()
+
+    if args.command == "migrate":
+        from marketradar import migrate
+
+        load_dotenv()
+        try:
+            return migrate.run(dry_run=args.dry_run)
+        except migrate.MigrationError as exc:
+            print(f"mr migrate: {exc}", file=sys.stderr)
+            return EXIT_ERROR
 
     if args.command == "selftest":
         from marketradar import selftest
