@@ -28,11 +28,26 @@ your source choices.
 - [x] **Tiingo news access.** *Resolved 2026-09-04:* Tiingo News is included
       on all plans, **not** a paid add-on. Constraint is depth, not access —
       3 months of queryable history plus everything going forward.
-- [ ] **OTC coverage.** Pull ten tickers you actually trade from Tiingo and
-      confirm they exist with sane history. Stooq's US bulk is already known
-      to be listed-only (see §2), so this now tests Tiingo alone. If Tiingo's
-      OTC coverage is thin, the sub-$1 bucket needs a different source and you
-      want to know now. **Still open — blocks trusting the sub-$1 band.**
+- [x] **OTC coverage — Tiingo has it.** *Resolved 2026-09-07 from the
+      supported-ticker file.* Tiingo carries **17,618 active OTC symbols**:
+      PINK 16,301, OTCMKTS 857, OTCQB 211, OTCGREY 190, OTCD 31, OTCQX 15,
+      OTCCE 10, OTCBB 3. Stooq's US bulk remains listed-only, so Tiingo is the
+      only viable source for the sub-$1 OTC band.
+
+      **They are currently excluded, as a decision rather than a gap.**
+      Including them takes the nightly universe from ~14,100 to ~31,700 and
+      roughly doubles sweep time (~95 min to ~211 min at 9,000 req/hour).
+      Turning them on is a one-line change to `LISTED_EXCHANGES`; the codes
+      are already recorded in `OTC_EXCHANGES`. **Open question for Easton:**
+      is the sub-$1 band worth doubling the nightly run?
+
+      Still worth doing with the ten tickers: confirm *history quality* on
+      names actually traded, which a symbol count does not tell us.
+- [x] **NYSE American is not being dropped.** *Checked 2026-09-07.* Tiingo
+      splits the venue across two codes — AMEX (298) and NYSE MKT (34) — and
+      both are kept, so 332 active listings are in scope. The low "NYSE MKT"
+      figure is a labelling artefact. Eight NYSE `ATEST*` exchange test
+      symbols were being included and are now filtered out.
 - [ ] **Rotate the SAM.gov API key.** *Deferred 2026-09-06, deliberately.*
       It was exposed in a tool transcript by an early version of
       `scripts/scan_secrets.py`, which classified secrets by variable name

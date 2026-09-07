@@ -51,10 +51,25 @@ DEFAULT_CHUNK_SIZE: Final[int] = 100
 MAX_RETRIES: Final[int] = 5
 REQUEST_TIMEOUT: Final[float] = 30.0
 
-#: Exchanges Stooq and Tiingo both call "listed". OTC coverage is a separate
-#: question, deliberately not answered here.
+#: US listed exchanges.
+#:
+#: Note AMEX and NYSE MKT are the same venue, NYSE American: Tiingo splits it
+#: across both codes (298 + 34 = 332 active). Both are kept; a count of 34
+#: under "NYSE MKT" alone is a labelling artefact, not a dropped exchange.
+#:
+#: OTC is deliberately excluded, and that exclusion is now a *decision* rather
+#: than an unknown. Tiingo carries 17,618 active OTC symbols (PINK 16,301,
+#: OTCMKTS 857, OTCQB 211, OTCGREY 190, OTCD 31, OTCQX 15, OTCCE 10, OTCBB 3).
+#: Including them would take the universe from ~14,000 to ~31,700 and roughly
+#: double sweep time, so it is a cost/benefit call for the sub-$1 band rather
+#: than a coverage gap. See docs/build-spec.md §0.
 LISTED_EXCHANGES: Final[frozenset[str]] = frozenset(
     {"NYSE", "NASDAQ", "NYSE MKT", "NYSE ARCA", "AMEX", "BATS"}
+)
+
+#: Present in the source file and available if the OTC band is switched on.
+OTC_EXCHANGES: Final[frozenset[str]] = frozenset(
+    {"PINK", "OTCMKTS", "OTCQB", "OTCQX", "OTCGREY", "OTCD", "OTCCE", "OTCBB"}
 )
 
 
@@ -161,9 +176,40 @@ def _client() -> httpx.Client:
     )
 
 
-#: A symbol whose last bar is older than this is delisted, not merely quiet.
-#: Matches the freshness window: survives a long weekend plus a holiday.
-ACTIVE_WITHIN_DAYS: Final[int] = 7
+#: A symbol whose last bar is older than this is treated as delisted.
+#:
+#: 30 days, not 7. An SEC trading suspension runs 10 business days — about
+#: 14 calendar days — so a 7-day window drops a suspended name mid-suspension.
+#: The filter is recomputed from a freshly downloaded universe on every run,
+#: so a resumed ticker returns on its own; the wider window simply means it
+#: never left. Cost measured against the real file: +88 symbols, +0.6%, about
+#: 36 seconds of extra sweep. Cheap insurance against a hole in exactly the
+#: names most likely to be interesting.
+ACTIVE_WITHIN_DAYS: Final[int] = 30
+
+#: Exchange test symbols. NYSE publishes ATEST* as live-looking rows; they are
+#: not real listings and would otherwise reach the screens.
+TEST_SYMBOL_PREFIXES: Final[tuple[str, ...]] = ("ATEST",)
+
+
+def include_row(row: dict[str, Any], cutoff: date | None) -> bool:
+    """Whether one universe row belongs in the sweep.
+
+    Split out from :func:`fetch_universe` so the filtering rules can be
+    tested without downloading anything.
+    """
+    ticker = (row.get("ticker") or "").strip().upper()
+    if not ticker or any(ticker.startswith(p) for p in TEST_SYMBOL_PREFIXES):
+        return False
+    if (row.get("exchange") or "").strip().upper() not in LISTED_EXCHANGES:
+        return False
+    if (row.get("assetType") or "").strip().lower() not in ("stock", "etf"):
+        return False
+    if cutoff is not None:
+        end = _parse_date(row.get("endDate"))
+        if end is None or end < cutoff:
+            return False
+    return True
 
 
 def fetch_universe(
@@ -203,21 +249,13 @@ def fetch_universe(
 
     out: list[TickerMeta] = []
     for row in csv.DictReader(io.StringIO(text)):
-        exchange = (row.get("exchange") or "").strip().upper()
-        asset = (row.get("assetType") or "").strip().lower()
-        ticker = (row.get("ticker") or "").strip().upper()
-        if not ticker or exchange not in LISTED_EXCHANGES:
-            continue
-        if asset not in ("stock", "etf"):
-            continue
-        end = _parse_date(row.get("endDate"))
-        if cutoff is not None and (end is None or end < cutoff):
+        if not include_row(row, cutoff):
             continue
         out.append(
             TickerMeta(
-                ticker=ticker,
-                exchange=exchange,
-                asset_type=asset,
+                ticker=(row.get("ticker") or "").strip().upper(),
+                exchange=(row.get("exchange") or "").strip().upper(),
+                asset_type=(row.get("assetType") or "").strip().lower(),
                 start_date=_parse_date(row.get("startDate")),
                 end_date=_parse_date(row.get("endDate")),
             )

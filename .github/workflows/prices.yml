@@ -1,0 +1,114 @@
+name: prices
+
+# Nightly EOD sweep. Runs the same `mr prices` you would run locally — if it
+# only worked here, it would be built wrong.
+#
+# Deliberately NOT passing --restart: a re-run after a timeout or a cancelled
+# job resumes from the last checkpoint instead of re-spending quota on the
+# ~9,000 tickers already fetched.
+
+on:
+  schedule:
+    # 03:30 UTC ≈ 23:30 ET, comfortably after the US close and after Tiingo
+    # has settled the day's bars. Cron is UTC and does not shift with DST.
+    - cron: "30 3 * * 2-6"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Cap the universe (blank = full sweep)"
+        required: false
+        type: string
+      days:
+        description: "Lookback window in days"
+        required: false
+        default: "5"
+        type: string
+      restart:
+        description: "Discard checkpoints and re-sweep from scratch"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # Two sweeps at once would double-spend the hourly quota and race on the
+  # same checkpoint. Never cancel a run in flight — its checkpoint is the
+  # thing that makes the next one cheap.
+  group: prices
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    # A full sweep is ~95 minutes at 9,000 req/hour. 4 hours leaves room for
+    # backoff without letting a wedged run burn the whole budget.
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Restore sweep checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: .checkpoints
+          # Restore the most recent checkpoint for this workflow. The key is
+          # per-run so each attempt writes its own entry; restore-keys walks
+          # back to the newest prefix match, which is what lets a retry pick
+          # up where the previous attempt died.
+          key: checkpoints-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            checkpoints-${{ github.run_id }}-
+            checkpoints-
+
+      - name: Sweep
+        id: sweep
+        env:
+          MR_ENV: ci
+          MR_TIINGO_API_KEY: ${{ secrets.MR_TIINGO_API_KEY }}
+          MR_R2_ACCOUNT_ID: ${{ secrets.MR_R2_ACCOUNT_ID }}
+          MR_R2_ACCESS_KEY_ID: ${{ secrets.MR_R2_ACCESS_KEY_ID }}
+          MR_R2_SECRET_ACCESS_KEY: ${{ secrets.MR_R2_SECRET_ACCESS_KEY }}
+          MR_R2_BUCKET: ${{ vars.MR_R2_BUCKET || 'market-radar' }}
+          MR_POSTGRES_DSN: ${{ secrets.MR_POSTGRES_DSN }}
+        run: |
+          uv run mr prices \
+            --days "${{ inputs.days || '5' }}" \
+            ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }} \
+            ${{ inputs.restart && '--restart' || '' }}
+
+      # No `continue-on-error`, no `|| true`, no `if: always()` swallowing the
+      # result anywhere above. A StaleDataError exits non-zero and the job goes
+      # red — a green run on empty data is the failure this project exists to
+      # prevent.
+
+      - name: Save sweep checkpoint
+        # Runs even when the sweep fails: a partial checkpoint is exactly what
+        # the retry needs. Skipped on cancellation, where state is unreliable.
+        if: success() || failure()
+        uses: actions/cache/save@v4
+        with:
+          path: .checkpoints
+          key: checkpoints-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Summary
+        if: success() || failure()
+        run: |
+          {
+            echo "### prices sweep"
+            echo ""
+            echo "- outcome: \`${{ steps.sweep.outcome }}\`"
+            echo "- window: ${{ inputs.days || '5' }} days"
+            echo "- limit: ${{ inputs.limit || 'full universe' }}"
+            echo "- restart: ${{ inputs.restart || false }}"
+          } >> "$GITHUB_STEP_SUMMARY"

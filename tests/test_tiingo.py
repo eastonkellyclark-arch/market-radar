@@ -6,7 +6,7 @@ licensing guard do not — and those are where the decisions live.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -275,3 +275,94 @@ def test_listed_exchanges_exclude_otc() -> None:
     assert "OTC" not in tiingo.LISTED_EXCHANGES
     assert "PINK" not in tiingo.LISTED_EXCHANGES
     assert "NASDAQ" in tiingo.LISTED_EXCHANGES
+
+
+# --- universe filtering rules ---------------------------------------------
+
+CUTOFF = date(2026, 8, 8)  # 30 days before 2026-09-07
+
+
+def _row(**kw):
+    base = {
+        "ticker": "AAPL",
+        "exchange": "NASDAQ",
+        "assetType": "Stock",
+        "startDate": "1980-12-12",
+        "endDate": "2026-09-04",
+    }
+    return {**base, **kw}
+
+
+def test_listed_row_is_included() -> None:
+    assert tiingo.include_row(_row(), CUTOFF) is True
+
+
+def test_nyse_american_is_kept_under_both_codes() -> None:
+    """Tiingo splits NYSE American across AMEX and NYSE MKT. A low count on
+    one code is a labelling artefact, not a dropped exchange."""
+    assert tiingo.include_row(_row(exchange="AMEX"), CUTOFF) is True
+    assert tiingo.include_row(_row(exchange="NYSE MKT"), CUTOFF) is True
+
+
+def test_otc_is_excluded_but_the_codes_are_recorded() -> None:
+    """Excluding OTC is a decision, not an unknown -- Tiingo does carry it."""
+    for code in ("PINK", "OTCMKTS", "OTCQB", "OTCGREY"):
+        assert tiingo.include_row(_row(exchange=code), CUTOFF) is False
+        assert code in tiingo.OTC_EXCHANGES
+
+
+def test_foreign_exchanges_are_excluded() -> None:
+    for code in ("SHE", "SHG"):
+        assert tiingo.include_row(_row(exchange=code), CUTOFF) is False
+
+
+def test_exchange_test_symbols_are_excluded() -> None:
+    """NYSE publishes ATEST* as live-looking rows. They are not listings and
+    would otherwise reach the screens."""
+    for t in ("ATEST", "ATEST-A", "ATEST-Z"):
+        assert tiingo.include_row(_row(ticker=t, exchange="NYSE MKT"), CUTOFF) is False
+
+
+def test_non_equity_asset_types_are_excluded() -> None:
+    assert tiingo.include_row(_row(assetType="Mutual Fund"), CUTOFF) is False
+
+
+def test_delisted_symbol_is_excluded() -> None:
+    assert tiingo.include_row(_row(endDate="2019-04-01"), CUTOFF) is False
+
+
+def test_missing_end_date_is_excluded_when_filtering() -> None:
+    assert tiingo.include_row(_row(endDate=""), CUTOFF) is False
+
+
+def test_no_cutoff_keeps_delisted_symbols_for_backfill() -> None:
+    assert tiingo.include_row(_row(endDate="2001-01-01"), None) is True
+
+
+# --- the halt/suspension question -----------------------------------------
+
+def test_active_window_covers_an_sec_trading_suspension() -> None:
+    """SEC suspensions run 10 business days, about 14 calendar days. A 7-day
+    window would drop a suspended name mid-suspension."""
+    assert tiingo.ACTIVE_WITHIN_DAYS >= 14
+
+
+def test_a_suspended_ticker_survives_the_whole_suspension() -> None:
+    today = date(2026, 9, 7)
+    cutoff = today - timedelta(days=tiingo.ACTIVE_WITHIN_DAYS)
+    halted_on = today - timedelta(days=14)  # full SEC suspension, still halted
+    assert tiingo.include_row(_row(endDate=halted_on.isoformat()), cutoff) is True
+
+
+def test_a_resumed_ticker_returns_to_the_universe() -> None:
+    """The filter is recomputed from a freshly downloaded universe each run,
+    so removal is never permanent: once the symbol trades again its endDate
+    moves forward and it is back in scope."""
+    today = date(2026, 9, 7)
+    cutoff = today - timedelta(days=tiingo.ACTIVE_WITHIN_DAYS)
+
+    long_gone = _row(endDate=(today - timedelta(days=60)).isoformat())
+    assert tiingo.include_row(long_gone, cutoff) is False
+
+    resumed = {**long_gone, "endDate": today.isoformat()}
+    assert tiingo.include_row(resumed, cutoff) is True
