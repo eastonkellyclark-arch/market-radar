@@ -16,8 +16,10 @@ def test_every_planned_command_is_registered() -> None:
 
 # Implemented commands are excluded: `manifest` reads the real manifest,
 # `selftest` publishes to R2 and GitHub for real, `migrate` needs Supabase,
-# and `prices` spends Tiingo quota. None belong in a suite that runs offline.
-IMPLEMENTED = {"manifest", "selftest", "migrate", "prices"}
+# `prices` spends Tiingo quota, and `screens` reads prices from R2. None
+# belong in a suite that runs offline. The screen's own logic is covered
+# against hand-built prices in tests/test_volatility.py.
+IMPLEMENTED = {"manifest", "selftest", "migrate", "prices", "screens"}
 
 
 @pytest.mark.parametrize("command", sorted(EXPECTED_COMMANDS - IMPLEMENTED))

@@ -102,7 +102,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="report coverage against the Tiingo universe and exit",
     )
 
-    sub.add_parser("screens", help="rebuild screens from local data")
+    p_screens = sub.add_parser("screens", help="rebuild screens from local data")
+    p_screens.add_argument(
+        "--as-of", type=_iso_date, metavar="YYYY-MM-DD",
+        help="trading day to screen (default: newest date in the data)",
+    )
+    p_screens.add_argument(
+        "--top", type=int, default=20, metavar="N", help="rows per list",
+    )
+    p_screens.add_argument(
+        "--sanity-floor", default="0.01", metavar="PRICE",
+        help="drop moves where either end is below this price (default 0.01). "
+             "Lower it to see the sub-penny band; it is not a liquidity gate.",
+    )
+    p_screens.add_argument(
+        "--adjust-dividends", action="store_true",
+        help="add cash dividends back for a total-return view",
+    )
+    p_screens.add_argument(
+        "--summary", action="store_true",
+        help="one line per list instead of the full lists",
+    )
+    p_screens.add_argument(
+        "--show-empty", action="store_true", help="print empty lists too",
+    )
 
     p_digest = sub.add_parser("digest", help="render the daily email")
     p_digest.add_argument("--dry-run", action="store_true", help="render, do not send")
@@ -187,7 +210,7 @@ def _cmd_prices(args: argparse.Namespace) -> int:
     print(f"chunks  : {len(universe)} tickers / {args.chunk_size} per chunk")
     print(f"pacing  : {args.rate_per_hour:,} req/hour")
     if args.dry_run:
-        print("\ndry run — no requests made")
+        print("\ndry run - no requests made")
         return EXIT_OK
 
     print()
@@ -263,6 +286,44 @@ def _cmd_sec_tickers(args: argparse.Namespace) -> int:
           f"(+{stats['companies_inserted']:,})")
     print(f"  tickers   : {stats['tickers_before']:,} -> {stats['tickers_after']:,} "
           f"(+{stats['tickers_inserted']:,})")
+    return EXIT_OK
+
+
+def _cmd_screens(args: argparse.Namespace) -> int:
+    """Volatility screens for one trading day.
+
+    Reads prices through the manifest and corporate_actions from Postgres,
+    adjusts at query time, and prints the lists. Nothing is written: a screen
+    is a view of stored data, so re-running it is always safe.
+    """
+    from marketradar import storage
+    from marketradar.freshness import StaleDataError
+    from marketradar.screens import volatility
+
+    con = storage.connect()
+    try:
+        result = volatility.screen(
+            con,
+            as_of=args.as_of,
+            top_n=args.top,
+            sanity_floor=args.sanity_floor,
+            adjust_dividends=args.adjust_dividends,
+        )
+    except (volatility.ScreenError, StaleDataError) as exc:
+        print(f"mr screens: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.summary:
+        print(f"volatility screen for {result.day.isoformat()}")
+        print(f"{result.moves_screened:,} moves screened, "
+              f"{result.floor_excluded:,} below the ${result.sanity_floor} floor")
+        print()
+        for line in volatility.summary(result.lists):
+            print(line)
+        return EXIT_OK
+
+    for line in volatility.render(result, show_empty=args.show_empty):
+        print(line)
     return EXIT_OK
 
 
@@ -359,8 +420,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"mr selftest: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
+    if args.command == "screens":
+        load_dotenv()
+        return _cmd_screens(args)
+
     pending = {
-        "screens": "Weekend 2",
         "digest": "Weekend 2",
         "backfill": "Weekend 3",
     }
