@@ -153,7 +153,7 @@ def test_real_looking_dsn_counts_as_configured(monkeypatch) -> None:
     # allowlisted for the pre-commit hook. Not a live credential.
     monkeypatch.setenv(
         storage.ENV_PG_DSN,
-        "postgresql://postgres.abcd:s3cret@aws-0-us-east-1.pooler.supabase.com:6543/postgres",  # pragma: allowlist secret
+        "postgresql://postgres.abcd:s3cret@aws-0-us-east-1.pooler.supabase.com:5432/postgres",  # pragma: allowlist secret
     )
     assert storage.postgres_configured() is True
 

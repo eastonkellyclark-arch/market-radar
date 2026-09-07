@@ -1,0 +1,40 @@
+# Normalise line endings. Development happens on Windows, CI runs on Linux;
+# without this the repo carries CRLF locally and LF on the runner, and the
+# first edit from either side produces a whole-file diff.
+#
+# LF in the repository, always. Git may check out CRLF locally where the
+# platform wants it, but what is stored and diffed is LF.
+* text=auto eol=lf
+
+# --- must be LF regardless of platform ------------------------------------
+# A shell script with CRLF fails to execute: the interpreter reads the \r as
+# part of the shebang path. The pre-commit hook is the one that matters here.
+*.sh            text eol=lf
+.githooks/*     text eol=lf
+
+# --- explicit text types --------------------------------------------------
+*.py            text eol=lf diff=python
+*.toml          text eol=lf
+*.md            text eol=lf
+*.sql           text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+.env.example    text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# --- never touch these ----------------------------------------------------
+# Data files are gitignored, but if one is ever force-added it must not be
+# line-ending mangled into corruption.
+*.parquet       binary
+*.zip           binary
+*.duckdb        binary
+*.db            binary
+*.sqlite        binary
+*.png           binary
+*.pdf           binary
+*.pptx          binary
+
+# uv.lock is generated; keep it out of diffs by default.
+uv.lock         text eol=lf linguist-generated=true
