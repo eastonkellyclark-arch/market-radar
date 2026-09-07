@@ -47,10 +47,14 @@ jobs:
     timeout-minutes: 240
 
     steps:
-      - uses: actions/checkout@v4
+      # All three pinned to Node 24 majors. Node 20 is deprecated on runners
+      # and was being force-upgraded with a warning on every run.
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        # setup-uv publishes floating major tags only up to v7, so the
+        # Node 24 line is pinned to an exact patch.
+        uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -59,7 +63,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Restore sweep checkpoint
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .checkpoints
           # Restore the most recent checkpoint for this workflow. The key is
@@ -70,6 +74,27 @@ jobs:
           restore-keys: |
             checkpoints-${{ github.run_id }}-
             checkpoints-
+
+      - name: Prune stale staging directories
+        # The restore-keys fallback pulls the whole .checkpoints tree forward
+        # from previous runs, and each logical run gets its own
+        # staging-<run_id>/ full of Parquet. At full universe that is a few MB
+        # a day, accumulating indefinitely. Anything older than three days is
+        # past any plausible retry and cannot belong to a live sweep.
+        run: |
+          set -euo pipefail
+          if [ ! -d .checkpoints ]; then
+            echo "no .checkpoints directory; nothing to prune"
+            exit 0
+          fi
+          echo "before: $(du -sh .checkpoints | cut -f1) across \
+          $(find .checkpoints -maxdepth 1 -name 'staging-*' | wc -l) staging dir(s)"
+          find .checkpoints -maxdepth 1 -name 'staging-*' -type d -mtime +3 \
+            -print -exec rm -rf {} + || true
+          find .checkpoints -maxdepth 1 -name 'tiingo_*.json' -type f -mtime +3 \
+            -print -delete || true
+          echo "after:  $(du -sh .checkpoints | cut -f1) across \
+          $(find .checkpoints -maxdepth 1 -name 'staging-*' | wc -l) staging dir(s)"
 
       - name: Sweep
         id: sweep
@@ -96,7 +121,7 @@ jobs:
         # Runs even when the sweep fails: a partial checkpoint is exactly what
         # the retry needs. Skipped on cancellation, where state is unreliable.
         if: success() || failure()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .checkpoints
           key: checkpoints-${{ github.run_id }}-${{ github.run_attempt }}
