@@ -138,11 +138,23 @@ def test_dark_mode_is_declared_under_both_scopes() -> None:
     assert ':not([data-theme="light"])' in page
 
 
-def test_the_page_is_self_contained() -> None:
-    """No server, no build step, no network at view time."""
+def test_the_page_reaches_for_nothing_external() -> None:
+    """Self-contained is the constraint, not script-free.
+
+    Sorting and filtering need a little script, and inline script keeps the
+    file one file. What must never appear is anything that leaves the disk:
+    a `file://` page has no server behind it, and a CDN reference would make
+    the dashboard depend on being online to render yesterday's numbers.
+    """
     page = shell.render(ctx())
-    for forbidden in ("<script", "http://", "https://", "fetch(", "<link"):
+    for forbidden in ("http://", "https://", "fetch(", "<link", "src=",
+                      "XMLHttpRequest", "import("):
         assert forbidden not in page, f"page reaches for {forbidden}"
+
+
+def test_the_map_alone_carries_no_script() -> None:
+    """With no digest there is nothing to sort, so nothing is emitted."""
+    assert "<script" not in shell.render(ctx())
 
 
 def test_panel_text_is_escaped() -> None:

@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 from marketradar import __version__
@@ -146,6 +147,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-load", action="store_true", help="fetch and report, store nothing"
     )
 
+    p_f4 = sub.add_parser(
+        "form4", help="read Form 4s and report open-market purchase clusters"
+    )
+    p_f4.add_argument("--date", type=_iso_date, metavar="YYYY-MM-DD",
+                      help="last day to read (default: today)")
+    p_f4.add_argument("--days", type=int, default=5, metavar="N",
+                      help="how many days back to read (default 5)")
+    p_f4.add_argument(
+        "--insider-floor", type=Decimal, default=Decimal("50000"),
+        metavar="USD",
+        help="minimum cluster value for officer/director lists (default 50000)",
+    )
+    p_f4.add_argument(
+        "--tenpct-floor", type=Decimal, default=Decimal("1000000"),
+        metavar="USD",
+        help="minimum cluster value for 10%%-holder lists (default 1000000). "
+             "Two orders of magnitude above the insider floor because the "
+             "populations are: sample-week medians were $339k and $26.4M.",
+    )
+    p_f4.add_argument("--window-days", type=int, default=3, metavar="N",
+                      help="cluster window in days (default 3, i.e. 72h)")
+    p_f4.add_argument("--min-buyers", type=int, default=2, metavar="N",
+                      help="distinct buyers required (default 2)")
+    p_f4.add_argument("--top", type=int, default=20, metavar="N",
+                      help="clusters to print per list")
+    p_f4.add_argument("--names", action="store_true",
+                      help="list the buyers in each cluster")
+
     # No publish flags: FRED is local-only. FRED redistributes the ICE BofA
     # series under permission, so they are not ours to republish, and there is
     # deliberately no switch that could turn that back on. See CLAUDE.md.
@@ -178,6 +207,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_dash.add_argument(
         "--no-open", action="store_true", help="write the file, do not open it"
+    )
+    p_dash.add_argument(
+        "--fast", action="store_true",
+        help="panel map only -- skip the screens, which read prices from R2",
     )
 
     p_backfill = sub.add_parser("backfill", help="drain N queue items")
@@ -382,8 +415,25 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     from marketradar import storage
     from marketradar.dashboard import shell
 
-    ctx = shell.gather(storage.connect())
-    target = shell.write(args.out, ctx=ctx)
+    con = storage.connect()
+    ctx = shell.gather(con)
+
+    # The digest is the single reader for health, macro and the screens, so
+    # the two surfaces cannot disagree about what today's moves were. If it
+    # cannot be built the shell still renders -- a dashboard that refuses to
+    # draw because R2 is unreachable is worse than one that opens with the
+    # panel saying so.
+    digest = None
+    if not args.fast:
+        from marketradar import digest as digest_mod
+
+        try:
+            digest = digest_mod.build(con, include_ungated=True)
+        except Exception as exc:
+            ctx.notes.append(f"Screens unavailable: {str(exc)[:160]}")
+            print(f"  screens unavailable: {str(exc)[:120]}", file=sys.stderr)
+
+    target = shell.write(args.out, ctx=ctx, digest=digest)
     counts = shell.summary(ctx)
 
     print(f"wrote {target}")
@@ -396,6 +446,78 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
     if not args.no_open and shell.open_in_browser(target):
         print("opened in your browser")
+    return EXIT_OK
+
+
+def _cmd_form4(args: argparse.Namespace) -> int:
+    """Read Form 4s from the daily index and report purchase clusters.
+
+    Two lists, kept apart. The floors differ by two orders of magnitude
+    because the populations do: in a sample week the median officer/director
+    cluster was $339k and the median 10%-holder cluster $26.4M. They are
+    arguments rather than constants because one week is a hypothesis.
+    """
+    from datetime import timedelta
+
+    import httpx
+
+    from marketradar.clock import market_today
+    from marketradar.signals import form4
+    from marketradar.signals.edgar_rss import Pacer
+
+    end = args.date or market_today()
+    days = [end - timedelta(days=n) for n in range(args.days)]
+
+    client = httpx.Client(timeout=60.0, follow_redirects=True)
+    pacer = Pacer(8.0)
+    paths: list[str] = []
+    for day in sorted(days):
+        got = form4.daily_index_paths(day, client=client)
+        if got:
+            print(f"  {day}: {len(got):,} filings")
+        paths.extend(got)
+    print(f"reading {len(paths):,} Form 4s (4 and 4/A)")
+
+    filings, failed = [], 0
+    for accession, text in form4.fetch_documents(paths, client=client, pacer=pacer):
+        try:
+            filings.append(form4.parse(text, accession=accession))
+        except form4.Form4Error:
+            failed += 1
+    client.close()
+
+    kept = form4.supersede(filings)
+    print(f"  parsed {len(filings):,} (failed {failed}); "
+          f"{len(filings) - len(kept):,} superseded by a 4/A")
+
+    found = form4.clusters(
+        kept,
+        insider_floor=args.insider_floor,
+        tenpct_floor=args.tenpct_floor,
+        window_days=args.window_days,
+        min_buyers=args.min_buyers,
+    )
+
+    for role, floor in ((form4.INSIDER, args.insider_floor),
+                        (form4.TEN_PERCENT, args.tenpct_floor)):
+        rows = found[role]
+        label = "officer / director" if role == form4.INSIDER else "10% holders"
+        print(f"\n--- {label}: {len(rows)} clusters "
+              f"(>= {args.min_buyers} buyers, >= ${floor:,.0f}, "
+              f"{args.window_days}d window) ---")
+        if not rows:
+            print("    (none)")
+            continue
+        print(f"    {'issuer':<10} {'cik':<12} {'window':<24} {'buyers':>6} "
+              f"{'value':>16}  flags")
+        for c in rows[: args.top]:
+            flags = f"{c.planned_buys} planned" if c.planned_buys else ""
+            window = (f"{c.first}" if c.first == c.last
+                      else f"{c.first} .. {c.last}")
+            print(f"    {(c.symbol or '-'):<10} {c.issuer_cik:<12} {window:<24} "
+                  f"{len(c.buyers):>6} ${c.value:>15,.0f}  {flags}")
+            if args.names:
+                print(f"      {', '.join(c.names)[:96]}")
     return EXIT_OK
 
 
@@ -632,6 +754,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "dashboard":
         load_dotenv()
         return _cmd_dashboard(args)
+
+    if args.command == "form4":
+        load_dotenv()
+        try:
+            return _cmd_form4(args)
+        except Exception as exc:
+            print(f"mr form4: error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
 
     if args.command == "edgar":
         load_dotenv()

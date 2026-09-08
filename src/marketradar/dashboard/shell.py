@@ -290,7 +290,7 @@ def _esc(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
-def _panel_html(panel: Panel, state: str, detail: str) -> str:
+def _panel_html(panel: Panel, state: str, detail: str, body: str = "") -> str:
     color, glyph = STATE_STYLE[state]
     waiting = ""
     if state != LIVE and detail:
@@ -301,7 +301,8 @@ def _panel_html(panel: Panel, state: str, detail: str) -> str:
     elif detail:
         waiting = f'<p class="why"><span class="why-k">now</span> {_esc(detail)}</p>'
     return f"""
-      <article class="panel" data-state="{_esc(state)}" data-panel="{_esc(panel.id)}">
+      <article class="panel{' wide' if body else ''}"
+               data-state="{_esc(state)}" data-panel="{_esc(panel.id)}">
         <header>
           <h3>{_esc(panel.title)}</h3>
           <span class="chip" style="--chip:{color}">
@@ -310,11 +311,31 @@ def _panel_html(panel: Panel, state: str, detail: str) -> str:
         </header>
         <p class="what">{_esc(panel.what)}</p>
         {waiting}
-        <div class="slot" aria-hidden="true"></div>
+        <div class="slot">{body}</div>
       </article>"""
 
 
-def render(ctx: Context, panels: tuple[Panel, ...] = PANELS) -> str:
+def render(
+    ctx: Context,
+    panels: tuple[Panel, ...] = PANELS,
+    digest: Any = None,
+) -> str:
+    """The page. With a digest, health/macro/screens get real bodies.
+
+    Without one the shell still renders -- a dashboard that refuses to draw
+    because prices are unreachable is less useful than one that opens with
+    the panel that says so.
+    """
+    bodies: dict[str, str] = {}
+    if digest is not None:
+        from marketradar.dashboard import panels as body_html
+
+        bodies = {
+            "health": body_html.health_html(digest),
+            "macro": body_html.macro_html(digest),
+            "screens": body_html.screens_html(digest),
+        }
+
     resolved = [(p, *p.resolve(ctx)) for p in panels]
     counts = {s: sum(1 for _, st, _ in resolved if st == s)
               for s in (LIVE, WAITING, NOT_BUILT)}
@@ -324,7 +345,9 @@ def render(ctx: Context, panels: tuple[Panel, ...] = PANELS) -> str:
         items = [r for r in resolved if r[0].section == section]
         if not items:
             continue
-        body = "".join(_panel_html(p, st, d) for p, st, d in items)
+        body = "".join(
+            _panel_html(p, st, d, bodies.get(p.id, "")) for p, st, d in items
+        )
         sections.append(
             f'<section><h2>{_esc(section)}</h2><div class="grid">{body}</div></section>'
         )
@@ -337,6 +360,11 @@ def render(ctx: Context, panels: tuple[Panel, ...] = PANELS) -> str:
     )
     notes = "".join(f"<li>{_esc(n)}</li>" for n in ctx.notes)
     stamp = ctx.generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    script = ""
+    if bodies:
+        from marketradar.dashboard.panels import SCRIPT
+
+        script = f"<script>{SCRIPT}</script>"
 
     return f"""<!doctype html>
 <html lang="en"><head>
@@ -405,6 +433,51 @@ h3 {{ font-size:14px; margin:0; font-weight:600; }}
 .notes {{ margin:18px 0 0; padding-left:18px; color:var(--muted); font-size:12px; }}
 footer {{ margin-top:40px; color:var(--muted); font-size:11.5px;
           border-top:1px solid var(--rule); padding-top:12px; }}
+.panel.wide {{ grid-column:1/-1; }}
+.status {{ display:flex; align-items:center; gap:7px; margin:10px 0 8px;
+           font-weight:600; font-size:13px; }}
+.status .glyph {{ color:var(--chip); font-size:12px; font-weight:700; }}
+table {{ border-collapse:collapse; width:100%; font-size:12.5px; }}
+.kv td, .kv th {{ padding:3px 10px 3px 0; text-align:left; vertical-align:top; }}
+.kv th {{ color:var(--muted); font-weight:600; font-size:11px;
+          text-transform:uppercase; letter-spacing:.05em; }}
+.kv tr.bad td {{ color:var(--ink); }}
+td.mark {{ color:#d03b3b; font-weight:700; width:12px; }}
+.note {{ color:var(--muted); }}
+.num {{ text-align:right; font-variant-numeric:tabular-nums; }}
+.strong {{ font-weight:600; }}
+.up {{ color:#0ca30c; }} .down {{ color:#d03b3b; }}
+.empty {{ color:var(--muted); font-size:12.5px; }}
+.filters {{ display:flex; gap:6px; flex-wrap:wrap; margin:12px 0 14px; }}
+button.f {{
+  font:inherit; font-size:11.5px; cursor:pointer; color:var(--ink-2);
+  background:var(--plane); border:1px solid var(--rule);
+  border-radius:999px; padding:3px 11px;
+}}
+button.f.sel {{ background:var(--ink); color:var(--surface); border-color:var(--ink); }}
+details.list {{ border-top:1px solid var(--rule); padding:7px 0; }}
+details.list[hidden] {{ display:none; }}
+summary {{
+  cursor:pointer; display:flex; align-items:baseline; gap:10px;
+  list-style:none; font-size:12.5px;
+}}
+summary::-webkit-details-marker {{ display:none; }}
+summary::before {{ content:"B8"; color:var(--muted); font-size:10px; }}
+details[open] > summary::before {{ content:"BE"; }}
+.ltitle {{ font-weight:600; }}
+.count {{ color:var(--muted); font-size:11px; }}
+.peek {{ margin-left:auto; color:var(--ink-2); font-variant-numeric:tabular-nums; }}
+.peek.empty {{ color:var(--muted); }}
+table.rows {{ margin:8px 0 4px; }}
+table.rows th {{
+  color:var(--muted); font-weight:600; font-size:10.5px; text-align:left;
+  text-transform:uppercase; letter-spacing:.05em; padding:4px 8px 4px 0;
+  border-bottom:1px solid var(--rule); cursor:pointer; user-select:none;
+}}
+table.rows th.num {{ text-align:right; }}
+table.rows td {{ padding:3px 8px 3px 0; border-bottom:1px solid var(--rule); }}
+td.tk {{ font-weight:600; font-variant-numeric:tabular-nums; }}
+td.new {{ color:#0ca30c; font-size:9.5px; font-weight:700; width:26px; }}
 </style></head>
 <body>
 <h1>Market Radar</h1>
@@ -416,6 +489,7 @@ footer {{ margin-top:40px; color:var(--muted); font-size:11.5px;
   Local file. Never published: the screens are computed from Tiingo prices, so
   putting them on a public host is redistribution.
 </footer>
+{script}
 </body></html>
 """
 
@@ -424,12 +498,13 @@ def write(
     path: Path | None = None,
     con: duckdb.DuckDBPyConnection | None = None,
     ctx: Context | None = None,
+    digest: Any = None,
 ) -> Path:
     """Render to a gitignored local file. There is no publish counterpart."""
     target = Path(path) if path else DEFAULT_OUTPUT
     target.parent.mkdir(parents=True, exist_ok=True)
     ctx = ctx or gather(con)
-    target.write_text(render(ctx), encoding="utf-8")
+    target.write_text(render(ctx, digest=digest), encoding="utf-8")
     return target
 
 

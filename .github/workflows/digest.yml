@@ -1,0 +1,93 @@
+name: digest
+
+# The daily email. Triggered by the price sweep *finishing*, not by its own
+# clock: a digest rendered mid-sweep is a digest of half the market, and the
+# sweep takes ~95 minutes and starts whenever GitHub gets round to it. Last
+# week the schedule fired 4h47m late, so any fixed time here would have
+# rendered against a partially-written partition.
+
+on:
+  workflow_run:
+    workflows: ["prices"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Render only, send nothing"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: digest
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Only after a sweep that actually succeeded. A red sweep leaves the
+    # partition mid-rewrite, and a digest of that is worse than no digest --
+    # it looks exactly like a normal morning.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Macro
+        # Rates and spreads are three requests and change daily; rendering
+        # yesterday's macro line beside today's screens would be quietly
+        # wrong. Not fatal: the digest reports a stale macro line rather
+        # than refusing to send.
+        continue-on-error: true
+        env:
+          MR_FRED_API_KEY: ${{ secrets.MR_FRED_API_KEY }}
+          MR_POSTGRES_DSN: ${{ secrets.MR_POSTGRES_DSN }}
+        run: uv run mr fred
+
+      - name: Render and send
+        id: digest
+        env:
+          MR_ENV: ci
+          MR_R2_ACCOUNT_ID: ${{ secrets.MR_R2_ACCOUNT_ID }}
+          MR_R2_ACCESS_KEY_ID: ${{ secrets.MR_R2_ACCESS_KEY_ID }}
+          MR_R2_SECRET_ACCESS_KEY: ${{ secrets.MR_R2_SECRET_ACCESS_KEY }}
+          MR_R2_BUCKET: ${{ vars.MR_R2_BUCKET || 'market-radar' }}
+          MR_POSTGRES_DSN: ${{ secrets.MR_POSTGRES_DSN }}
+          MR_RESEND_API_KEY: ${{ secrets.MR_RESEND_API_KEY }}
+          MR_DIGEST_FROM: ${{ vars.MR_DIGEST_FROM || 'onboarding@resend.dev' }}
+          MR_DIGEST_TO: ${{ secrets.MR_DIGEST_TO }}
+        run: |
+          uv run mr digest ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      # No `continue-on-error` on the step above. A StaleDataError exits
+      # non-zero and the job goes red: an email that renders green off empty
+      # screens is the failure this project exists to prevent, and it is
+      # worse here than in the sweep because it *looks* like a normal morning.
+
+      - name: Summary
+        if: success() || failure()
+        run: |
+          {
+            echo "### digest"
+            echo ""
+            echo "- outcome: \`${{ steps.digest.outcome }}\`"
+            echo "- trigger: \`${{ github.event_name }}\`"
+            echo "- upstream sweep: \`${{ github.event.workflow_run.conclusion || 'n/a' }}\`"
+            echo "- dry run: \`${{ inputs.dry_run || false }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final, Iterable, Iterator
 from xml.etree import ElementTree as ET
@@ -415,3 +415,191 @@ def fetch_documents(
     finally:
         if owns:
             client.close()
+
+
+# --- clusters -----------------------------------------------------------
+
+#: Placeholders EDGAR accepts in issuerTradingSymbol. A company with no
+#: listed equity files them literally, so they are a *name*, not a ticker,
+#: and four of the twelve largest candidates in a sample week carried one.
+#: The issuer is keyed on CIK; the symbol is a display hint that may be absent.
+_NO_SYMBOL: Final[frozenset[str]] = frozenset({"", "N/A", "NONE", "-", "NA", "N/A."})
+
+#: 72 hours, expressed in calendar days because transactionDate is a date.
+#: Three days spans a Friday-to-Monday cluster, which is the common shape --
+#: insiders act on the same news and file across a weekend.
+CLUSTER_WINDOW_DAYS: Final[int] = 3
+
+MIN_CLUSTER_BUYERS: Final[int] = 2
+
+#: Per-list floors. Different by two orders of magnitude because the two
+#: populations are: in a sample week the median officer/director cluster was
+#: $339k and the median 10%-holder cluster $26.4M. A single threshold either
+#: deletes almost every insider cluster or admits trivial fund activity.
+#: One week is a hypothesis -- these are parameters, not constants.
+DEFAULT_INSIDER_FLOOR: Final[Decimal] = Decimal("50000")
+DEFAULT_TENPCT_FLOOR: Final[Decimal] = Decimal("1000000")
+
+INSIDER: Final[str] = "insider"
+TEN_PERCENT: Final[str] = "ten_percent"
+
+
+def display_symbol(raw: str | None) -> str | None:
+    """The ticker, or None when the filer said there isn't one."""
+    if raw is None:
+        return None
+    cleaned = raw.strip().upper()
+    return None if cleaned in _NO_SYMBOL else cleaned
+
+
+@dataclass(frozen=True, slots=True)
+class Buy:
+    """One person's open-market purchase at one issuer on one day."""
+
+    issuer_cik: str
+    issuer_name: str
+    symbol: str | None
+    buyer: str
+    buyer_name: str
+    role: str                       # INSIDER | TEN_PERCENT
+    on: date
+    value: Decimal
+    accession: str | None
+    planned: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Cluster:
+    issuer_cik: str
+    issuer_name: str
+    symbol: str | None
+    role: str
+    first: date
+    last: date
+    buys: list[Buy] = field(default_factory=list)
+
+    @property
+    def buyers(self) -> set[str]:
+        return {b.buyer for b in self.buys}
+
+    @property
+    def value(self) -> Decimal:
+        return sum((b.value for b in self.buys), Decimal(0))
+
+    @property
+    def planned_buys(self) -> int:
+        return sum(1 for b in self.buys if b.planned)
+
+    @property
+    def names(self) -> list[str]:
+        seen, out = set(), []
+        for b in self.buys:
+            if b.buyer not in seen:
+                seen.add(b.buyer)
+                out.append(b.buyer_name)
+        return out
+
+
+def purchases(filings: Iterable[Form4]) -> list[Buy]:
+    """Every open-market purchase, one row per (buyer, transaction).
+
+    Keyed on ``transaction_date``, not ``periodOfReport``. A late-filed Form 4
+    reports an old trade, and grouping on the period pulls transactions from
+    months earlier into this week's window -- one issuer in a sample week
+    showed up dated 2025-10-24 alongside filings from September.
+
+    A joint filing reports the *same* shares under several reporting persons,
+    so the value is divided among them rather than counted once each.
+    """
+    out: list[Buy] = []
+    for f in filings:
+        if not f.issuer_cik:
+            continue
+        buyers = [
+            (o, INSIDER if o.is_insider else TEN_PERCENT)
+            for o in f.owners
+            if o.is_insider or o.is_ten_percent
+        ]
+        if not buyers:
+            continue
+        for txn in f.purchases:
+            when = txn.transaction_date or f.period_of_report
+            if when is None:
+                continue
+            share = (txn.value or Decimal(0)) / len(buyers)
+            for owner, role in buyers:
+                out.append(
+                    Buy(
+                        issuer_cik=f.issuer_cik,
+                        issuer_name=f.issuer_name,
+                        symbol=display_symbol(f.issuer_symbol),
+                        buyer=owner.cik or owner.name,
+                        buyer_name=owner.name,
+                        role=role,
+                        on=when,
+                        value=share,
+                        accession=f.accession,
+                        planned=f.is_planned,
+                    )
+                )
+    return out
+
+
+def clusters(
+    filings: Iterable[Form4],
+    *,
+    insider_floor: Decimal = DEFAULT_INSIDER_FLOOR,
+    tenpct_floor: Decimal = DEFAULT_TENPCT_FLOOR,
+    window_days: int = CLUSTER_WINDOW_DAYS,
+    min_buyers: int = MIN_CLUSTER_BUYERS,
+) -> dict[str, list[Cluster]]:
+    """Two lists, kept apart: officer/director clusters and 10%-holder ones.
+
+    Separate rather than merged or filtered, for the same reason ETFs are
+    kept out of the stock lists: they are different signals at different
+    scales. Measured on a sample week the medians were $339k and $26.4M --
+    78x apart -- so one threshold cannot serve both, which is why the floors
+    are per list and are parameters rather than constants.
+
+    Someone who is both an officer and a 10% holder counts as an insider. A
+    CEO who happens to hold 12% is an insider who is large, not a fund.
+    """
+    floors = {INSIDER: insider_floor, TEN_PERCENT: tenpct_floor}
+    by_key: dict[tuple[str, str], list[Buy]] = {}
+    for buy in purchases(filings):
+        by_key.setdefault((buy.issuer_cik, buy.role), []).append(buy)
+
+    out: dict[str, list[Cluster]] = {INSIDER: [], TEN_PERCENT: []}
+    span = timedelta(days=window_days - 1)
+
+    for (cik, role), buys in by_key.items():
+        buys.sort(key=lambda b: b.on)
+        i = 0
+        while i < len(buys):
+            # Greedy, non-overlapping: open a window at the earliest buy not
+            # yet placed and take everything within it. Overlapping windows
+            # would report the same purchase in two clusters.
+            start = buys[i].on
+            window = [b for b in buys[i:] if b.on <= start + span]
+            i += len(window)
+            if len({b.buyer for b in window}) < min_buyers:
+                continue
+            total = sum((b.value for b in window), Decimal(0))
+            if total < floors[role]:
+                continue
+            head = window[0]
+            out[role].append(
+                Cluster(
+                    issuer_cik=cik,
+                    issuer_name=head.issuer_name,
+                    symbol=head.symbol,
+                    role=role,
+                    first=start,
+                    last=max(b.on for b in window),
+                    buys=window,
+                )
+            )
+
+    for role in out:
+        out[role].sort(key=lambda c: c.value, reverse=True)
+    return out
