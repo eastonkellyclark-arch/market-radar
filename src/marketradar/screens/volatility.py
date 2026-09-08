@@ -42,6 +42,7 @@ from typing import Any, Final, Iterable, Iterator
 import duckdb
 
 from marketradar import manifest, storage
+from marketradar.clock import market_today
 from marketradar.freshness import assert_fresh
 
 log = logging.getLogger(__name__)
@@ -148,7 +149,9 @@ def read_prices(
     con: duckdb.DuckDBPyConnection, as_of: date | None = None
 ) -> duckdb.DuckDBPyRelation:
     """Raw prices for the partitions a screen on ``as_of`` needs."""
-    as_of = as_of or date.today()
+    # Trading date, not local or UTC date -- the screen runs right after the
+    # sweep, in the same window where the three disagree.
+    as_of = as_of or market_today()
     rels = [
         storage.read_dataset(DATASET, year, con=con) for year in _price_years(as_of)
     ]

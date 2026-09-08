@@ -265,9 +265,12 @@ def fetch_universe(
 
     cutoff = None
     if active_within_days is not None:
-        cutoff = (today or datetime.now(timezone.utc).date()) - timedelta(
-            days=active_within_days
-        )
+        # Trading date: the cutoff is compared against each row's endDate,
+        # which is a session date, so anchoring it on the UTC clock shifts the
+        # whole "currently trading" boundary by a day every night.
+        from marketradar.clock import market_today
+
+        cutoff = (today or market_today()) - timedelta(days=active_within_days)
 
     out: list[TickerMeta] = []
     for row in rows:
@@ -669,5 +672,13 @@ def upsert_corporate_actions(
 
 
 def default_window(days: int = 5, today: date | None = None) -> tuple[date, date]:
-    end = today or datetime.now(timezone.utc).date()
+    """The sweep window, anchored on the trading date rather than UTC.
+
+    See :mod:`marketradar.clock`: the nightly cron runs after the UTC rollover
+    but before the ET one, so a UTC-derived end date is a day ahead of the
+    session that just closed.
+    """
+    from marketradar.clock import market_today
+
+    end = today or market_today()
     return end - timedelta(days=days), end

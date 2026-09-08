@@ -179,13 +179,18 @@ def _cmd_prices(args: argparse.Namespace) -> int:
     import time
     from pathlib import Path as _Path
 
+    from datetime import timedelta
+
     from marketradar import storage
+    from marketradar.clock import market_today
     from marketradar.sources import tiingo
 
-    end = args.date or __import__("datetime").datetime.now(
-        __import__("datetime").timezone.utc
-    ).date()
-    start = args.start or (end - __import__("datetime").timedelta(days=args.days))
+    # The trading date, not the UTC date. At 03:30 UTC the UTC calendar has
+    # rolled over but the US market has not, so a UTC-derived date names a
+    # session that has not happened -- and on January 1st it files December
+    # 31st's bars into next year's immutable partition.
+    end = args.date or market_today()
+    start = args.start or (end - timedelta(days=args.days))
     partition = str(end.year)
 
     # Validate credentials before downloading anything. The universe zip is
