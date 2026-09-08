@@ -596,6 +596,41 @@ def _write_parquet(
 # --------------------------------------------------------------------------
 
 
+def _q(value: str) -> str:
+    """Escape a single-quoted SQL literal. Locations come from the
+    manifest, which is trusted config, but COPY targets cannot be bound
+    as parameters so they are escaped rather than trusted twice."""
+    return value.replace("'", "''")
+
+
+class PartitionShrankError(TiingoError):
+    """A publish would have made a partition smaller than it already was.
+
+    Almost always means the merge did not happen and the sweep window was
+    about to overwrite accumulated history. Overridable, because a deliberate
+    restatement is a real thing, but never silently.
+    """
+
+
+def _existing_rows(con: duckdb.DuckDBPyConnection, location: str) -> int | None:
+    """Row count already published at ``location``, or None if there is none.
+
+    A missing object is the normal first-publish case, not an error, and is
+    indistinguishable from an unreadable one at this layer — both mean "no
+    prior history to merge", and the shrink guard below is what makes that
+    safe to assume.
+    """
+    try:
+        return int(
+            con.execute(
+                "SELECT count(*) FROM read_parquet(?)", [location]
+            ).fetchone()[0]
+        )
+    except duckdb.Error as exc:
+        log.info("no existing partition at %s (%s)", location, str(exc)[:120])
+        return None
+
+
 def publish(
     staging: Path,
     partition: str,
@@ -603,12 +638,31 @@ def publish(
     con: duckdb.DuckDBPyConnection | None = None,
     min_rows: int,
     max_staleness_days: int = 4,
+    restate: bool = False,
 ) -> Any:
-    """Merge staged chunks, publish to the manifest location, assert freshness.
+    """Merge published + staged, rewrite the whole partition, assert freshness.
 
-    The destination is resolved through the manifest, which is what keeps
-    vendor data off GitHub Releases: ``prices_*`` is declared ``r2`` and a
-    test fails the build if that ever changes.
+    Parquet has no upsert, so a partition is always rewritten whole. The thing
+    that matters is *what goes into the rewrite*: the previously published file
+    as well as this sweep's chunks. Rewriting from staging alone silently
+    discards every session outside the sweep window, which is how a
+    year-partitioned store ends up holding two days.
+
+    Dedupe is on ``(ticker, date, source)`` keeping the newest ``ingested_at``,
+    so a re-run of an overlapping window replaces those bars rather than
+    duplicating them, and history outside the window is carried forward
+    untouched.
+
+    The merge streams through a local file rather than reading and writing the
+    same remote object in one statement. DuckDB's COPY is lazy, and pointing
+    the read side of a query at the object the write side is replacing is a
+    good way to produce a truncated file. It also keeps memory flat: a full
+    year is millions of rows and neither side is ever materialised in RAM.
+
+    Raises :class:`PartitionShrankError` if the merged result would be smaller
+    than what is already published. That is the assertion this function
+    needed on day one — the overwrite bug produced a *valid, fresh, smaller*
+    partition every night, and every other check passed it.
     """
     ref = manifest.get(DATASET, partition)
     if ref.backend not in manifest.PRIVATE_BACKENDS:
@@ -624,25 +678,86 @@ def publish(
         raise TiingoError(f"No staged chunks in {staging}; nothing to publish.")
 
     pattern = (staging / "chunk_*.parquet").as_posix()
-    # Idempotent by rewrite: Parquet has no upsert, so dedupe on the natural
-    # key keeping the newest ingest and rewrite the whole partition.
-    con.execute(
-        f"""
-        CREATE OR REPLACE VIEW merged AS
+    prior_rows = _existing_rows(con, ref.location)
+
+    if prior_rows is None or restate:
+        source_sql = f"SELECT * FROM read_parquet('{pattern}')"
+        if restate:
+            log.warning(
+                "restating %s/%s from staging alone; %s existing rows will be "
+                "replaced, not merged",
+                DATASET, partition,
+                "0" if prior_rows is None else f"{prior_rows:,}",
+            )
+        else:
+            log.info("first publish of %s/%s", DATASET, partition)
+    else:
+        # Column sets are compared before the union so schema drift reports as
+        # schema drift. UNION ALL BY NAME would otherwise fill a renamed or
+        # dropped column with NULLs and publish it looking healthy.
+        staged_cols = {c.lower() for c in con.sql(
+            f"SELECT * FROM read_parquet('{pattern}') LIMIT 0").columns}
+        published_cols = {c.lower() for c in con.sql(
+            "SELECT * FROM read_parquet(?) LIMIT 0", params=[ref.location]).columns}
+        if staged_cols != published_cols:
+            raise TiingoError(
+                f"{DATASET}/{partition}: staged and published schemas differ. "
+                f"only in staging: {sorted(staged_cols - published_cols)}; "
+                f"only in published: {sorted(published_cols - staged_cols)}. "
+                "Refusing to merge -- resolve the schema change deliberately."
+            )
+        source_sql = (
+            f"SELECT * FROM read_parquet('{pattern}') "
+            "UNION ALL BY NAME "
+            f"SELECT * FROM read_parquet('{_q(ref.location)}')"
+        )
+
+    merged_sql = f"""
         SELECT * EXCLUDE (rn) FROM (
             SELECT *, row_number() OVER (
                 PARTITION BY ticker, date, source ORDER BY ingested_at DESC
             ) AS rn
-            FROM read_parquet('{pattern}')
+            FROM ({source_sql})
         ) WHERE rn = 1
-        """
-    )
-    con.execute(f"COPY merged TO '{ref.location}' (FORMAT parquet)")
+    """
 
-    rel = con.view("merged")
+    local = staging / "merged.parquet"
+    if local.exists():
+        local.unlink()
+    con.execute(f"COPY ({merged_sql}) TO '{local.as_posix()}' (FORMAT parquet)")
+
+    merged_rel = con.read_parquet(local.as_posix())
+    merged_rows = int(
+        con.execute(
+            "SELECT count(*) FROM read_parquet(?)", [local.as_posix()]
+        ).fetchone()[0]
+    )
+
+    if prior_rows is not None and merged_rows < prior_rows and not restate:
+        raise PartitionShrankError(
+            f"{DATASET}/{partition}: publishing would take the partition from "
+            f"{prior_rows:,} rows to {merged_rows:,}, a loss of "
+            f"{prior_rows - merged_rows:,}. A sweep adds sessions; it does not "
+            "remove them. This is what an overwrite-instead-of-merge looks "
+            "like. If the shrink is deliberate -- a restatement, or purging "
+            "symbols that should never have been swept -- pass restate=True, "
+            "which publishes exactly what is staged and merges nothing."
+        )
+
+    con.execute(
+        f"COPY (SELECT * FROM read_parquet('{local.as_posix()}')) "
+        f"TO '{_q(ref.location)}' (FORMAT parquet)"
+    )
+    log.info(
+        "%s/%s: %s -> %s rows",
+        DATASET, partition,
+        "first publish" if prior_rows is None else f"{prior_rows:,}",
+        f"{merged_rows:,}",
+    )
+
     observed = assert_fresh(
         DATASET,
-        rel,
+        merged_rel,
         partition=partition,
         min_rows=min_rows,
         expect_cols=("ticker", "close", "volume", "source"),
