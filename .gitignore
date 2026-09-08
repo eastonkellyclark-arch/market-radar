@@ -47,3 +47,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Dashboard output. The screens are computed from Tiingo prices, so the
+# rendered file is vendor data in browsable form -- never committed, never
+# published, never a Release asset. Same boundary that put prices in R2.
+# See docs/build-spec.md, "The UI track".
+.dashboard/
+dashboard.html

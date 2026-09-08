@@ -400,6 +400,79 @@ after the day's work.
 
 ## 5. Build order
 
+### The UI track
+
+Runs *alongside* the weekends, not after them. This was in the original
+requirements, got dropped, and every feature since has shipped headless —
+which is how you end up with twenty-four screen lists that exist only as
+terminal scrollback and a digest nobody scheduled.
+
+**A feature is not done until its panel exists.** That is a third exit
+criterion on every weekend from here, alongside "it runs" and "corrupting the
+data turns it red". A placeholder panel counts, provided it says what it is
+waiting for.
+
+#### Shape
+
+`mr dashboard` writes **one static HTML file** and opens it in the browser.
+No server, no build step, no framework, no network at view time. Data is
+embedded as JSON in the file rather than fetched, because a `file://` page
+cannot fetch its neighbours and adding a server to work around that would
+trade the whole point of the constraint for nothing.
+
+**Never GitHub Pages, and never a Release asset.** The screens are computed
+from Tiingo prices, so publishing them is redistribution — the same boundary
+that put `prices_eod_raw` in R2 and keeps FRED's ICE series local. The output
+path is gitignored. A test asserts the dashboard writer has no publish path,
+the same way `sources/fred.py` has none.
+
+#### The shell is the map
+
+Panels are declared up front — including the ones that do not exist yet — and
+each renders one of three states:
+
+| state | meaning |
+|---|---|
+| **live** | data is present and current |
+| **waiting** | built, but the data it needs has not landed. Says which data. |
+| **not built** | on the roadmap. Says which weekend. |
+
+The point is that the dashboard is a picture of the whole system rather than
+of the parts that happen to work. An absent panel is indistinguishable from a
+broken one; a panel that says "waiting on the 10-year backfill" is not.
+
+#### Panels
+
+| panel | state today | needs |
+|---|---|---|
+| Health | live | — |
+| Macro | live | — |
+| Screens (24 lists, ungated collapsed) | live | — |
+| Company names on screen rows | live | 54% coverage; the rest need W4 entity work |
+| EDGAR filing feed | live | — |
+| Form 4 clusters | W3 | cluster detection |
+| Ticker detail — price chart | waiting | 10-year backfill |
+| Day-over-day / NEW markers | waiting | 2+ sessions of universe history |
+| Liquidity gate (12 of the 24 lists) | **waiting, see below** | trailing-window ADV |
+| News | not built | W3 |
+| M&A teardowns | not built | W3–beyond |
+| Deal multiples | not built | beyond |
+| Historical outcomes | not built | beyond |
+| DCF / 3-statement | not built | beyond |
+| Pitch decks | not built | beyond |
+
+#### Blocking issue, ahead of the backfill
+
+`screens/volatility.py` computes average dollar volume with **no time
+window** — it averages every row in the partitions it reads. With three
+sessions loaded that is accidentally a recent average. With 2025 and 2026
+full it becomes a ~1.7-year average, and a name that traded $50M/day in early
+2025 and $200k/day now passes the >$5M gate. Twelve of the twenty-four lists
+are gated on that number.
+
+Fix the window before the backfill, not after: the gate silently changes
+meaning the moment the data arrives, and nothing fails.
+
 ### Weekend 1 — Skeleton and prices
 
 Deliberately boring. Every later weekend assumes this layer is trustworthy.
@@ -450,7 +523,33 @@ Notes:
 - `sources/fred.py` — 10-year Treasury, credit spreads
 - `digest.py` — first daily email to yourself
 
-**Exit:** a daily email with six top-20 lists you'd actually read.
+**UI (retrofit — this weekend shipped headless):**
+
+- `U0` `dashboard/shell.py` — `mr dashboard`, the panel registry, the three
+  render states, gitignored output
+- `U1` health, macro and the 24 screen lists as live panels; ungated lists
+  collapsed by default; sort and filter by band and security type
+- `U2` `.github/workflows/digest.yml` — the digest is built and reviewed but
+  nothing schedules it. Triggered by `prices.yml` completing, not by its own
+  clock: a digest rendered mid-sweep is a digest of half the market.
+
+**Exit:** a daily email with six top-20 lists you'd actually read, and the
+same lists in a browser without a terminal.
+
+### Weekend 2.5 — Backfill and the liquidity gate
+
+Pulled out of "Beyond" because everything comparative waits on it, and
+because two things must land in the right order.
+
+- `T1` trailing-window ADV in `screens/volatility.py` — **before** the
+  backfill (see the UI track)
+- `T2` 10-year backfill, 2016-01-01 to the last complete session, aligned to
+  year boundaries
+- `U3` ticker detail panel — price chart per name, activated by T2
+- `U4` day-over-day and NEW markers move from *waiting* to *live*
+
+**Exit:** clicking a ticker shows ten years of bars, and the liquid lists mean
+what they say.
 
 ### Weekend 3 — Sentinels
 
@@ -460,7 +559,16 @@ Notes:
 - `sources/sec_suspensions.py`
 - `sources/gdelt.py` and `sources/finnhub_news.py` → `signals`
 
-**Exit:** a merger filing lands and appears in your digest the same day.
+**UI:**
+
+- `U5` filing feed panel — the seven watched form types, newest first
+- `U6` Form 4 cluster panel — **two lists, not one**: officer/director
+  clusters and 10%-holder clusters, kept apart for the same reason ETFs are
+  kept apart from stocks. Dollar-weighted, plan purchases flagged.
+- `U7` news panel — replaces the "not built" placeholder
+
+**Exit:** a merger filing lands and appears in your digest *and on the
+dashboard* the same day.
 
 ### Weekend 4 — Private company data
 
@@ -475,8 +583,16 @@ human-confirmable record. Budget more time than the other three weekends.
 - `sources/usaspending.py` — contract awards
 - `screens/mature_target.py` — v1
 
+**UI:**
+
+- `U8` private-company panel — NAICS, employee count, three-year trend
+- `U9` entity review queue — the fuzzy sponsor-name matches, confirmed or
+  rejected by hand. This one is a *working* surface rather than a readout,
+  and it is the panel most likely to justify the whole track: the alternative
+  is resolving 5500 sponsor names in a terminal.
+
 **Exit:** query private companies in your target NAICS by employee count and
-three-year trend.
+three-year trend, and clear a review queue without writing SQL.
 
 ### Beyond
 
@@ -493,6 +609,23 @@ three-year trend.
 - DCF / 3-statement engine
 - python-pptx deck generation
 - FMCSA, OSHA, EPA, state licensing, state SoS/UCC as sectors demand
+
+**UI, paired to each of the above rather than trailing them:**
+
+- `U10` XBRL fundamentals panel — ships with `tag_map.py`, not after it. The
+  tag map is maintained by hand and branches by SIC code; a panel showing
+  which tags resolved and which fell through is the fastest way to find the
+  next branch it needs.
+- `U11` M&A teardown panel — replaces the placeholder
+- `U12` deal multiples and historical outcome distributions — the forward
+  return join is pure SQL and needs no LLM, so this panel can precede every
+  embedding
+- `U13` DCF / 3-statement panel
+- `U14` deck preview — the generated pitch deck, before it is a file
+
+The placeholders for all of these exist from `U0`. They say "not built yet"
+and which weekend, so the shell is a roadmap you can look at rather than one
+you have to remember.
 
 ---
 
