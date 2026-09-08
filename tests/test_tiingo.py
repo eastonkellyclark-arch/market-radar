@@ -317,10 +317,33 @@ def test_foreign_exchanges_are_excluded() -> None:
 
 
 def test_exchange_test_symbols_are_excluded() -> None:
-    """NYSE publishes ATEST* as live-looking rows. They are not listings and
-    would otherwise reach the screens."""
-    for t in ("ATEST", "ATEST-A", "ATEST-Z"):
+    """Every venue publishes live-looking rows that are not securities.
+
+    Regression with a date on it: on 2026-09-04, ZVZZT reached the screens and
+    took the top of the liquid $10+ loser list at -86.75% on a fabricated
+    $7.6M average dollar volume. The filter covered NYSE's family only.
+    """
+    nyse = ("ATEST", "ATEST-A", "ATEST-B", "ATEST-Z")
+    nasdaq = ("ZAZZT", "ZBZZT", "ZCZZT", "ZJZZT", "ZVZZT", "ZWZZT", "ZXZZT")
+    cboe = ("ZTEST", "TEST")
+
+    for t in nyse:
         assert tiingo.include_row(_row(ticker=t, exchange="NYSE MKT"), CUTOFF) is False
+    for t in nasdaq:
+        assert tiingo.include_row(_row(ticker=t, exchange="NASDAQ"), CUTOFF) is False
+    for t in cboe:
+        assert tiingo.include_row(_row(ticker=t, exchange="BATS"), CUTOFF) is False
+
+
+def test_real_tickers_that_merely_start_like_test_symbols_survive() -> None:
+    """The reason this is a pattern and not a prefix list.
+
+    Tiingo carries TESTF, TESTJ, TESTK, TESTM, TESTS, TESTT and TESTY. They
+    are OTC today and excluded by exchange, but a bare ``startswith("TEST")``
+    would silently drop all seven the moment the OTC band is switched on.
+    """
+    for t in ("TESTF", "TESTJ", "TESTM", "TESTY", "ZAZZTX", "ATESTING"):
+        assert tiingo.include_row(_row(ticker=t, exchange="NASDAQ"), CUTOFF) is True
 
 
 def test_non_equity_asset_types_are_excluded() -> None:

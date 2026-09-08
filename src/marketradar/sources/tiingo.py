@@ -23,6 +23,7 @@ import io
 import logging
 import os
 import random
+import re
 import time
 import zipfile
 from dataclasses import dataclass
@@ -193,9 +194,27 @@ def _client() -> httpx.Client:
 #: names most likely to be interesting.
 ACTIVE_WITHIN_DAYS: Final[int] = 30
 
-#: Exchange test symbols. NYSE publishes ATEST* as live-looking rows; they are
-#: not real listings and would otherwise reach the screens.
-TEST_SYMBOL_PREFIXES: Final[tuple[str, ...]] = ("ATEST",)
+#: Exchange test symbols. Every US venue publishes a handful of live-looking
+#: rows that carry quotes and volume but are not securities, and they reach
+#: the screens looking exactly like real moves. ZVZZT topped the liquid $10+
+#: loser list at -86.75% on a fabricated $7.6M average dollar volume before
+#: this was widened past NYSE's family.
+#:
+#: * ``ATEST``   -- NYSE, with ``ATEST-A`` .. ``ATEST-Z`` class variants
+#: * ``Z?ZZT``   -- NASDAQ: ZAZZT, ZBZZT, ZCZZT, ZJZZT, ZVZZT, ZWZZT, ZXZZT
+#: * ``ZTEST``, ``TEST`` -- Cboe/BATS
+#:
+#: Excluded at the universe boundary rather than in the screens: these are not
+#: securities, so storing their bars is not faithfulness to the feed, and
+#: dropping them here also keeps them out of the request budget and out of
+#: every downstream consumer at once.
+#:
+#: An optional ``-``/``.`` suffix is allowed so class variants match, but a
+#: bare prefix match is not, so a real ticker merely *starting* with these
+#: letters survives.
+TEST_SYMBOL: Final[re.Pattern[str]] = re.compile(
+    r"^(?:ATEST|ZTEST|TEST|Z[A-Z]ZZT)(?:[-.].*)?$"
+)
 
 
 def include_row(row: dict[str, Any], cutoff: date | None) -> bool:
@@ -205,7 +224,7 @@ def include_row(row: dict[str, Any], cutoff: date | None) -> bool:
     tested without downloading anything.
     """
     ticker = (row.get("ticker") or "").strip().upper()
-    if not ticker or any(ticker.startswith(p) for p in TEST_SYMBOL_PREFIXES):
+    if not ticker or TEST_SYMBOL.match(ticker):
         return False
     if (row.get("exchange") or "").strip().upper() not in LISTED_EXCHANGES:
         return False
