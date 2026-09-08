@@ -73,6 +73,16 @@ SANITY_FLOOR: Final[str] = "0.01"
 
 LIQUID_MIN_DOLLAR_VOLUME: Final[int] = 5_000_000
 
+#: Longest gap between consecutive bars that still counts as one continuous
+#: series. Beyond this the "previous close" is not a previous close, it is a
+#: different era -- and after a relisting, often a different company.
+#:
+#: Thirty days, matching the delisting window the sweep already uses. A weekend
+#: is 3, a holiday weekend 4, and an SEC trading suspension runs ten business
+#: days (about 14), so 30 clears every legitimate interruption. Real recycles
+#: leave holes of months or years: AAAP's was 3,045 days.
+MAX_GAP_DAYS: Final[int] = 30
+
 TOP_N: Final[int] = 20
 
 #: A screen that returns nothing must not exit green. This is the freshness
@@ -105,6 +115,10 @@ class Move:
     split_factor: Decimal
     div_cash: Decimal
     is_ex_div: bool
+    #: Which listing this bar belongs to, identified by that listing's first
+    #: session. None when the bar falls outside every range the vendor knows.
+    listing_id: date | None = None
+    gap_days: int | None = None
 
     @property
     def liquid(self) -> bool:
@@ -182,7 +196,8 @@ def read_actions(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
 
 _MOVES_SQL: Final[str] = """
 with px as (
-    select ticker, date, close, volume, security_type, exchange
+    select ticker, date, close, volume, security_type, exchange,
+           {listing_expr} as listing_id
     from prices
     where close is not null and volume is not null
 ),
@@ -200,13 +215,21 @@ seq as (
         lag(close) over w as prev_close,
         lag(date)  over w as prev_date
     from px
-    window w as (partition by ticker order by date)
+    -- By listing, not by ticker. A ticker is not an entity across time: 356
+    -- active symbols carry two different companies inside a ten-year pull,
+    -- and partitioning by ticker alone makes lag() reach across the gap and
+    -- compare one company's close against another's. AAAP did exactly that
+    -- and produced a clean, plausible -69.26%.
+    window w as (partition by ticker, listing_id order by date)
 ),
 adv as (
-    select ticker, cast(avg(cast(close as decimal(38,12)) * volume) as decimal(38,12))
+    -- Also by listing. Averaging dollar volume across a relisting blends two
+    -- companies' liquidity into one number and gates on the blend.
+    select ticker, listing_id,
+           cast(avg(cast(close as decimal(38,12)) * volume) as decimal(38,12))
         as avg_dollar_volume
     from px
-    group by ticker
+    group by ticker, listing_id
 ),
 -- Every action strictly after the previous bar and up to and including this
 -- one. A range rather than an equality join: a gap in the price series (a
@@ -261,7 +284,13 @@ priced as (
         -- and nobody would see it happen. The caller filters and reports the
         -- count instead.
         (adj_prev_close >= cast({floor} as decimal(18,6))
-         and close      >= cast({floor} as decimal(18,6))) as passes_floor
+         and close      >= cast({floor} as decimal(18,6))) as passes_floor,
+        (date - prev_date) as gap_days,
+        -- Kept even with listing_id, and deliberately so. It catches a long
+        -- halt inside one listing, and it catches a listing range that is
+        -- simply wrong -- the vendor's own metadata is the thing listing_id
+        -- trusts, and this is what covers being let down by it.
+        ((date - prev_date) <= {max_gap}) as within_gap
     from adjusted
 )
 select
@@ -284,9 +313,13 @@ select
     priced.split_factor,
     priced.div_cash,
     priced.div_cash > 0                                       as is_ex_div,
-    priced.passes_floor
+    priced.listing_id,
+    priced.gap_days,
+    priced.passes_floor,
+    priced.within_gap
 from priced
 join adv on adv.ticker = priced.ticker
+         and adv.listing_id is not distinct from priced.listing_id
 """
 
 
@@ -311,6 +344,20 @@ def moves(
     prices = read_prices(con, as_of) if prices is None else prices
     actions = read_actions(con) if actions is None else actions
 
+    # Data written before listing_id existed has no such column. Synthesising
+    # NULL keeps one code path, and NULL is the honest value: every bar for
+    # that ticker lands in a single "unknown listing" group, which is what we
+    # actually know. The gap guard is what protects those rows.
+    if "listing_id" in prices.columns:
+        listing_expr = "listing_id"
+    else:
+        listing_expr = "cast(null as date)"
+        log.warning(
+            "prices have no listing_id column; falling back to one unknown "
+            "listing per ticker. Moves across a relisting are then caught by "
+            "the %d-day gap guard alone.", MAX_GAP_DAYS,
+        )
+
     con.register("prices", prices)
     con.register("actions", actions)
 
@@ -322,6 +369,8 @@ def moves(
         band_high=BAND_HIGH,
         floor=sanity_floor,
         adjust_dividends="true" if adjust_dividends else "false",
+        listing_expr=listing_expr,
+        max_gap=MAX_GAP_DAYS,
     )
     return con.sql(sql)
 
@@ -338,6 +387,8 @@ def _to_move(row: tuple[Any, ...]) -> Move:
         tick_move=row[8], tick_size=row[9], volume=int(row[10]),
         dollar_volume=row[11], avg_dollar_volume=row[12], split_factor=row[13],
         div_cash=row[14], is_ex_div=bool(row[15]),
+        listing_id=row[16],
+        gap_days=None if row[17] is None else int(row[17]),
     )
 
 
@@ -348,6 +399,8 @@ class ScreenResult:
     moves_screened: int
     floor_excluded: int
     sanity_floor: str
+    gap_excluded: int = 0
+    unattributed: int = 0
 
 
 def screen(
@@ -372,7 +425,7 @@ def screen(
         adjust_dividends=adjust_dividends, sanity_floor=sanity_floor,
     )
     con.register("raw_moves", rel)
-    kept = con.sql("select * from raw_moves where passes_floor")
+    kept = con.sql("select * from raw_moves where passes_floor and within_gap")
 
     observed = assert_fresh(
         "vol_screen", kept, partition="moves", min_rows=min_moves,
@@ -387,6 +440,14 @@ def screen(
     rows = con.execute("select * from kept_moves where date = ?", [day]).fetchall()
     excluded = con.execute(
         "select count(*) from raw_moves where date = ? and not passes_floor", [day]
+    ).fetchone()[0]
+    gapped = con.execute(
+        "select count(*) from raw_moves where date = ? and passes_floor "
+        "and not within_gap", [day]
+    ).fetchone()[0]
+    unattributed = con.execute(
+        "select count(*) from raw_moves where date = ? and listing_id is null",
+        [day],
     ).fetchone()[0]
 
     if not rows:
@@ -436,6 +497,8 @@ def screen(
         moves_screened=len(everything),
         floor_excluded=int(excluded),
         sanity_floor=sanity_floor,
+        gap_excluded=int(gapped),
+        unattributed=int(unattributed),
     )
 
 
@@ -463,6 +526,17 @@ def render(result: ScreenResult, *, show_empty: bool = False) -> Iterator[str]:
             f"{result.floor_excluded:,} moves excluded by the "
             f"${result.sanity_floor} sanity floor "
             f"(sub-penny quotes; lower --sanity-floor to include them)"
+        )
+    if result.gap_excluded:
+        yield (
+            f"{result.gap_excluded:,} moves excluded for spanning a gap of "
+            f"more than {MAX_GAP_DAYS} days (relisting or long halt; the "
+            "prior close is not comparable)"
+        )
+    if result.unattributed:
+        yield (
+            f"{result.unattributed:,} bars carry no listing_id -- outside "
+            "every listing period the vendor knows about"
         )
 
     for sl in lists:

@@ -368,6 +368,83 @@ def fetch_prices(
     raise TiingoError(f"{ticker}: still rate-limited after {MAX_RETRIES} attempts")
 
 
+#: Gap below which two of Tiingo's ranges are the same listing.
+#:
+#: The file frequently splits one continuous series across two rows for a
+#: venue change: AIEQ ends 2024-01-26, a Friday, and resumes 2024-01-29, the
+#: Monday. Treating that as a relisting would fragment ~100 healthy symbols.
+#: Measured against the real file, the count of multi-listing active symbols
+#: is 516 at zero tolerance, 418 at seven days, and 416 at thirty -- it goes
+#: flat after a week, because a genuine recycle leaves a hole of months or
+#: years, never a weekend.
+LISTING_MERGE_TOLERANCE_DAYS: Final[int] = 7
+
+
+def listing_spans(
+    rows: Iterable[dict[str, Any]],
+    tolerance_days: int = LISTING_MERGE_TOLERANCE_DAYS,
+) -> dict[str, list[tuple[date, date]]]:
+    """Disjoint listing periods per ticker, from Tiingo's own universe file.
+
+    Tiingo knows a recycled symbol is two things -- it carries two rows with
+    non-overlapping ranges -- and this recovers that. Overlapping or
+    near-adjacent ranges are merged, because those are one listing quoted on
+    two venues rather than two companies.
+    """
+    ranges: dict[str, list[tuple[date, date]]] = {}
+    for row in rows:
+        ticker = (row.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        start = _parse_iso(row.get("startDate"))
+        if start is None:
+            continue
+        end = _parse_iso(row.get("endDate")) or date.max
+        ranges.setdefault(ticker, []).append((start, end))
+
+    tol = timedelta(days=tolerance_days)
+    out: dict[str, list[tuple[date, date]]] = {}
+    for ticker, spans in ranges.items():
+        spans.sort()
+        merged = [spans[0]]
+        for start, end in spans[1:]:
+            last_start, last_end = merged[-1]
+            if start <= last_end + tol:
+                merged[-1] = (last_start, max(last_end, end))
+            else:
+                merged.append((start, end))
+        out[ticker] = merged
+    return out
+
+
+def _parse_iso(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value).strip()[:10])
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def listing_for(spans: list[tuple[date, date]] | None, day: date) -> date | None:
+    """Which listing a bar belongs to, identified by that listing's first day.
+
+    The identifier is the span's start date rather than an ordinal (1, 2, 3)
+    on purpose. Partitions are immutable, and an ordinal renumbers every
+    earlier bar the moment Tiingo adds a listing that predates the ones we
+    already know about -- so ten years of stored history would silently change
+    meaning. A start date only moves if that specific listing's start moves.
+
+    Returns None when the bar falls outside every known span, which is a real
+    state and must not be collapsed into "the first listing": that is exactly
+    the silent default this whole change exists to remove.
+    """
+    if not spans:
+        return None
+    for start, end in spans:
+        if start <= day <= end:
+            return start
+    return None
+
+
 # --------------------------------------------------------------------------
 # shaping
 # --------------------------------------------------------------------------
@@ -409,7 +486,10 @@ def _factor(value: Any, default: Decimal) -> Decimal:
 
 
 def shape_rows(
-    ticker: str, meta: TickerMeta | None, payload: Iterable[dict[str, Any]]
+    ticker: str,
+    meta: TickerMeta | None,
+    payload: Iterable[dict[str, Any]],
+    spans: list[tuple[date, date]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split a Tiingo payload into raw price rows and corporate actions.
 
@@ -437,6 +517,11 @@ def shape_rows(
                 "exchange": (meta.exchange.lower() if meta else None),
                 "security_type": (meta.asset_type if meta else None),
                 "source": "tiingo",
+                # Which company this bar belongs to. A ticker is not an
+                # entity across time: 356 active symbols carry two different
+                # companies inside a ten-year pull, and without this the two
+                # concatenate into one series.
+                "listing_id": listing_for(spans, day),
                 "ingested_at": ingested,
             }
         )
@@ -476,6 +561,7 @@ def sweep(
     restart: bool = False,
     checkpoint_dir: Path | None = None,
     progress: bool = True,
+    spans: dict[str, list[tuple[date, date]]] | None = None,
 ) -> SweepResult:
     """Fetch every ticker, chunk by chunk, resuming by default.
 
@@ -532,7 +618,10 @@ def sweep(
                     bad += 1
                     result.failures.append((meta.ticker, str(exc)[:120]))
                     continue
-                p, a = shape_rows(meta.ticker, by_ticker.get(meta.ticker), payload)
+                p, a = shape_rows(
+                    meta.ticker, by_ticker.get(meta.ticker), payload,
+                    spans=spans.get(meta.ticker) if spans else None,
+                )
                 rows.extend(p)
                 actions.extend(a)
                 ok += 1
@@ -594,6 +683,7 @@ def _write_parquet(
                 ("exchange", pa.string()),
                 ("security_type", pa.string()),
                 ("source", pa.string()),
+                ("listing_id", pa.date32()),
                 ("ingested_at", pa.timestamp("us", tz="UTC")),
             ]
         )

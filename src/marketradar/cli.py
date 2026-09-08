@@ -90,6 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="discard checkpoints and re-sweep from scratch",
     )
+    p_prices.add_argument(
+        "--restate",
+        action="store_true",
+        help="replace each partition with exactly what this run staged, "
+             "instead of merging into what is already there. Needed after a "
+             "schema change, and the only way to remove rows. Destructive: "
+             "history outside this run's window is dropped.",
+    )
 
     p_sec = sub.add_parser(
         "sec-tickers", help="load the SEC CIK/ticker map and seed companies"
@@ -220,9 +228,16 @@ def _cmd_prices(args: argparse.Namespace) -> int:
         tiingo._token()
 
     print(f"universe: fetching supported tickers (free, outside the request budget)")
-    universe = tiingo.fetch_universe()
+    rows = tiingo.download_universe_rows()
+    universe = tiingo.fetch_universe(rows=rows)
     universe_size = len(universe)
     print(f"  {universe_size:,} US listed stock/ETF symbols currently trading")
+
+    # Listing periods, so every bar can be attributed to the company that
+    # actually traded it. A ticker is not an entity across time.
+    spans = tiingo.listing_spans(rows)
+    recycled = sum(1 for t in universe if len(spans.get(t.ticker, [])) > 1)
+    print(f"  {recycled:,} of them have carried more than one listing")
 
     if args.limit:
         universe = sorted(universe, key=lambda t: t.ticker)[: args.limit]
@@ -248,6 +263,7 @@ def _cmd_prices(args: argparse.Namespace) -> int:
         chunk_size=args.chunk_size,
         rate_per_hour=args.rate_per_hour,
         restart=args.restart,
+        spans=spans,
     )
 
     print(f"\nattempted {result.attempted:,}  succeeded {result.succeeded:,}  "
@@ -275,9 +291,26 @@ def _cmd_prices(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     con = storage.connect()
+
+    # Bars that fall outside every known listing period. Not fatal -- the bar
+    # is real and the gap guard in the screens still protects it -- but it
+    # must never pass silently, because "unknown listing" collapsing into
+    # "the first listing" is the exact failure this column exists to prevent.
+    unattributed = int(
+        con.execute(
+            "SELECT count(*) FROM read_parquet(?) WHERE listing_id IS NULL",
+            [(staging / "chunk_*.parquet").as_posix()],
+        ).fetchone()[0]
+    )
+    if unattributed:
+        share = unattributed / max(1, result.rows)
+        print(f"\nWARNING: {unattributed:,} of {result.rows:,} bars "
+              f"({share:.2%}) fall outside every known listing period and "
+              "carry listing_id = NULL.", file=sys.stderr)
+
     # One publish per year present in staging. A sweep that crosses New Year
     # writes two partitions; a backfill writes as many as it spans.
-    observed = tiingo.publish_all(staging, con=con)
+    observed = tiingo.publish_all(staging, con=con, restate=args.restate)
     print()
     for obs in observed:
         print(f"published {obs.partition}: {obs.row_count:,} rows, "
