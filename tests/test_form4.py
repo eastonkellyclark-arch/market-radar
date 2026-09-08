@@ -239,3 +239,92 @@ def test_supersede_leaves_unamended_filings_alone() -> None:
     a = form4.parse(doc(owners=[owner_xml(name="A", cik="1")]))
     b = form4.parse(doc(owners=[owner_xml(name="B", cik="2")]))
     assert len(form4.supersede([a, b])) == 2
+
+
+# --- Rule 10b5-1 --------------------------------------------------------
+
+
+def doc_with_plan(flag: str) -> str:
+    return doc().replace(
+        "<periodOfReport>", f"<aff10b5One>{flag}</aff10b5One><periodOfReport>"
+    )
+
+
+@pytest.mark.parametrize("flag", ["true", "1", "TRUE", "Y"])
+def test_the_plan_box_is_read_in_every_spelling(flag: str) -> None:
+    """Real filings use all of these. Sampled 60 and saw false, 0, true and 1."""
+    f = form4.parse(doc_with_plan(flag))
+    assert f.aff10b5_one and f.is_planned
+
+
+@pytest.mark.parametrize("flag", ["false", "0", "", "no"])
+def test_an_unset_plan_box_is_not_planned(flag: str) -> None:
+    assert not form4.parse(doc_with_plan(flag)).is_planned
+
+
+def test_a_filing_with_no_plan_element_is_not_planned() -> None:
+    assert not form4.parse(doc()).is_planned
+
+
+def test_a_footnote_mention_is_recorded_but_is_not_the_flag() -> None:
+    """Weaker evidence and unattributed: the footnote may be about a sale.
+
+    Kept separate so the headline number stays the filer's own tick-box.
+    """
+    xml = doc().replace(
+        "</issuer>",
+        "</issuer><footnotes><footnote id='F1'>Sold under a Rule 10b5-1 "
+        "trading plan adopted 2026-01-05.</footnote></footnotes>",
+    )
+    f = form4.parse(xml)
+    assert f.mentions_10b5_1
+    assert not f.aff10b5_one
+    assert not f.is_planned
+
+
+def test_a_planned_purchase_is_still_an_open_market_purchase() -> None:
+    """is_planned annotates; it does not reclassify the transaction code."""
+    f = form4.parse(doc_with_plan("1"))
+    assert f.has_open_market_purchase
+    assert f.is_planned
+
+
+# --- form types ---------------------------------------------------------
+
+
+def test_amendments_are_in_the_default_form_type_set() -> None:
+    """A filter of exactly "4" excludes every 4/A. That is how a week's
+    distribution came back reporting zero amendments when there were 106."""
+    assert set(form4.FORM4_TYPES) == {"4", "4/A"}
+
+
+def test_the_daily_index_reads_both_form_types(monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(form4, "user_agent", lambda: "x you@example.org")
+    index = (
+        "Form Type   Company Name       CIK  Date Filed  File Name\n"
+        "-------------------------------------------------------\n"
+        "4           ACME CORP          1    2026-09-03  edgar/data/1/a.txt\n"
+        "4/A         ACME CORP          1    2026-09-03  edgar/data/1/b.txt\n"
+        "8-K         ACME CORP          1    2026-09-03  edgar/data/1/c.txt\n"
+        "3           ACME CORP          1    2026-09-03  edgar/data/1/d.txt\n"
+    )
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, text=index))
+    )
+    got = form4.daily_index_paths(date(2026, 9, 3), client=client)
+    assert got == ["edgar/data/1/a.txt", "edgar/data/1/b.txt"]
+
+    only_4 = form4.daily_index_paths(date(2026, 9, 3), "4", client=client)
+    assert only_4 == ["edgar/data/1/a.txt"]
+
+
+def test_a_missing_daily_index_is_a_weekend_not_an_error(monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(form4, "user_agent", lambda: "x you@example.org")
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404))
+    )
+    assert form4.daily_index_paths(date(2026, 9, 5), client=client) == []

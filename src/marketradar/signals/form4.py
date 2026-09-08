@@ -144,6 +144,28 @@ class Form4:
     issuer_symbol: str
     owners: list[Owner] = field(default_factory=list)
     transactions: list[Transaction] = field(default_factory=list)
+    #: The filer ticked the Rule 10b5-1(c) affirmative-defence box. Present on
+    #: every modern Form 4, in both boolean spellings.
+    #:
+    #: Document-level, which is a real limitation: on a filing carrying several
+    #: transactions it says "at least one of these was under a plan", not which
+    #: one. Treat it as a flag on the filing, never as proof about a specific
+    #: row.
+    aff10b5_one: bool = False
+    #: A footnote mentions 10b5-1. Some filers disclose the plan that way
+    #: instead of, or as well as, the box. Weaker evidence and unattributed --
+    #: the footnote may well be attached to a sale rather than the purchase.
+    mentions_10b5_1: bool = False
+
+    @property
+    def is_planned(self) -> bool:
+        """Scheduled under a pre-arranged plan, on the filer's own say-so.
+
+        A purchase set up months ago is not a decision made today. This is the
+        flag, not the footnote: the footnote is unattributed and would sweep in
+        filings whose plan language is about an unrelated sale.
+        """
+        return self.aff10b5_one
 
     @property
     def is_amendment(self) -> bool:
@@ -287,6 +309,8 @@ def parse(document: str, accession: str | None = None) -> Form4:
         ),
         owners=owners,
         transactions=transactions,
+        aff10b5_one=_flag(root, "aff10b5One"),
+        mentions_10b5_1="10b5-1" in xml,
     )
 
 
@@ -319,9 +343,15 @@ def supersede(filings: Iterable[Form4]) -> list[Form4]:
 # --- reading a day ------------------------------------------------------
 
 
-def daily_index_paths(day: date, form_type: str = "4",
+#: Both are Form 4s. EDGAR lists an amendment under its own form type, so a
+#: filter of exactly "4" silently excludes every 4/A -- which is how a week's
+#: distribution came back reporting zero amendments when there were 106.
+FORM4_TYPES: Final[tuple[str, ...]] = ("4", "4/A")
+
+
+def daily_index_paths(day: date, form_types: str | Iterable[str] = FORM4_TYPES,
                       client: httpx.Client | None = None) -> list[str]:
-    """Archive paths for every filing of one form type on one day.
+    """Archive paths for every filing of the given form types on one day.
 
     The bulk file, deliberately. Reading a week back through the current-events
     feed is impossible -- it holds only a few hundred filings -- and doing it
@@ -346,11 +376,14 @@ def daily_index_paths(day: date, form_type: str = "4",
         if owns:
             client.close()
 
-    wanted = form_type.upper()
+    wanted = (
+        {form_types.upper()} if isinstance(form_types, str)
+        else {f.upper() for f in form_types}
+    )
     out: list[str] = []
     for line in resp.text.splitlines():
         parts = line.split()
-        if not parts or parts[0].upper() != wanted:
+        if not parts or parts[0].upper() not in wanted:
             continue
         path = parts[-1]
         if path.endswith(".txt"):
