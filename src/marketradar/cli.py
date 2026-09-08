@@ -169,6 +169,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--html", action="store_true", help="print the HTML body instead of text"
     )
 
+    p_dash = sub.add_parser(
+        "dashboard", help="render the local dashboard and open it"
+    )
+    p_dash.add_argument(
+        "--out", type=Path, metavar="PATH",
+        help="output file (default: .dashboard/index.html, gitignored)",
+    )
+    p_dash.add_argument(
+        "--no-open", action="store_true", help="write the file, do not open it"
+    )
+
     p_backfill = sub.add_parser("backfill", help="drain N queue items")
     p_backfill.add_argument("--budget", type=int, default=100, help="items to drain")
 
@@ -358,6 +369,33 @@ def _cmd_sec_tickers(args: argparse.Namespace) -> int:
           f"(+{stats['companies_inserted']:,})")
     print(f"  tickers   : {stats['tickers_before']:,} -> {stats['tickers_after']:,} "
           f"(+{stats['tickers_inserted']:,})")
+    return EXIT_OK
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    """Render the panel map to a local file and open it.
+
+    Local only, and there is no publish path anywhere in the module: the
+    screens are computed from Tiingo prices, so a public host would be
+    redistribution. See docs/build-spec.md, "The UI track".
+    """
+    from marketradar import storage
+    from marketradar.dashboard import shell
+
+    ctx = shell.gather(storage.connect())
+    target = shell.write(args.out, ctx=ctx)
+    counts = shell.summary(ctx)
+
+    print(f"wrote {target}")
+    print(f"  {counts[shell.LIVE]} live, {counts[shell.WAITING]} waiting, "
+          f"{counts[shell.NOT_BUILT]} not built")
+    for panel in shell.PANELS:
+        state, detail = panel.resolve(ctx)
+        mark = {shell.LIVE: "+", shell.WAITING: "~", shell.NOT_BUILT: "."}[state]
+        print(f"  {mark} {panel.title:<24} {state:<10} {detail[:52]}")
+
+    if not args.no_open and shell.open_in_browser(target):
+        print("opened in your browser")
     return EXIT_OK
 
 
@@ -590,6 +628,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "screens":
         load_dotenv()
         return _cmd_screens(args)
+
+    if args.command == "dashboard":
+        load_dotenv()
+        return _cmd_dashboard(args)
 
     if args.command == "edgar":
         load_dotenv()
