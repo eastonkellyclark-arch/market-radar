@@ -42,11 +42,12 @@ def screen_result() -> volatility.ScreenResult:
     return volatility.screen(con, prices=con.table("px"), actions=con.table("act"))
 
 
-@pytest.fixture
-def digest(screen_result) -> digest_mod.Digest:
-    return digest_mod.Digest(
+def make_digest(screen_result, **kw) -> digest_mod.Digest:
+    defaults = dict(
         day=D4,
+        prior_day=D3,
         generated_at=datetime(2026, 9, 8, 18, 34, tzinfo=timezone.utc),
+        health=digest_mod.Health(items=[digest_mod.HealthItem("prices", "ok")]),
         macro=[
             digest_mod.MacroLine(
                 label="10y Treasury", value=Decimal("4.77"), units="%",
@@ -60,8 +61,18 @@ def digest(screen_result) -> digest_mod.Digest:
             ),
         ],
         screen=screen_result,
+        names={},
+        new_tickers={},
         top_n=10,
+        include_ungated=False,
     )
+    defaults.update(kw)
+    return digest_mod.Digest(**defaults)
+
+
+@pytest.fixture
+def digest(screen_result) -> digest_mod.Digest:
+    return make_digest(screen_result)
 
 
 # --- the dry-run contract ----------------------------------------------
@@ -122,8 +133,10 @@ def test_macro_comes_before_the_screens(digest) -> None:
     assert text.index("MACRO") < text.index("SCREENS")
 
 
-def test_liquid_lists_come_before_ungated_ones(digest) -> None:
-    ordered = digest_mod._ordered_lists(digest)
+def test_liquid_lists_come_before_ungated_ones(screen_result) -> None:
+    ordered = digest_mod._visible_lists(
+        make_digest(screen_result, include_ungated=True)
+    )
     liquidity = [sl.liquidity for sl in ordered]
     assert liquidity == sorted(liquidity, key=lambda x: x != "liquid")
 
@@ -140,19 +153,119 @@ def test_empty_lists_are_not_printed(digest) -> None:
 
 def test_truncation_is_announced(screen_result) -> None:
     """A silently short list reads as "that is all there was"."""
-    d = digest_mod.Digest(
-        day=D4, generated_at=datetime.now(timezone.utc), macro=[],
-        screen=screen_result, top_n=0,
-    )
+    d = make_digest(screen_result, top_n=0)
     assert "more" in digest_mod.render_text(d)
 
 
 def test_missing_macro_data_is_stated_not_omitted(screen_result) -> None:
-    d = digest_mod.Digest(
-        day=D4, generated_at=datetime.now(timezone.utc), macro=[],
-        screen=screen_result, top_n=10,
-    )
+    d = make_digest(screen_result, macro=[])
     assert "run `mr fred`" in digest_mod.render_text(d)
+
+
+# --- names -------------------------------------------------------------
+
+
+def test_company_names_are_rendered_next_to_the_ticker(screen_result) -> None:
+    d = make_digest(
+        screen_result,
+        names={"UPCO": digest_mod.Name("Upco Industries Inc", ambiguous=False)},
+    )
+    assert "Upco Industries Inc" in digest_mod.render_text(d)
+
+
+def test_an_ambiguous_ticker_is_marked_not_silently_picked(screen_result) -> None:
+    """A ticker is not a join key. Where it resolves to more than one company
+    the digest says so rather than presenting one as fact."""
+    d = make_digest(
+        screen_result,
+        names={"UPCO": digest_mod.Name("Upco Industries Inc", ambiguous=True)},
+    )
+    assert "Upco Industries Inc ?" in digest_mod.render_text(d)
+
+
+def test_a_missing_name_is_blank_not_noisy(screen_result) -> None:
+    """About half the universe has no CIK. That is normal, not an error."""
+    text = digest_mod.render_text(make_digest(screen_result, names={}))
+    assert "UNKNOWN" not in text and "None" not in text
+
+
+# --- new vs yesterday --------------------------------------------------
+
+
+def test_new_names_are_marked(screen_result) -> None:
+    key = ("stock", "$10+", "gainers", "liquid")
+    d = make_digest(screen_result, new_tickers={key: {"UPCO"}})
+    lines = [l for l in digest_mod.render_text(d).splitlines() if "UPCO" in l]
+    assert any(l.strip().startswith("NEW") for l in lines)
+
+
+def test_names_present_yesterday_are_not_marked(screen_result) -> None:
+    key = ("stock", "$10+", "gainers", "liquid")
+    d = make_digest(screen_result, new_tickers={key: set()})
+    lines = [l for l in digest_mod.render_text(d).splitlines() if "UPCO" in l]
+    assert lines and not any("NEW" in l for l in lines)
+
+
+def test_no_prior_session_says_so_rather_than_marking_everything(
+    screen_result,
+) -> None:
+    """With one session of data every name is trivially "new", which would be
+    a lie dressed as a signal."""
+    d = make_digest(screen_result, prior_day=None, new_tickers={})
+    text = digest_mod.render_text(d)
+    assert "NEW markers unavailable" in text
+    assert "NEW " not in text.split("SCREENS")[1].replace("NEW markers", "")
+
+
+# --- health ------------------------------------------------------------
+
+
+def test_a_healthy_run_says_ok(screen_result) -> None:
+    d = make_digest(screen_result)
+    assert "HEALTH  OK" in digest_mod.render_text(d)
+    assert "[DEGRADED]" not in d.subject
+
+
+def test_a_degraded_run_cannot_be_mistaken_for_a_healthy_one(
+    screen_result,
+) -> None:
+    """The whole point of the block: a 60%-coverage sweep still produces
+    twenty plausible lists, and nothing else on the page would say so."""
+    health = digest_mod.Health(items=[
+        digest_mod.HealthItem("prices_eod_raw", "9,102 / 14,133 symbols (64%)",
+                              ok=False, note="sweep looks truncated"),
+        digest_mod.HealthItem("DGS10", "2026-08-01 (38d old)", ok=False,
+                              note="stalled"),
+    ])
+    d = make_digest(screen_result, health=health)
+    text = digest_mod.render_text(d)
+
+    assert "DEGRADED - 2 problems" in text
+    assert "! prices_eod_raw" in text
+    assert "sweep looks truncated" in text
+    assert d.subject.endswith("[DEGRADED]")
+
+
+def test_health_comes_before_everything_else(digest) -> None:
+    text = digest_mod.render_text(digest)
+    assert text.index("HEALTH") < text.index("MACRO") < text.index("SCREENS")
+
+
+# --- list scope --------------------------------------------------------
+
+
+def test_ungated_lists_are_hidden_by_default(screen_result) -> None:
+    text = digest_mod.render_text(make_digest(screen_result))
+    assert ">$5M ADV" in text
+    assert all(
+        ">$5M ADV" in line for line in text.splitlines() if line.startswith("--- ")
+    )
+
+
+def test_all_includes_the_ungated_lists(screen_result) -> None:
+    text = digest_mod.render_text(make_digest(screen_result, include_ungated=True))
+    headings = [line for line in text.splitlines() if line.startswith("--- ")]
+    assert any(">$5M ADV" not in h for h in headings)
 
 
 def test_subject_carries_the_trading_day(digest) -> None:

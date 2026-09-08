@@ -58,34 +58,34 @@ def test_missing_api_key_is_named_not_inferred(monkeypatch) -> None:
 # --- the licensing boundary --------------------------------------------
 
 
-def test_publish_refuses_the_ice_series_by_default(monkeypatch) -> None:
-    """The rule in CLAUDE.md, enforced in code rather than in a comment.
+def test_there_is_no_publish_path_at_all() -> None:
+    """FRED is local-only, and the absence is the enforcement.
 
-    DGS10 is Treasury data and ours to republish. The BAMLxxx series are ICE
-    BofA indices FRED redistributes under permission; putting those in a
-    public Release asset is redistributing a third-party index.
+    FRED carries the ICE BofA series under permission from ICE Data Indices,
+    LLC, so they are not ours to mirror to a world-readable Release. A flag
+    guarding that would be a flag someone later flips; no function and no
+    flag cannot be flipped. Decided 2026-09-08, see CLAUDE.md.
     """
-    monkeypatch.setenv("MR_GITHUB_REPO", "someone/market-radar")
-    observations = [
-        fred.Observation("DGS10", date(2026, 9, 3), Decimal("4.77")),
-        fred.Observation("BAMLH0A0HYM2", date(2026, 9, 7), Decimal("2.68")),
-    ]
-    with pytest.raises(fred.FredError, match="BAMLH0A0HYM2"):
-        fred.publish(observations, con=object())
+    assert not hasattr(fred, "publish")
+    source = __import__("inspect").getsource(fred)
+    assert "allow_licensed" not in source
+    assert "github_release" not in source
 
 
-def test_publish_allows_the_treasury_series_through(monkeypatch) -> None:
-    """Only the licensing guard is under test; the upload is not reached."""
-    monkeypatch.setenv("MR_GITHUB_REPO", "someone/market-radar")
-    monkeypatch.setattr(fred, "_gh", lambda: (_ for _ in ()).throw(
-        fred.FredError("reached the upload")
-    ))
-    observations = [fred.Observation("DGS10", date(2026, 9, 3), Decimal("4.77"))]
-    with pytest.raises(fred.FredError, match="reached the upload"):
-        fred.publish(observations, con=object())
+def test_the_manifest_keeps_fred_out_of_a_public_backend() -> None:
+    from marketradar import manifest
+
+    ref = manifest.get("fred_series", "all")
+    assert ref.backend == "supabase"
+    assert ref.is_private
 
 
 def test_every_series_declares_which_side_of_the_boundary_it_is_on() -> None:
+    """Documentation, not logic — but the distinction has to stay recorded.
+
+    Anyone adding a publish path later needs to see that "from a government
+    source" and "ours to republish" are different tests.
+    """
     for series in fred.SERIES:
         assert isinstance(series.public_domain, bool)
     assert {s.series_id for s in fred.SERIES if s.public_domain} == {"DGS10"}

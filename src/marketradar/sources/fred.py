@@ -5,13 +5,21 @@ digest opens with: where the risk-free rate sits and what credit is charging
 over it. Cheap, small, and slow-moving, so it is fetched whole each run and
 upserted rather than incrementally tracked.
 
-**Licensing.** ``DGS10`` is US Treasury data and public domain. The two
-``BAMLxxx`` series are ICE BofA indices that FRED redistributes under
-permission from ICE Data Indices, LLC — they are not government-produced.
-Republishing those as a public Release asset is redistribution of a
-third-party index, which is exactly the boundary CLAUDE.md makes a hard rule.
-:func:`publish` therefore refuses to run until that call is made explicitly;
-:func:`load` is unaffected and stores everything locally.
+**This source is local-only, and there is deliberately no publish path.**
+
+``DGS10`` is US Treasury data and public domain. The two ``BAMLxxx`` series
+are ICE BofA indices that FRED redistributes under permission from ICE Data
+Indices, LLC — they are not government-produced, so republishing them as a
+public Release asset would be redistributing a third-party index. "Government
+source" and "ours to republish" are not the same test, and FRED is the case
+that separates them.
+
+Decided 2026-09-08: neither series is published. Not DGS10 either — splitting
+one API call across two destinations by licence buys nothing and leaves a
+publish path that a later edit could widen back over the ICE series by
+accident. There is no flag to relax this, because a flag is the thing that
+gets forgotten. ``macro_series`` in Postgres is the only home; the manifest
+records it as ``supabase`` accordingly. See CLAUDE.md.
 
 **Two freshness checks, not one.** A combined assertion over all three series
 passes as long as *any* of them is current, which is precisely how a stalled
@@ -27,12 +35,9 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
-import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from typing import Any, Final, Iterable
 
 import duckdb
@@ -46,9 +51,6 @@ log = logging.getLogger(__name__)
 ENV_API_KEY: Final[str] = "MR_FRED_API_KEY"
 DATASET: Final[str] = "fred_series"
 SOURCE: Final[str] = "fred"
-
-RELEASE_TAG: Final[str] = "reference-data"
-ASSET_NAME: Final[str] = "fred_series.parquet"
 
 REQUEST_TIMEOUT: Final[float] = 60.0
 BATCH_SIZE: Final[int] = 500
@@ -86,7 +88,11 @@ class Series:
     min_rows: int
 
 
-#: The ``public_domain`` flag is not decoration — :func:`publish` reads it.
+#: ``public_domain`` records which side of the licensing line each series sits
+#: on. Nothing reads it, because nothing publishes — it is here so that anyone
+#: adding a publish path later has the distinction in front of them rather
+#: than having to rediscover that "from a government source" and "ours to
+#: republish" are different tests. DGS10 is the only True in the list.
 SERIES: Final[tuple[Series, ...]] = (
     # ~2,900 business days available from HISTORY_START.
     Series("DGS10", "10y Treasury", "%", public_domain=True, min_rows=2_000),
@@ -207,42 +213,6 @@ def _fetch_one(
     return out
 
 
-def _write_parquet(observations: list[Observation], target: Path) -> None:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    ingested = datetime.now(timezone.utc)
-    schema = pa.schema(
-        [
-            ("series_id", pa.string()),
-            ("obs_date", pa.date32()),
-            ("value", pa.decimal128(18, 6)),
-            ("source", pa.string()),
-            ("ingested_at", pa.timestamp("us", tz="UTC")),
-        ]
-    )
-    table = pa.table(
-        {
-            "series_id": [o.series_id for o in observations],
-            "obs_date": [o.obs_date for o in observations],
-            "value": [o.value for o in observations],
-            "source": [SOURCE] * len(observations),
-            "ingested_at": [ingested] * len(observations),
-        },
-        schema=schema,
-    )
-    pq.write_table(table, target, compression="zstd")
-
-
-def _gh() -> str:
-    import shutil
-
-    found = shutil.which("gh") or shutil.which("gh", path=r"C:\Program Files\GitHub CLI")
-    if not found:
-        raise FredError("gh CLI not found; needed to publish the GitHub Release.")
-    return found
-
-
 def assert_series_fresh(
     rel: duckdb.DuckDBPyRelation,
     *,
@@ -275,82 +245,6 @@ def assert_series_fresh(
         if record:
             manifest.record_stats(obs, con=con)
     return observed
-
-
-def publish(
-    observations: list[Observation],
-    *,
-    con: duckdb.DuckDBPyConnection | None = None,
-    allow_licensed: bool = False,
-) -> list[Any]:
-    """Write Parquet, upload as a Release asset, assert freshness per series.
-
-    Refuses to publish the ICE BofA series to a world-readable Release until
-    that is explicitly allowed. This is the licensing rule enforced in code
-    rather than in a comment: a Release asset on a public repo is
-    redistribution, and only the Treasury series is unambiguously ours to
-    redistribute. Pass ``allow_licensed=True`` once the call has been made.
-    """
-    ref = manifest.get(DATASET, "all")
-    if ref.backend != "github_release":
-        raise FredError(
-            f"{DATASET}/all resolves to backend {ref.backend!r}. FRED data "
-            "belongs in a GitHub Release, not a private bucket. See the "
-            "licensing rule in CLAUDE.md."
-        )
-
-    licensed = sorted({o.series_id for o in observations} - {
-        s.series_id for s in SERIES if s.public_domain
-    })
-    if licensed and not allow_licensed:
-        raise FredError(
-            "Refusing to publish "
-            + ", ".join(licensed)
-            + " to a public GitHub Release. Those are ICE BofA indices that "
-            "FRED redistributes under permission from ICE Data Indices, LLC; "
-            "they are not government-produced, so republishing them is "
-            "redistribution of a third-party index. Publish the Treasury "
-            "series alone, or pass allow_licensed=True once that call is made."
-        )
-
-    repo = os.environ.get("MR_GITHUB_REPO")
-    if not repo:
-        raise FredError("MR_GITHUB_REPO is unset; needed to publish the Release.")
-
-    con = con or storage.connect()
-    gh = _gh()
-
-    with tempfile.TemporaryDirectory(prefix="mr-fred-") as tmp:
-        local = Path(tmp) / ASSET_NAME
-        _write_parquet(observations, local)
-
-        seen = subprocess.run(
-            [gh, "release", "view", RELEASE_TAG, "--repo", repo],
-            capture_output=True, text=True,
-        )
-        if seen.returncode != 0:
-            created = subprocess.run(
-                [gh, "release", "create", RELEASE_TAG, "--repo", repo,
-                 "--title", "reference data",
-                 "--notes", "Public-domain reference data republished from "
-                            "government sources."],
-                capture_output=True, text=True,
-            )
-            if created.returncode != 0:
-                raise FredError(
-                    f"Could not create release {RELEASE_TAG}: "
-                    f"{created.stderr.strip()[:300]}"
-                )
-
-        up = subprocess.run(
-            [gh, "release", "upload", RELEASE_TAG, str(local),
-             "--repo", repo, "--clobber"],
-            capture_output=True, text=True,
-        )
-        if up.returncode != 0:
-            raise FredError(f"Could not upload {ASSET_NAME}: {up.stderr.strip()[:300]}")
-
-        return assert_series_fresh(con.read_parquet(str(local)), con=con)
 
 
 def _batched(items: list, size: int) -> list[list]:

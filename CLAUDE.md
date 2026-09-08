@@ -90,6 +90,23 @@ Anything a vendor touched — prices, corporate actions, vendor news — goes to
 the private R2 bucket. The manifest's `backend` column carries the
 distinction. When adding a dataset, decide which side it falls on first.
 
+**"From a government source" is not the same test as "ours to republish."**
+FRED is the case that separates them, and it is the reason this paragraph
+exists. `DGS10` is Treasury data and public domain, but the ICE BofA series
+(`BAMLH0A0HYM2`, `BAMLC0A0CM`) are third-party indices that FRED
+redistributes *under permission from ICE Data Indices, LLC*. Fetching them is
+fine; mirroring them to a world-readable Release asset is redistributing
+someone else's index. So the government-source whitelist above is a rule about
+the *publisher*, not about every series that publisher carries — check the
+series, not just the agency.
+
+Decided 2026-09-08: **FRED is local-only.** `macro_series` in Postgres is its
+only home and `sources/fred.py` has no publish path. Not even DGS10 is
+published: splitting one API call across two destinations by licence buys
+nothing and would leave a publish path that a later edit could widen back over
+the ICE series by accident. There is deliberately no flag to relax this,
+because a flag is the thing that gets forgotten.
+
 **Never commit data files.** Parquet goes to R2 or GitHub Releases via the
 manifest, per the rule above. Repo holds code and SQL only. The one exception
 is a small, deliberately chosen set of parser test fixtures — never a bulk

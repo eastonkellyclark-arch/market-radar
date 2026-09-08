@@ -59,13 +59,8 @@ company_tickers = { location = "https://www.sec.gov/files/company_tickers.json",
 all = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/reference-data/sec_company_tickers.parquet", backend = "github_release" }
 
 [fred_series]
-# Treasury yields and credit spreads from FRED.
-#
-# LICENSING NOTE, unresolved: DGS10 is US Treasury data and unambiguously
-# public domain. The two BAMLxxx series are ICE BofA indices that FRED
-# redistributes under permission from ICE Data Indices, LLC -- they are not
-# themselves government-produced. Publishing them as a public Release asset is
-# redistribution of a third-party index, which is the exact question the
-# licensing rule in CLAUDE.md exists to force. Flagged for a decision; nothing
-# is published to this location until it is settled.
-all = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/reference-data/fred_series.parquet", backend = "github_release" }
+# Treasury yields and credit spreads. Postgres is the only home: FRED
+# redistributes the ICE BofA series under permission and they are not ours to
+# republish, so this dataset has no public mirror and sources/fred.py has no
+# publish path at all. Decided 2026-09-08 — see CLAUDE.md.
+all = { location = "macro_series", backend = "supabase" }

@@ -127,18 +127,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-empty", action="store_true", help="print empty lists too",
     )
 
-    p_fred = sub.add_parser(
-        "fred", help="load Treasury yields and credit spreads from FRED"
-    )
-    p_fred.add_argument(
-        "--no-publish", action="store_true", help="upsert only, skip the Release"
-    )
-    p_fred.add_argument(
-        "--allow-licensed", action="store_true",
-        help="publish the ICE BofA series to the public Release as well. "
-             "Off by default: those are third-party indices FRED redistributes "
-             "under permission, not government data.",
-    )
+    # No publish flags: FRED is local-only. FRED redistributes the ICE BofA
+    # series under permission, so they are not ours to republish, and there is
+    # deliberately no switch that could turn that back on. See CLAUDE.md.
+    sub.add_parser("fred", help="load Treasury yields and credit spreads from FRED")
 
     p_digest = sub.add_parser("digest", help="render the daily email")
     p_digest.add_argument("--dry-run", action="store_true", help="render, do not send")
@@ -149,6 +141,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_digest.add_argument(
         "--top", type=int, default=10, metavar="N",
         help="rows per list in the email (default 10)",
+    )
+    p_digest.add_argument(
+        "--all", dest="include_ungated", action="store_true",
+        help="include the ungated lists as well as the >$5M ADV ones",
     )
     p_digest.add_argument(
         "--html", action="store_true", help="print the HTML body instead of text"
@@ -319,7 +315,12 @@ def _cmd_sec_tickers(args: argparse.Namespace) -> int:
 
 
 def _cmd_fred(args: argparse.Namespace) -> int:
-    """Treasury yields and credit spreads. Three requests, no budget."""
+    """Treasury yields and credit spreads. Three requests, no budget.
+
+    Stores to Postgres only. There is no publish step and no flag to add one:
+    FRED carries the ICE BofA series under permission from ICE Data Indices,
+    LLC, so they are not ours to mirror.
+    """
     from marketradar import storage
     from marketradar.sources import fred
 
@@ -333,21 +334,7 @@ def _cmd_fred(args: argparse.Namespace) -> int:
               f"  ({s.label})")
 
     con = storage.connect()
-
-    if not args.no_publish:
-        try:
-            observed = fred.publish(
-                observations, con=con, allow_licensed=args.allow_licensed
-            )
-            for obs in observed:
-                print(f"  published {obs.partition}: {obs.row_count:,} rows, "
-                      f"max {obs.max_date}")
-        except fred.FredError as exc:
-            print(f"\nnot published: {exc}\n", file=sys.stderr)
-            print("continuing with the local upsert; pass --no-publish to "
-                  "silence this.", file=sys.stderr)
-
-    print("\nupserting into macro_series")
+    print("\nupserting into macro_series (local only, not published)")
     stats = fred.load(observations, con=con)
     print(f"  rows: {stats['rows_before']:,} -> {stats['rows_after']:,} "
           f"(+{stats['rows_inserted']:,})")
@@ -367,7 +354,10 @@ def _cmd_digest(args: argparse.Namespace) -> int:
 
     con = storage.connect()
     try:
-        digest = digest_mod.build(con, as_of=args.as_of, top_n=args.top)
+        digest = digest_mod.build(
+            con, as_of=args.as_of, top_n=args.top,
+            include_ungated=args.include_ungated,
+        )
     except (digest_mod.DigestError, StaleDataError) as exc:
         print(f"mr digest: {exc}", file=sys.stderr)
         return EXIT_ERROR
