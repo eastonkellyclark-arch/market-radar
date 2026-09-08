@@ -161,10 +161,9 @@ def read_prices(
 def read_actions(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
     """Corporate actions from Postgres.
 
-    Only the four columns the adjustment needs. ``ingested_at`` is
-    ``timestamptz``, and reading one of those back through DuckDB's Postgres
-    scanner requires ``pytz``, which is not a dependency here — selecting it
-    would make the screen fail for a column it never uses.
+    Only the four columns the adjustment needs — the screen has no use for
+    ``id`` or ``ingested_at`` and there is no reason to drag them across the
+    wire for every ticker.
     """
     if not storage.postgres_attached(con):
         raise ScreenError(
