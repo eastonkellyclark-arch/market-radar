@@ -275,10 +275,13 @@ def _cmd_prices(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     con = storage.connect()
-    observed = tiingo.publish(
-        staging, partition, con=con, min_rows=max(1, result.rows // 2)
-    )
-    print(f"\npublished {observed.row_count:,} rows, max_date {observed.max_date}")
+    # One publish per year present in staging. A sweep that crosses New Year
+    # writes two partitions; a backfill writes as many as it spans.
+    observed = tiingo.publish_all(staging, con=con)
+    print()
+    for obs in observed:
+        print(f"published {obs.partition}: {obs.row_count:,} rows, "
+              f"max_date {obs.max_date}")
     n = tiingo.upsert_corporate_actions(staging, con=con)
     print(f"corporate actions upserted: {n:,}")
     return EXIT_OK

@@ -16,6 +16,27 @@
 [prices_eod_raw]
 # Raw unadjusted OHLCV from Tiingo. Adjustment happens at query time against
 # corporate_actions, which keeps history immutable and year partitions honest.
+#
+# One entry per year back to 2016. A single Tiingo request returns a whole
+# date range, so a ten-year backfill costs the same 14,124 requests as a
+# one-year one -- the depth is free, the partitions are what make it storable.
+# A sweep spanning a year boundary writes to both partitions; publish() filters
+# staged rows to the partition's own year rather than trusting the caller.
+#
+# Closed years are immutable once backfilled. They are still asserted on every
+# publish, just under a different contract: row count and the year's boundary
+# sessions rather than wall-clock staleness, which is meaningless for a year
+# that ended. See tiingo._assert_partition_fresh.
+2016 = { location = "r2://market-radar/prices_eod_raw/2016.parquet", backend = "r2" }
+2017 = { location = "r2://market-radar/prices_eod_raw/2017.parquet", backend = "r2" }
+2018 = { location = "r2://market-radar/prices_eod_raw/2018.parquet", backend = "r2" }
+2019 = { location = "r2://market-radar/prices_eod_raw/2019.parquet", backend = "r2" }
+2020 = { location = "r2://market-radar/prices_eod_raw/2020.parquet", backend = "r2" }
+2021 = { location = "r2://market-radar/prices_eod_raw/2021.parquet", backend = "r2" }
+2022 = { location = "r2://market-radar/prices_eod_raw/2022.parquet", backend = "r2" }
+2023 = { location = "r2://market-radar/prices_eod_raw/2023.parquet", backend = "r2" }
+2024 = { location = "r2://market-radar/prices_eod_raw/2024.parquet", backend = "r2" }
+2025 = { location = "r2://market-radar/prices_eod_raw/2025.parquet", backend = "r2" }
 2026 = { location = "r2://market-radar/prices_eod_raw/2026.parquet", backend = "r2" }
 
 [corporate_actions]

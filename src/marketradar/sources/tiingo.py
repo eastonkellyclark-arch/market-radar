@@ -26,7 +26,7 @@ import random
 import re
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -37,7 +37,7 @@ import httpx
 
 from marketradar import manifest, storage
 from marketradar.checkpoint import Checkpoint, chunked
-from marketradar.freshness import assert_fresh
+from marketradar.freshness import StaleDataError, assert_fresh, utc_today
 
 log = logging.getLogger(__name__)
 
@@ -387,6 +387,27 @@ def _dec(value: Any) -> Decimal | None:
         return None
 
 
+#: Corporate-action scale. Twelve places, and quantised rather than passed
+#: through, because a reverse split ratio is frequently non-terminating:
+#: 1-for-15 arrives as 0.0666666667 and 1-for-18 as 0.0555555556, both ten
+#: places. The column was decimal128(18,8) and pyarrow refused them outright
+#: -- "Rescaling Decimal value would cause data loss" -- which is the right
+#: instinct and the wrong place to discover it, since it only shows up once
+#: the history is deep enough to contain such a split. Twelve matches the
+#: width the screens already widen to for the adjustment division.
+_ACTION_SCALE: Final[Decimal] = Decimal("0.000000000001")
+
+
+def _factor(value: Any, default: Decimal) -> Decimal:
+    """A split factor or dividend, quantised to the stored scale."""
+    if value is None:
+        return default
+    try:
+        return Decimal(str(value)).quantize(_ACTION_SCALE)
+    except (ArithmeticError, ValueError):
+        return default
+
+
 def shape_rows(
     ticker: str, meta: TickerMeta | None, payload: Iterable[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -422,8 +443,8 @@ def shape_rows(
 
         split = bar.get("splitFactor")
         div = bar.get("divCash")
-        split_f = Decimal(str(split)) if split is not None else Decimal(1)
-        div_f = Decimal(str(div)) if div is not None else Decimal(0)
+        split_f = _factor(split, Decimal(1))
+        div_f = _factor(div, Decimal(0))
         if split_f != 1 or div_f != 0:
             actions.append(
                 {
@@ -581,8 +602,8 @@ def _write_parquet(
             [
                 ("ticker", pa.string()),
                 ("ex_date", pa.date32()),
-                ("split_factor", pa.decimal128(18, 8)),
-                ("div_cash", pa.decimal128(18, 8)),
+                ("split_factor", pa.decimal128(18, 12)),
+                ("div_cash", pa.decimal128(18, 12)),
                 ("source", pa.string()),
             ]
         )
@@ -595,6 +616,155 @@ def _write_parquet(
 # publish
 # --------------------------------------------------------------------------
 
+
+#: A closed year's boundary sessions. The last US trading day of a year is
+#: always 29, 30 or 31 December -- 31st unless it falls on a weekend, in which
+#: case the Friday before. The first is 2, 3 or 4 January by the same logic.
+#: Asserting against these ranges catches a truncated historical pull without
+#: taking a market-calendar dependency for two facts that never move.
+LAST_SESSION_ON_OR_AFTER: Final[int] = 29      # December
+FIRST_SESSION_ON_OR_BEFORE: Final[int] = 8     # January, with slack
+
+
+def _assert_partition_fresh(
+    rel: Any,
+    *,
+    partition: str,
+    min_rows: int,
+    max_staleness_days: int,
+    today: date | None = None,
+) -> Any:
+    """Freshness for a year partition, under the contract that year deserves.
+
+    A closed year cannot be *fresh*: 2020's newest bar is five years old and
+    always will be. Skipping the assertion there would be the wrong fix, since
+    a truncated historical pull -- half a year fetched, or a range that quietly
+    stopped in June -- is exactly what needs to fail loudly. So only the
+    wall-clock test is dropped. Row count, columns, and both year boundaries
+    are still asserted, which is a *stronger* check than the live partition
+    gets: a closed year has a known shape and we can hold it to it.
+
+    The current year keeps the ordinary contract, because for it staleness is
+    the real signal.
+    """
+    today = today or utc_today()
+    year = int(partition)
+
+    if year >= today.year:
+        return assert_fresh(
+            DATASET,
+            rel,
+            partition=partition,
+            min_rows=min_rows,
+            expect_cols=("ticker", "close", "volume", "source"),
+            max_staleness_days=max_staleness_days,
+        )
+
+    # Closed year: assert everything except wall-clock staleness.
+    observed = assert_fresh(
+        DATASET,
+        rel,
+        partition=partition,
+        min_rows=min_rows,
+        date_column=None,
+        expect_cols=("ticker", "date", "close", "volume", "source"),
+    )
+
+    row = rel.query("rel", "SELECT min(date) AS lo, max(date) AS hi FROM rel").fetchone()
+    lo, hi = row[0], row[1]
+    if lo is None or hi is None:
+        raise StaleDataError(
+            f"{DATASET}/{partition}: {observed.row_count:,} rows but no dates, "
+            "so the partition's span cannot be established."
+        )
+
+    if hi.year != year or lo.year != year:
+        raise StaleDataError(
+            f"{DATASET}/{partition}: spans {lo.isoformat()}..{hi.isoformat()}, "
+            f"which is not entirely within {year}. A partition holds one year; "
+            "publish() filters staged rows by year, so this means the "
+            "already-published file is wrong."
+        )
+
+    if hi < date(year, 12, LAST_SESSION_ON_OR_AFTER):
+        raise StaleDataError(
+            f"{DATASET}/{partition}: newest bar is {hi.isoformat()}, but "
+            f"{year} ran to the end of December. The pull stopped early -- a "
+            f"complete year ends on the 29th, 30th or 31st. "
+            f"{observed.row_count:,} rows is not evidence to the contrary; a "
+            "truncated year is still a large number of rows."
+        )
+
+    if lo > date(year, 1, FIRST_SESSION_ON_OR_BEFORE):
+        raise StaleDataError(
+            f"{DATASET}/{partition}: oldest bar is {lo.isoformat()}, but "
+            f"{year} began trading in the first week of January. The pull "
+            "started late; the front of the year is missing."
+        )
+
+    # assert_fresh was called with date_column=None to skip the wall-clock
+    # test, which also means it did not compute a max date. Put the one
+    # measured above back on the observation, or dataset_stats records NULL
+    # for every historical partition and the freshness history has a hole in
+    # it exactly where the backfill is.
+    return replace(observed, max_date=hi)
+
+
+def staged_years(con: duckdb.DuckDBPyConnection, staging: Path) -> list[str]:
+    """Which year partitions this staging directory has rows for.
+
+    A sweep window that crosses New Year produces two, and a backfill produces
+    as many as it covers.
+    """
+    pattern = (staging / "chunk_*.parquet").as_posix()
+    rows = con.execute(
+        f"SELECT DISTINCT year(date) AS y FROM read_parquet('{pattern}') "
+        "WHERE date IS NOT NULL ORDER BY y"
+    ).fetchall()
+    return [str(int(r[0])) for r in rows]
+
+
+def publish_all(
+    staging: Path,
+    *,
+    con: duckdb.DuckDBPyConnection | None = None,
+    min_rows_factor: float = 0.5,
+    max_staleness_days: int = 4,
+    restate: bool = False,
+) -> list[Any]:
+    """Publish every year present in staging, one partition each.
+
+    A ten-year backfill is a single pass over the universe -- one Tiingo
+    request per ticker returns the whole range -- but it lands in eleven
+    partitions. Splitting here rather than sweeping once per year is the
+    difference between 14,124 requests and 141,240.
+
+    ``min_rows_factor`` is applied to each year's own staged count, so a year
+    where a ticker listed halfway through is not held to the same floor as a
+    full one.
+    """
+    con = con or storage.connect()
+    pattern = (staging / "chunk_*.parquet").as_posix()
+    observed: list[Any] = []
+
+    for partition in staged_years(con, staging):
+        staged = int(
+            con.execute(
+                f"SELECT count(*) FROM read_parquet('{pattern}') "
+                f"WHERE year(date) = {int(partition)}"
+            ).fetchone()[0]
+        )
+        observed.append(
+            publish(
+                staging,
+                partition,
+                con=con,
+                min_rows=max(1, int(staged * min_rows_factor)),
+                max_staleness_days=max_staleness_days,
+                restate=restate,
+            )
+        )
+    return observed
 
 def _q(value: str) -> str:
     """Escape a single-quoted SQL literal. Locations come from the
@@ -680,8 +850,17 @@ def publish(
     pattern = (staging / "chunk_*.parquet").as_posix()
     prior_rows = _existing_rows(con, ref.location)
 
+    # A partition holds exactly one year. Filtering here rather than trusting
+    # the caller matters for a sweep that crosses New Year and for a backfill
+    # that spans a decade -- both stage rows for several years at once, and
+    # without this the first partition written would swallow all of them.
+    staged_sql = (
+        f"SELECT * FROM read_parquet('{pattern}') "
+        f"WHERE year(date) = {int(partition)}"
+    )
+
     if prior_rows is None or restate:
-        source_sql = f"SELECT * FROM read_parquet('{pattern}')"
+        source_sql = staged_sql
         if restate:
             log.warning(
                 "restating %s/%s from staging alone; %s existing rows will be "
@@ -696,7 +875,7 @@ def publish(
         # schema drift. UNION ALL BY NAME would otherwise fill a renamed or
         # dropped column with NULLs and publish it looking healthy.
         staged_cols = {c.lower() for c in con.sql(
-            f"SELECT * FROM read_parquet('{pattern}') LIMIT 0").columns}
+            f"{staged_sql} LIMIT 0").columns}
         published_cols = {c.lower() for c in con.sql(
             "SELECT * FROM read_parquet(?) LIMIT 0", params=[ref.location]).columns}
         if staged_cols != published_cols:
@@ -707,8 +886,7 @@ def publish(
                 "Refusing to merge -- resolve the schema change deliberately."
             )
         source_sql = (
-            f"SELECT * FROM read_parquet('{pattern}') "
-            "UNION ALL BY NAME "
+            f"{staged_sql} UNION ALL BY NAME "
             f"SELECT * FROM read_parquet('{_q(ref.location)}')"
         )
 
@@ -755,12 +933,10 @@ def publish(
         f"{merged_rows:,}",
     )
 
-    observed = assert_fresh(
-        DATASET,
+    observed = _assert_partition_fresh(
         merged_rel,
         partition=partition,
         min_rows=min_rows,
-        expect_cols=("ticker", "close", "volume", "source"),
         max_staleness_days=max_staleness_days,
     )
     manifest.record_stats(observed, con=con)

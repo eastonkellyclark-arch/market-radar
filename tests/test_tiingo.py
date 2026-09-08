@@ -389,3 +389,32 @@ def test_a_resumed_ticker_returns_to_the_universe() -> None:
 
     resumed = {**long_gone, "endDate": today.isoformat()}
     assert tiingo.include_row(resumed, cutoff) is True
+
+
+def test_non_terminating_split_ratios_survive_the_stored_scale() -> None:
+    """A 1-for-15 reverse split arrives as 0.0666666667 -- ten decimal places.
+
+    The corporate-action columns were decimal128(18,8) and pyarrow refused
+    these outright ("Rescaling Decimal value would cause data loss"), which is
+    the right instinct in the wrong place: it only surfaces once the history
+    is deep enough to contain such a split, so a five-day sweep looked fine
+    for months and a ten-year backfill died on ticker 40.
+    """
+    from decimal import Decimal
+
+    for raw in (0.0666666667, 0.0555555556, 0.04873009, 0.1679969):
+        got = tiingo._factor(raw, Decimal(1))
+        assert -got.as_tuple().exponent <= 12, f"{raw} kept too many places"
+
+    assert tiingo._factor(None, Decimal(1)) == Decimal(1)
+    assert tiingo._factor(None, Decimal(0)) == Decimal(0)
+    assert tiingo._factor("not a number", Decimal(1)) == Decimal(1)
+
+
+def test_a_one_for_fifteen_reverse_split_still_adjusts_correctly() -> None:
+    """Quantising must not move the adjusted price at the stored precision."""
+    from decimal import Decimal
+
+    factor = tiingo._factor(0.0666666667, Decimal(1))
+    adjusted = (Decimal("0.05") / factor).quantize(Decimal("0.000001"))
+    assert adjusted == Decimal("0.750000")
