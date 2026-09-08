@@ -135,6 +135,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-empty", action="store_true", help="print empty lists too",
     )
 
+    p_edgar = sub.add_parser(
+        "edgar", help="poll EDGAR's current-filings feed into signals"
+    )
+    p_edgar.add_argument(
+        "--forms", nargs="+", metavar="TYPE",
+        help="form types to poll (default: the watched set)",
+    )
+    p_edgar.add_argument(
+        "--no-load", action="store_true", help="fetch and report, store nothing"
+    )
+
     # No publish flags: FRED is local-only. FRED redistributes the ICE BofA
     # series under permission, so they are not ours to republish, and there is
     # deliberately no switch that could turn that back on. See CLAUDE.md.
@@ -350,6 +361,35 @@ def _cmd_sec_tickers(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_edgar(args: argparse.Namespace) -> int:
+    """Poll the current-filings feed and land everything in signals.
+
+    A tripwire, not a history: the feed holds only the last few hundred
+    filings across all of EDGAR, so this wants running often. Reading a week
+    back is a job for the daily index files.
+    """
+    from collections import Counter
+
+    from marketradar import storage
+    from marketradar.signals import edgar_rss
+
+    forms = tuple(args.forms) if args.forms else edgar_rss.FORM_TYPES
+    print(f"polling EDGAR current filings: {', '.join(forms)}")
+    filings = edgar_rss.fetch(form_types=forms)
+    print(f"  {len(filings):,} filings in the current window")
+    for form, n in Counter(f.form_type for f in filings).most_common():
+        print(f"    {form:<10} {n:>4}")
+
+    if args.no_load:
+        print("\n--no-load: nothing stored")
+        return EXIT_OK
+
+    stats = edgar_rss.load(filings, con=storage.connect())
+    print(f"\nsignals: {stats['before']:,} -> {stats['after']:,} "
+          f"(+{stats['inserted']:,} new)")
+    return EXIT_OK
+
+
 def _cmd_fred(args: argparse.Namespace) -> int:
     """Treasury yields and credit spreads. Three requests, no budget.
 
@@ -550,6 +590,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "screens":
         load_dotenv()
         return _cmd_screens(args)
+
+    if args.command == "edgar":
+        load_dotenv()
+        try:
+            return _cmd_edgar(args)
+        except Exception as exc:
+            from marketradar.freshness import StaleDataError
+
+            label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
+            print(f"mr edgar: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
 
     if args.command == "fred":
         load_dotenv()

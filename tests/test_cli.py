@@ -21,6 +21,7 @@ def test_every_planned_command_is_registered() -> None:
 # against hand-built prices in tests/test_volatility.py.
 IMPLEMENTED = {
     "manifest", "selftest", "migrate", "prices", "screens", "fred", "digest",
+    "edgar",
 }
 
 

@@ -64,6 +64,19 @@ base = { location = "https://api.stlouisfed.org/fred", backend = "vendor_api" }
 # digest.py holds no literal endpoint, same as every other remote call.
 send = { location = "https://api.resend.com/emails", backend = "vendor_api" }
 
+[edgar]
+# EDGAR endpoints. Not storage -- recorded here so the signal modules hold no
+# literal URL, same as every other remote call.
+#
+# `current` is the near-real-time feed the sentinel polls: it returns only the
+# last few hundred filings, so it is a tripwire, not a history.
+# `daily_index` is the bulk file for a whole day, which is how a week is read
+# back without several thousand requests.
+# `archives` is the prefix every filing document hangs off.
+current = { location = "https://www.sec.gov/cgi-bin/browse-edgar", backend = "vendor_api" }
+daily_index = { location = "https://www.sec.gov/Archives/edgar/daily-index", backend = "vendor_api" }
+archives = { location = "https://www.sec.gov/Archives", backend = "vendor_api" }
+
 [sec_files]
 # CIK <-> ticker map for every SEC filer with a listed security. One small
 # file, no key, but SEC requires a descriptive User-Agent with a real contact
