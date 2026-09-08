@@ -33,6 +33,16 @@ base = { location = "https://api.tiingo.com", backend = "vendor_api" }
 # for each symbol. Free, no quota, not part of the 10k/hour request budget.
 all = { location = "https://apimedia.tiingo.com/docs/tiingo/daily/supported_tickers.zip", backend = "vendor_api" }
 
+[fred_api]
+# St. Louis Fed. Free with a key (MR_FRED_API_KEY). Three series once a day is
+# nowhere near any published limit, so this is not part of any request budget.
+base = { location = "https://api.stlouisfed.org/fred", backend = "vendor_api" }
+
+[resend_api]
+# Transactional email for the daily digest. Not storage; recorded here so
+# digest.py holds no literal endpoint, same as every other remote call.
+send = { location = "https://api.resend.com/emails", backend = "vendor_api" }
+
 [sec_files]
 # CIK <-> ticker map for every SEC filer with a listed security. One small
 # file, no key, but SEC requires a descriptive User-Agent with a real contact
@@ -47,3 +57,15 @@ company_tickers = { location = "https://www.sec.gov/files/company_tickers.json",
 # CIK <-> ticker map, republished from SEC. Public domain, so a GitHub
 # Release is fine and correct: readable with no credentials.
 all = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/reference-data/sec_company_tickers.parquet", backend = "github_release" }
+
+[fred_series]
+# Treasury yields and credit spreads from FRED.
+#
+# LICENSING NOTE, unresolved: DGS10 is US Treasury data and unambiguously
+# public domain. The two BAMLxxx series are ICE BofA indices that FRED
+# redistributes under permission from ICE Data Indices, LLC -- they are not
+# themselves government-produced. Publishing them as a public Release asset is
+# redistribution of a third-party index, which is the exact question the
+# licensing rule in CLAUDE.md exists to force. Flagged for a decision; nothing
+# is published to this location until it is settled.
+all = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/reference-data/fred_series.parquet", backend = "github_release" }

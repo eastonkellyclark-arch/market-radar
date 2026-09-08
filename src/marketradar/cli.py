@@ -127,8 +127,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-empty", action="store_true", help="print empty lists too",
     )
 
+    p_fred = sub.add_parser(
+        "fred", help="load Treasury yields and credit spreads from FRED"
+    )
+    p_fred.add_argument(
+        "--no-publish", action="store_true", help="upsert only, skip the Release"
+    )
+    p_fred.add_argument(
+        "--allow-licensed", action="store_true",
+        help="publish the ICE BofA series to the public Release as well. "
+             "Off by default: those are third-party indices FRED redistributes "
+             "under permission, not government data.",
+    )
+
     p_digest = sub.add_parser("digest", help="render the daily email")
     p_digest.add_argument("--dry-run", action="store_true", help="render, do not send")
+    p_digest.add_argument(
+        "--as-of", type=_iso_date, metavar="YYYY-MM-DD",
+        help="trading day to render (default: newest in the data)",
+    )
+    p_digest.add_argument(
+        "--top", type=int, default=10, metavar="N",
+        help="rows per list in the email (default 10)",
+    )
+    p_digest.add_argument(
+        "--html", action="store_true", help="print the HTML body instead of text"
+    )
 
     p_backfill = sub.add_parser("backfill", help="drain N queue items")
     p_backfill.add_argument("--budget", type=int, default=100, help="items to drain")
@@ -294,6 +318,78 @@ def _cmd_sec_tickers(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_fred(args: argparse.Namespace) -> int:
+    """Treasury yields and credit spreads. Three requests, no budget."""
+    from marketradar import storage
+    from marketradar.sources import fred
+
+    print("fetching FRED series (one request each)")
+    observations = fred.fetch()
+    by_series: dict[str, int] = {}
+    for o in observations:
+        by_series[o.series_id] = by_series.get(o.series_id, 0) + 1
+    for s in fred.SERIES:
+        print(f"  {s.series_id:<14} {by_series.get(s.series_id, 0):>6,} observations"
+              f"  ({s.label})")
+
+    con = storage.connect()
+
+    if not args.no_publish:
+        try:
+            observed = fred.publish(
+                observations, con=con, allow_licensed=args.allow_licensed
+            )
+            for obs in observed:
+                print(f"  published {obs.partition}: {obs.row_count:,} rows, "
+                      f"max {obs.max_date}")
+        except fred.FredError as exc:
+            print(f"\nnot published: {exc}\n", file=sys.stderr)
+            print("continuing with the local upsert; pass --no-publish to "
+                  "silence this.", file=sys.stderr)
+
+    print("\nupserting into macro_series")
+    stats = fred.load(observations, con=con)
+    print(f"  rows: {stats['rows_before']:,} -> {stats['rows_after']:,} "
+          f"(+{stats['rows_inserted']:,})")
+
+    print("\nlatest:")
+    for series_id, obs in fred.latest(con).items():
+        series = fred.BY_ID[series_id]
+        print(f"  {series.label:<14} {obs.value}{series.units}  as of {obs.obs_date}")
+    return EXIT_OK
+
+
+def _cmd_digest(args: argparse.Namespace) -> int:
+    """Render the daily email, and send it unless --dry-run."""
+    from marketradar import digest as digest_mod
+    from marketradar import storage
+    from marketradar.freshness import StaleDataError
+
+    con = storage.connect()
+    try:
+        digest = digest_mod.build(con, as_of=args.as_of, top_n=args.top)
+    except (digest_mod.DigestError, StaleDataError) as exc:
+        print(f"mr digest: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    body = (
+        digest_mod.render_html(digest) if args.html else digest_mod.render_text(digest)
+    )
+    print(body)
+
+    try:
+        outcome = digest_mod.send(digest, dry_run=args.dry_run)
+    except digest_mod.DigestError as exc:
+        print(f"\nmr digest: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if outcome["sent"]:
+        print(f"\nsent to {', '.join(outcome['to'])} from {outcome['from']}")
+    else:
+        print(f"\ndry run - nothing sent. subject would be: {outcome['subject']!r}")
+    return EXIT_OK
+
+
 def _cmd_screens(args: argparse.Namespace) -> int:
     """Volatility screens for one trading day.
 
@@ -429,8 +525,22 @@ def main(argv: list[str] | None = None) -> int:
         load_dotenv()
         return _cmd_screens(args)
 
+    if args.command == "fred":
+        load_dotenv()
+        try:
+            return _cmd_fred(args)
+        except Exception as exc:
+            from marketradar.freshness import StaleDataError
+
+            label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
+            print(f"mr fred: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "digest":
+        load_dotenv()
+        return _cmd_digest(args)
+
     pending = {
-        "digest": "Weekend 2",
         "backfill": "Weekend 3",
     }
     return _not_implemented(args.command, pending[args.command])

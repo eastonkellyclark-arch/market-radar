@@ -19,7 +19,9 @@ def test_every_planned_command_is_registered() -> None:
 # `prices` spends Tiingo quota, and `screens` reads prices from R2. None
 # belong in a suite that runs offline. The screen's own logic is covered
 # against hand-built prices in tests/test_volatility.py.
-IMPLEMENTED = {"manifest", "selftest", "migrate", "prices", "screens"}
+IMPLEMENTED = {
+    "manifest", "selftest", "migrate", "prices", "screens", "fred", "digest",
+}
 
 
 @pytest.mark.parametrize("command", sorted(EXPECTED_COMMANDS - IMPLEMENTED))
