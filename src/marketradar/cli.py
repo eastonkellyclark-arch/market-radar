@@ -147,6 +147,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-load", action="store_true", help="fetch and report, store nothing"
     )
 
+    p_deals = sub.add_parser(
+        "deals", help="extract M&A from 8-K Items 1.01 and 2.01"
+    )
+    p_deals.add_argument("--date", type=_iso_date, metavar="YYYY-MM-DD",
+                         help="last day to read (default: today)")
+    p_deals.add_argument("--days", type=int, default=5, metavar="N",
+                         help="how many days back to read (default 5)")
+    p_deals.add_argument(
+        "--no-exhibits", action="store_true",
+        help="skip the press-release fetch. Body-only value coverage was 68%% "
+             "against 77%% with exhibits, so this trades nine points of "
+             "coverage for one fewer request per valueless candidate.",
+    )
+    p_deals.add_argument("--no-load", action="store_true",
+                         help="extract and report, store nothing")
+    p_deals.add_argument("--review", action="store_true",
+                         help="print only candidates whose classifiers disagreed")
+
     p_f4 = sub.add_parser(
         "form4", help="read Form 4s and report open-market purchase clusters"
     )
@@ -462,6 +480,68 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
     if not args.no_open and shell.open_in_browser(target):
         print("opened in your browser")
+    return EXIT_OK
+
+
+def _cmd_deals(args: argparse.Namespace) -> int:
+    """Extract deal candidates from 8-K Items 1.01 and 2.01.
+
+    Item 1.01 is mostly not M&A -- measured at roughly 16% over a full week
+    of filings -- so the output is a candidate list with both classifiers
+    shown, not a deal list. Rows where the exhibit and the text disagree are
+    the review queue and are marked rather than dropped.
+    """
+    from datetime import timedelta
+
+    from marketradar.clock import market_today
+    from marketradar.signals import deals
+
+    end = args.date or market_today()
+    start = end - timedelta(days=args.days - 1)
+    print(f"reading 8-K filings {start} to {end}")
+
+    found = deals.fetch(start, end, read_exhibits=not args.no_exhibits)
+    if not found:
+        print("no deal candidates in that window")
+        return EXIT_OK
+
+    agree = [d for d in found if d.classifiers_agree]
+    review = [d for d in found if not d.classifiers_agree]
+    by_type: dict[str, int] = {}
+    for d in found:
+        by_type[d.deal_type] = by_type.get(d.deal_type, 0) + 1
+
+    print(f"\n{len(found)} candidates: {len(agree)} both classifiers agree, "
+          f"{len(review)} for review")
+    print("  " + "  ".join(f"{k}={v}" for k, v in sorted(by_type.items())))
+
+    priced = [d for d in found if d.value_usd is not None]
+    print(f"  value stated: {len(priced)}/{len(found)}"
+          f" ({len(priced) / len(found) * 100:.0f}%)"
+          f"; from an exhibit: "
+          f"{sum(1 for d in priced if d.value_basis == 'stated_exhibit')}")
+    promised = sum(1 for d in found if d.target_financials == "rule_305_promised")
+    print(f"  target financials promised under Rule 3-05: {promised}/{len(found)}")
+
+    shown = review if args.review else found
+    print()
+    for d in sorted(shown, key=lambda d: (d.value_usd or 0), reverse=True):
+        flag = "  " if d.classifiers_agree else "??"
+        money = f"${d.value_usd:,.0f}" if d.value_usd is not None else d.value_basis
+        print(f"{flag} {d.filed_date}  {d.company[:30]:30s} {d.deal_type:14s} "
+              f"{d.consideration:10s} {money:>18s}")
+        print(f"     items {d.items}  exhibit={'Y' if d.exhibit_signal else 'n'} "
+              f"text={d.text_signal or '-'}  role={d.filer_role}"
+              + (f"  vs {d.counterparty[:40]}" if d.counterparty else ""))
+
+    if args.no_load:
+        print("\n--no-load: nothing stored")
+        return EXIT_OK
+
+    stats = deals.load(found)
+    print(f"\nstored: {stats['inserted']} new, "
+          f"{stats['candidates'] - stats['inserted']} updated, "
+          f"{stats['after']} total")
     return EXIT_OK
 
 
@@ -798,6 +878,17 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_form4(args)
         except Exception as exc:
             print(f"mr form4: error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "deals":
+        load_dotenv()
+        try:
+            return _cmd_deals(args)
+        except Exception as exc:
+            from marketradar.freshness import StaleDataError
+
+            label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
+            print(f"mr deals: {label}: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "edgar":

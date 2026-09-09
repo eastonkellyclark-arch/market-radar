@@ -455,7 +455,7 @@ broken one; a panel that says "waiting on the 10-year backfill" is not.
 | Day-over-day / NEW markers | waiting | 2+ sessions of universe history |
 | Liquidity gate (12 of the 24 lists) | **waiting, see below** | trailing-window ADV |
 | News | not built | W3 |
-| M&A teardowns | not built | W3–beyond |
+| 8-K deals | LIVE | W3-T3 |
 | Deal multiples | not built | beyond |
 | Historical outcomes | not built | beyond |
 | DCF / 3-statement | not built | beyond |
@@ -616,7 +616,7 @@ three-year trend, and clear a review queue without writing SQL.
   tag map is maintained by hand and branches by SIC code; a panel showing
   which tags resolved and which fell through is the fastest way to find the
   next branch it needs.
-- `U11` M&A teardown panel — replaces the placeholder
+- `U11` 8-K deals panel — shipped with W3-T3, replacing the placeholder
 - `U12` deal multiples and historical outcome distributions — the forward
   return join is pure SQL and needs no LLM, so this panel can precede every
   embedding

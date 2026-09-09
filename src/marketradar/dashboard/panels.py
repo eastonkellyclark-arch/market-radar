@@ -426,3 +426,184 @@ FEED_SCRIPT: Final[str] = """
   });
 })();
 """
+
+
+# --- W3-T3: 8-K deals ---------------------------------------------------
+
+#: How the value states are worded on screen. Spelled out rather than shown
+#: as a code, because the entire point of the reason codes is that a reader
+#: never has to guess what a blank means.
+_VALUE_WORDS: Final[dict[str, str]] = {
+    "stated_8k": "in the 8-K",
+    "stated_exhibit": "in an exhibit",
+    "not_stated": "not stated",
+    "not_parsed": "unparsed",
+}
+_FIN_WORDS: Final[dict[str, str]] = {
+    "rule_305_promised": "Rule 3-05 promised",
+    "figures_in_filing": "figures given",
+    "none_disclosed": "none",
+}
+
+
+def _money(raw: str | None) -> str:
+    """A stated value, compactly. Empty when there is none.
+
+    Never a dash and never a zero: an absent price is the common case here,
+    and the caller prints the reason in its place.
+    """
+    if raw in (None, ""):
+        return ""
+    value = Decimal(raw)
+    for cut, suffix in ((Decimal("1e9"), "B"), (Decimal("1e6"), "M"),
+                        (Decimal("1e3"), "K")):
+        if value >= cut:
+            return f"${value / cut:,.2f}{suffix}"
+    return f"${value:,.0f}"
+
+
+def deals_html(rows: list[dict[str, Any]]) -> str:
+    """Deal candidates from 8-K Items 1.01 and 2.01.
+
+    **This is a candidate list, not a deal list.** Item 1.01 is "Entry into a
+    Material Definitive Agreement" and only about 16% of it is M&A -- the rest
+    is credit facilities, equity raises and supply contracts. So each row
+    shows both classifiers rather than a verdict: whether an EX-2.x exhibit is
+    attached, which is the filer's own Reg S-K 601(b)(2) classification, and
+    what the prose names. Rows where the two disagree carry a REVIEW mark and
+    can be isolated with one click -- that disagreement is the only honest
+    signal available about which rows to distrust.
+
+    SPAC combinations filter separately. A quarter of the set is a de-SPAC,
+    which has no operating acquirer and no computable multiple; reading it
+    alongside operating deals is what makes an average meaningless.
+    """
+    if not rows:
+        return ('<p class="empty">No deal candidates stored. Run '
+                "<code>mr deals</code>.</p>")
+
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["deal_type"]] = counts.get(r["deal_type"], 0) + 1
+    review = sum(1 for r in rows if not r["agree"])
+    priced = sum(1 for r in rows if r["value_usd"])
+
+    chips = "".join(
+        f'<button class="f" data-f="dtype" data-v="{_esc(k)}">{_esc(k)} '
+        f'<span class="count">{v}</span></button>'
+        for k, v in sorted(counts.items(), key=lambda kv: -kv[1])
+    )
+
+    body = []
+    for r in rows:
+        marks = []
+        if not r["agree"]:
+            marks.append('<span class="mk rev" title="the EX-2.x exhibit and '
+                         'the prose disagree">REVIEW</span>')
+        if r["target_financials"] == "rule_305_promised":
+            marks.append('<span class="mk fin" title="audited target '
+                         'financials due by amendment">3-05</span>')
+        value = _money(r["value_usd"])
+        basis = _VALUE_WORDS.get(r["value_basis"], r["value_basis"])
+        who = r.get("counterparty") or ""
+        cell = value or f'<span class="note">{_esc(basis)}</span>'
+        why = (
+            "exhibit EX-2.x: <strong>"
+            + ("yes" if r["exhibit_signal"] else "no")
+            + "</strong> &middot; text reads: <strong>"
+            + _esc(r["text_signal"] or "ambiguous")
+            + "</strong> &middot; value " + _esc(basis)
+            + (f' ({_esc(r["value_text"])})' if r.get("value_text") else "")
+            + " &middot; target financials "
+            + _esc(_FIN_WORDS.get(r["target_financials"], "?"))
+            + " &middot; filer is "
+            + _esc(r["filer_role"].replace("_", " "))
+        )
+        body.append(
+            f'<tr class="dl" data-dtype="{_esc(r["deal_type"])}" '
+            f'data-review="{int(not r["agree"])}">'
+            f'<td class="note">{_esc(r["filed"])}</td>'
+            f'<td class="tk">{_esc(r["company"][:30])}</td>'
+            f'<td class="note">{_esc(r["deal_type"])}</td>'
+            f'<td class="note">{_esc(r["items"])}</td>'
+            f'<td class="num" data-v="{_esc(r["value_usd"] or 0)}">{cell}</td>'
+            f'<td class="note">{_esc(r["consideration"].replace("_", " "))}</td>'
+            f'<td class="note">{_esc(who[:34])}</td>'
+            f'<td class="note">{"".join(marks)}</td></tr>'
+            f'<tr class="dl-why" data-dtype="{_esc(r["deal_type"])}" '
+            f'data-review="{int(not r["agree"])}">'
+            f'<td></td><td colspan="7" class="note">{why}</td></tr>'
+        )
+
+    return f"""
+      <p class="note">Item 1.01 covers every material contract a registrant
+        signs and measured <strong>~16% M&amp;A</strong> over a full week, so
+        these are candidates rather than deals. {review} of {len(rows)} have
+        the exhibit and the prose disagreeing; {priced} of {len(rows)} state a
+        value at all.</p>
+      <div class="filters">{chips}
+        <button class="f" data-f="dreview">review only
+          <span class="count">{review}</span></button>
+        <button class="f reset" data-f="dreset">all</button>
+        <span class="note dl-count"></span></div>
+      <table class="rows" id="deal-rows">
+        <thead><tr><th data-s="t">filed</th><th data-s="t">company</th>
+          <th data-s="t">type</th><th>items</th>
+          <th data-s="n" class="num">value</th><th>consideration</th>
+          <th data-s="t">counterparty</th><th>flags</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>"""
+
+
+#: Deal-panel filtering. Kept with the other inline script: one file, no
+#: build step.
+DEALS_SCRIPT: Final[str] = """
+(function () {
+  var table = document.getElementById('deal-rows');
+  if (!table) { return; }
+  var dtype = null, reviewOnly = false;
+  function apply() {
+    var shown = 0, total = 0;
+    table.querySelectorAll('tbody tr').forEach(function (r) {
+      var ok = (!dtype || r.dataset.dtype === dtype) &&
+               (!reviewOnly || r.dataset.review === '1');
+      r.hidden = !ok;
+      if (r.classList.contains('dl')) {
+        total++;
+        if (ok) { shown++; }
+      }
+    });
+    var c = document.querySelector('.dl-count');
+    if (c) { c.textContent = shown + ' of ' + total + ' candidates'; }
+  }
+  document.querySelectorAll('button.f[data-f="dtype"]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      dtype = (dtype === b.dataset.v) ? null : b.dataset.v;
+      document.querySelectorAll('button.f[data-f="dtype"]').forEach(function (o) {
+        o.classList.toggle('sel', o.dataset.v === dtype);
+      });
+      apply();
+    });
+  });
+  var rv = document.querySelector('button.f[data-f="dreview"]');
+  if (rv) {
+    rv.addEventListener('click', function () {
+      reviewOnly = !reviewOnly;
+      rv.classList.toggle('sel', reviewOnly);
+      apply();
+    });
+  }
+  var rs = document.querySelector('button.f[data-f="dreset"]');
+  if (rs) {
+    rs.addEventListener('click', function () {
+      dtype = null;
+      reviewOnly = false;
+      document.querySelectorAll('button.f').forEach(function (o) {
+        o.classList.remove('sel');
+      });
+      apply();
+    });
+  }
+  apply();
+})();
+"""

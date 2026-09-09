@@ -97,6 +97,7 @@ class Context:
     filings: dict[str, Any] = field(default_factory=dict)
     recent_filings: list[dict[str, Any]] = field(default_factory=list)
     clusters: list[dict[str, Any]] = field(default_factory=list)
+    deals: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -168,6 +169,29 @@ def gather(con: duckdb.DuckDBPyConnection | None = None) -> Context:
         parts = (acc or "").split(":")
         body["issuer_cik"] = parts[1] if len(parts) > 2 else ""
         ctx.clusters.append(body)
+
+    # value_usd is cast to text: it is numeric(20,2) and the point of this
+    # column is that a NULL is never zero, so it travels as NULL or as its
+    # own digits, never through a float.
+    for row in q(
+        "select accession, company, cik, filed_date::text as filed, items, "
+        "exhibit_signal, text_signal, classifiers_agree, deal_type, "
+        "consideration, value_usd::text as value_usd, value_basis, "
+        "value_text, filer_role, counterparty, acquirer, target, "
+        "party_basis, target_financials, url "
+        "from deals order by filed_date desc, value_usd desc nulls last "
+        "limit 400"
+    ):
+        ctx.deals.append({
+            "accession": row[0], "company": row[1], "cik": row[2],
+            "filed": row[3], "items": row[4], "exhibit_signal": bool(row[5]),
+            "text_signal": row[6], "agree": bool(row[7]), "deal_type": row[8],
+            "consideration": row[9], "value_usd": row[10],
+            "value_basis": row[11], "value_text": row[12],
+            "filer_role": row[13], "counterparty": row[14],
+            "acquirer": row[15], "target": row[16], "party_basis": row[17],
+            "target_financials": row[18], "url": row[19],
+        })
     return ctx
 
 
@@ -278,6 +302,15 @@ def _probe_clusters_tenpct(ctx: Context) -> tuple[str, str]:
     return LIVE, f"{n} 10%-holder clusters stored, unfiltered"
 
 
+def _probe_deals(ctx: Context) -> tuple[str, str]:
+    if not ctx.deals:
+        return WAITING, "no deal candidates stored -- run `mr deals`"
+    review = sum(1 for d in ctx.deals if not d["agree"])
+    spac = sum(1 for d in ctx.deals if d["deal_type"] == "spac")
+    return LIVE, (f"{len(ctx.deals)} candidates, {review} for review, "
+                  f"{spac} SPAC combinations")
+
+
 # --- the registry -------------------------------------------------------
 
 PANELS: Final[tuple[Panel, ...]] = (
@@ -320,6 +353,11 @@ PANELS: Final[tuple[Panel, ...]] = (
           "apart because the medians are 78x apart, so one floor cannot "
           "serve both.",
           probe=_probe_clusters_tenpct),
+    Panel("deals", "8-K deals", "Filings",
+          "Items 1.01 and 2.01, classified. Item 1.01 is only ~16% M&A, so "
+          "both classifiers are shown and disagreements are a review queue "
+          "rather than a hidden judgement call.",
+          probe=_probe_deals),
     Panel("news", "News", "Filings",
           "GDELT and Finnhub headlines against watched issuers.",
           weekend="Weekend 3"),
@@ -336,9 +374,6 @@ PANELS: Final[tuple[Panel, ...]] = (
           "Normalised financials, plus which tags resolved and which fell "
           "through -- the fastest way to find the next branch tag_map needs.",
           weekend="Beyond"),
-    Panel("teardowns", "M&A teardowns", "Analysis",
-          "8-K item codes, deal structure, consideration.",
-          weekend="Weekend 3 to Beyond"),
     Panel("multiples", "Deal multiples", "Analysis",
           "Comparable transactions, filtered before ranked.",
           weekend="Beyond"),
@@ -420,6 +455,8 @@ def render(
             ctx.clusters, "insider", 50_000)
         bodies["clusters_tenpct"] = body_html.clusters_html(
             ctx.clusters, "ten_percent", 1_000_000)
+    if ctx.deals:
+        bodies["deals"] = body_html.deals_html(ctx.deals)
 
     resolved = [(p, *p.resolve(ctx)) for p in panels]
     counts = {s: sum(1 for _, st, _ in resolved if st == s)
@@ -450,6 +487,8 @@ def render(
         parts.append(body_html.SCRIPT)
     if ctx.recent_filings or ctx.clusters:
         parts.append(body_html.FEED_SCRIPT)
+    if ctx.deals:
+        parts.append(body_html.DEALS_SCRIPT)
     if details:
         parts.append(
             "window.__TK__=" + json.dumps(details, separators=(",", ":")) + ";"
@@ -594,6 +633,11 @@ td.new {{ color:#0ca30c; font-size:9.5px; font-weight:700; width:26px; }}
        border:1px solid var(--rule); border-radius:3px; padding:0 4px;
        margin-right:4px; color:var(--muted); }}
 .mk.fund {{ color:#fab219; border-color:#fab219; }}
+/* Status colours, not series colours: REVIEW is the warning step and 3-05 the
+   good one, and both carry a word so the state is never colour alone. */
+.mk.rev {{ color:#fab219; border-color:#fab219; }}
+.mk.fin {{ color:#0ca30c; border-color:#0ca30c; }}
+tr.dl-why td {{ padding-top:0; padding-bottom:6px; }}
 .cl-controls {{ align-items:center; }}
 .flr {{ font-size:11.5px; color:var(--ink-2); display:inline-flex;
         align-items:center; gap:4px; }}

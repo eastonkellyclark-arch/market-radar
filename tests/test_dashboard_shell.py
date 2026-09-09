@@ -35,7 +35,7 @@ def test_every_panel_in_the_build_order_is_declared() -> None:
     ids = {p.id for p in shell.PANELS}
     for expected in ("health", "macro", "screens", "news",
                      "clusters_insider", "clusters_tenpct",
-                     "private", "review", "xbrl", "teardowns", "multiples",
+                     "private", "review", "xbrl", "deals", "multiples",
                      "outcomes", "dcf", "decks", "ticker", "dod", "liquidity"):
         assert expected in ids, f"{expected} is missing from the panel map"
 
