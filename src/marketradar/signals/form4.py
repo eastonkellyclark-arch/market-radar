@@ -582,9 +582,35 @@ def clusters(
     Someone who is both an officer and a 10% holder counts as an insider. A
     CEO who happens to hold 12% is an insider who is large, not a fund.
     """
+    return clusters_from_buys(
+        purchases(filings),
+        insider_floor=insider_floor,
+        tenpct_floor=tenpct_floor,
+        window_days=window_days,
+        min_buyers=min_buyers,
+    )
+
+
+def clusters_from_buys(
+    buys_in: Iterable[Buy],
+    *,
+    insider_floor: Decimal = DEFAULT_INSIDER_FLOOR,
+    tenpct_floor: Decimal = DEFAULT_TENPCT_FLOOR,
+    window_days: int = CLUSTER_WINDOW_DAYS,
+    min_buyers: int = MIN_CLUSTER_BUYERS,
+) -> dict[str, list[Cluster]]:
+    """The windowing rule itself, over :class:`Buy` records.
+
+    Split out from :func:`clusters` so the eleven-year study can feed buys
+    parsed from SEC's quarterly Form 3/4/5 data sets -- 43 downloads instead
+    of 2.5 million per-filing requests -- and still be scored by exactly the
+    rule that runs nightly. A second implementation of the window would be a
+    second thing to keep in step, and a historical result that used a
+    slightly different rule would not be evidence about this one.
+    """
     floors = {INSIDER: insider_floor, TEN_PERCENT: tenpct_floor}
     by_key: dict[tuple[str, str], list[Buy]] = {}
-    for buy in purchases(filings):
+    for buy in buys_in:
         by_key.setdefault((buy.issuer_cik, buy.role), []).append(buy)
 
     out: dict[str, list[Cluster]] = {INSIDER: [], TEN_PERCENT: []}

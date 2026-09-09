@@ -54,3 +54,4 @@ desktop.ini
 # See docs/build-spec.md, "The UI track".
 .dashboard/
 dashboard.html
+.cache/

@@ -607,3 +607,114 @@ DEALS_SCRIPT: Final[str] = """
   apply();
 })();
 """
+
+
+# --- Historical outcomes ------------------------------------------------
+
+#: Diverging pair for the excess-return bars: one hue each side of a neutral
+#: zero line, never a rainbow and never the status palette, which is reserved
+#: for good/warning/serious/critical. The number is printed beside every bar,
+#: so colour is a second encoding rather than the only one.
+_UP: Final[str] = "#2b6cb0"
+_DOWN: Final[str] = "#b45309"
+
+#: Widest bar, as a fraction. Excess returns here live inside a few percent;
+#: scaling to the maximum observed value would make noise look like signal.
+_BAR_FULL: Final[float] = 0.10
+
+
+def _bar(value: float | None) -> str:
+    """A diverging bar from a centre line. Empty when there is no number."""
+    if value is None:
+        return ""
+    frac = max(-1.0, min(1.0, value / _BAR_FULL))
+    width = abs(frac) * 50.0
+    left = 50.0 if frac >= 0 else 50.0 - width
+    hue = _UP if frac >= 0 else _DOWN
+    return (
+        '<span class="oc-bar" aria-hidden="true">'
+        f'<span class="oc-fill" style="left:{left:.1f}%;width:{width:.1f}%;'
+        f'background:{hue}"></span></span>'
+    )
+
+
+def outcomes_html(rows: list[dict[str, Any]]) -> str:
+    """Forward returns after an event, by slice and horizon.
+
+    **The median leads and the mean sits beside it.** Event-study return
+    distributions are not normal: one 900% takeout moves the mean of ten
+    thousand events and says nothing about the next one. A large gap between
+    the two columns is itself the finding.
+
+    Two numbers here are easy to skip and should not be. ``priced`` is how
+    much of the population produced any return at all -- a delisted target
+    has no thirty-session close, and the deal closing is exactly why its
+    history ends, so the drops correlate with the outcome. ``drop`` counts
+    events excluded as suspected unrecorded splits, which is a statement
+    about our corporate-actions coverage rather than about the market.
+    """
+    if not rows:
+        return ('<p class="empty">No outcome study stored. Run '
+                "<code>mr outcomes</code>.</p>")
+
+    studies: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        studies.setdefault(r["study"], []).append(r)
+
+    def num(v: Any) -> float | None:
+        return None if v in (None, "") else float(v)
+
+    def pct(v: float | None) -> str:
+        return '<span class="note">-</span>' if v is None else f"{v * 100:+.2f}%"
+
+    blocks = []
+    for study, group in sorted(studies.items()):
+        head = group[0]
+        events, priced = head.get("events") or 0, head.get("priced") or 0
+        share = f"{priced / events * 100:.0f}%" if events else "-"
+        body = []
+        for r in sorted(group, key=lambda r: (r["slice"] != "all",
+                                              r["slice"], r["horizon"])):
+            ex = num(r["median_excess"])
+            mean_ex = num(r["mean_excess"])
+            win = num(r["win_rate"])
+            win_cell = '<span class="note">-</span>' if win is None \
+                else f"{win * 100:.0f}%"
+            emphasis = ' class="oc-all"' if r["slice"] == "all" else ""
+            body.append(
+                f"<tr{emphasis}>"
+                f'<td class="tk">{_esc(r["slice"])}</td>'
+                f'<td class="num">+{int(r["horizon"])}d</td>'
+                f'<td class="num">{int(r["n"]):,}</td>'
+                f'<td class="num">{pct(num(r["median_ret"]))}</td>'
+                f'<td class="num">{pct(ex)}{_bar(ex)}</td>'
+                f'<td class="num">{pct(mean_ex)}</td>'
+                f'<td class="num">{win_cell}</td>'
+                f'<td class="num">{pct(num(r["median_run_up"]))}</td>'
+                f'<td class="num note">{int(r["n_suspect"])}</td></tr>'
+            )
+        blocks.append(f"""
+          <h5>{_esc(study)}</h5>
+          <p class="note">{events:,} events, {priced:,} priced ({share}).
+            Benchmark {_esc(head.get("benchmark") or "SPY")}; horizons are
+            trading sessions from the last close before the event, so
+            <strong>+1d is the event session itself</strong>.</p>
+          <table class="rows">
+            <thead><tr><th>slice</th><th class="num">h</th>
+              <th class="num">n</th><th class="num">median</th>
+              <th class="num">median excess</th><th class="num">mean excess</th>
+              <th class="num">win</th><th class="num">run-up</th>
+              <th class="num">drop</th></tr></thead>
+            <tbody>{''.join(body)}</tbody>
+          </table>""")
+
+    return f"""
+      <p class="note">Pure SQL over eleven years of prices - no LLM, no
+        embeddings - so this can precede the expensive machinery rather than
+        justify it afterwards. <strong>run-up</strong> is the five sessions
+        before the event: a signal that only appears after the move already
+        happened is a different thing from one that precedes it.
+        <strong>drop</strong> counts events excluded as suspected unrecorded
+        splits, which measures our corporate-actions coverage, not the
+        market.</p>
+      {''.join(blocks)}"""

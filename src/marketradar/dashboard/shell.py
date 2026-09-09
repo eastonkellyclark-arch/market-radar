@@ -98,6 +98,7 @@ class Context:
     recent_filings: list[dict[str, Any]] = field(default_factory=list)
     clusters: list[dict[str, Any]] = field(default_factory=list)
     deals: list[dict[str, Any]] = field(default_factory=list)
+    outcomes: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -191,6 +192,23 @@ def gather(con: duckdb.DuckDBPyConnection | None = None) -> Context:
             "filer_role": row[13], "counterparty": row[14],
             "acquirer": row[15], "target": row[16], "party_basis": row[17],
             "target_financials": row[18], "url": row[19],
+        })
+
+    # Numerics as text: these are ratios that must not pass through a float
+    # on the way to a page that prints them to two decimals.
+    for row in q(
+        "select study, slice, horizon, n, n_suspect, median_ret::text, "
+        "mean_ret::text, median_excess::text, mean_excess::text, "
+        "win_rate::text, median_run_up::text, events, priced, benchmark "
+        "from outcome_stats order by study, slice, horizon"
+    ):
+        ctx.outcomes.append({
+            "study": row[0], "slice": row[1], "horizon": row[2],
+            "n": row[3], "n_suspect": row[4], "median_ret": row[5],
+            "mean_ret": row[6], "median_excess": row[7],
+            "mean_excess": row[8], "win_rate": row[9],
+            "median_run_up": row[10], "events": row[11], "priced": row[12],
+            "benchmark": row[13],
         })
     return ctx
 
@@ -302,6 +320,16 @@ def _probe_clusters_tenpct(ctx: Context) -> tuple[str, str]:
     return LIVE, f"{n} 10%-holder clusters stored, unfiltered"
 
 
+def _probe_outcomes(ctx: Context) -> tuple[str, str]:
+    if not ctx.outcomes:
+        return WAITING, "no study stored -- run `mr outcomes`"
+    studies = {r["study"] for r in ctx.outcomes}
+    events = sum(r["events"] or 0 for r in ctx.outcomes if r["slice"] == "all"
+                 and r["horizon"] == 1)
+    return LIVE, (f"{len(studies)} population(s), {events:,} events scored "
+                  "at +1/+5/+30 sessions")
+
+
 def _probe_deals(ctx: Context) -> tuple[str, str]:
     if not ctx.deals:
         return WAITING, "no deal candidates stored -- run `mr deals`"
@@ -378,9 +406,10 @@ PANELS: Final[tuple[Panel, ...]] = (
           "Comparable transactions, filtered before ranked.",
           weekend="Beyond"),
     Panel("outcomes", "Historical outcomes", "Analysis",
-          "Forward returns at +1d/+5d/+30d. Pure SQL, no LLM -- can precede "
-          "every embedding.",
-          weekend="Beyond"),
+          "Forward returns at +1/+5/+30 trading sessions, against a "
+          "benchmark. Pure SQL, no LLM -- so it precedes every embedding "
+          "rather than justifying one afterwards.",
+          probe=_probe_outcomes),
     Panel("dcf", "DCF / 3-statement", "Analysis",
           "Model output against the normalised statements.",
           weekend="Beyond"),
@@ -457,6 +486,8 @@ def render(
             ctx.clusters, "ten_percent", 1_000_000)
     if ctx.deals:
         bodies["deals"] = body_html.deals_html(ctx.deals)
+    if ctx.outcomes:
+        bodies["outcomes"] = body_html.outcomes_html(ctx.outcomes)
 
     resolved = [(p, *p.resolve(ctx)) for p in panels]
     counts = {s: sum(1 for _, st, _ in resolved if st == s)
@@ -637,6 +668,14 @@ td.new {{ color:#0ca30c; font-size:9.5px; font-weight:700; width:26px; }}
    good one, and both carry a word so the state is never colour alone. */
 .mk.rev {{ color:#fab219; border-color:#fab219; }}
 .mk.fin {{ color:#0ca30c; border-color:#0ca30c; }}
+/* Diverging bar for excess returns: one hue each side of a neutral zero
+   line. The number is printed beside it, so colour never carries the value
+   alone. */
+.oc-bar {{ position:relative; display:inline-block; width:64px; height:6px;
+  margin-left:6px; vertical-align:middle; background:var(--rule);
+  border-radius:3px; }}
+.oc-fill {{ position:absolute; top:0; height:6px; border-radius:3px; }}
+tr.oc-all td {{ font-weight:600; }}
 tr.dl-why td {{ padding-top:0; padding-bottom:6px; }}
 .cl-controls {{ align-items:center; }}
 .flr {{ font-size:11.5px; color:var(--ink-2); display:inline-flex;

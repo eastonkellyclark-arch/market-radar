@@ -9,6 +9,7 @@ Unimplemented subcommands exit non-zero rather than doing nothing quietly.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import logging
 import os
 import sys
@@ -146,6 +147,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_edgar.add_argument(
         "--no-load", action="store_true", help="fetch and report, store nothing"
     )
+
+    p_out = sub.add_parser(
+        "outcomes",
+        help="forward returns after Form 4 clusters and 8-K deals (pure SQL)",
+    )
+    p_out.add_argument("--study", choices=("form4", "deals", "both"),
+                       default="both", help="which population to score")
+    p_out.add_argument("--clusters", metavar="PATH",
+                       help="parquet of historical Form 4 clusters (default: "
+                            ".cache/form4_clusters.parquet, else the live "
+                            "signals table)")
+    p_out.add_argument("--benchmark", default="SPY", metavar="TICKER",
+                       help="benchmark for excess returns (default SPY)")
+    p_out.add_argument("--no-load", action="store_true",
+                       help="compute and print, store nothing")
 
     p_deals = sub.add_parser(
         "deals", help="extract M&A from 8-K Items 1.01 and 2.01"
@@ -480,6 +496,159 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
     if not args.no_open and shell.open_in_browser(target):
         print("opened in your browser")
+    return EXIT_OK
+
+
+def _outcome_prices(con):
+    """Every price partition, not just the ones a screen needs."""
+    from marketradar import storage
+    from marketradar.screens.volatility import DATASET
+
+    rels = []
+    for year in range(2016, _dt.date.today().year + 1):
+        try:
+            rels.append(storage.read_dataset(DATASET, year, con=con))
+        except Exception:
+            continue
+    if not rels:
+        raise RuntimeError("no price partitions are readable")
+    rel = rels[0]
+    for other in rels[1:]:
+        rel = rel.union(other)
+    return rel
+
+
+def _cluster_events(con, path: str | None):
+    """Form 4 clusters as events, anchored on when they became public.
+
+    Anchored on the *filing* date, never the transaction date. A Form 4 is
+    due two business days after the trade, so scoring returns from the day
+    the insider bought would measure a return nobody could have earned. That
+    is the single easiest way to make this signal look better than it is.
+    """
+    from pathlib import Path
+
+    default = Path(".cache/form4_clusters.parquet")
+    source = Path(path) if path else default
+    if source.exists():
+        return con.sql(f"""
+            select event_id, symbol as ticker, visible_on as event_date,
+                   role,
+                   case when fund_like then 'fund-like' else 'people' end
+                       as flag,
+                   case when value >= 1000000 then 'over $1M'
+                        else 'under $1M' end as size
+            from read_parquet('{source.as_posix()}')
+            where symbol is not null and visible_on is not null
+        """)
+
+    # No history file: score whatever the nightly job has stored. Far fewer
+    # events, and the answer will be correspondingly weak -- said out loud
+    # rather than left for the reader to infer from a small n.
+    print("  (no cluster history file; scoring the live signals table only)")
+    return con.sql("""
+        select accession as event_id,
+               payload->>'symbol' as ticker,
+               cast(payload->>'last' as date) as event_date,
+               payload->>'role' as role,
+               case when (payload->>'fund_like')::boolean then 'fund-like'
+                    else 'people' end as flag,
+               case when (payload->>'value')::double >= 1000000
+                    then 'over $1M' else 'under $1M' end as size
+        from postgres_query('pg', '
+            select accession, payload::text as payload from signals
+            where kind = ''form4_cluster''')
+        where payload->>'symbol' is not null
+    """)
+
+
+def _deal_events(con):
+    """8-K deal candidates as events, joined to a ticker."""
+    return con.sql("""
+        select d.accession as event_id, t.ticker,
+               d.filed_date as event_date, d.deal_type,
+               case when d.classifiers_agree then 'both agree'
+                    else 'review' end as confidence
+        from postgres_query('pg', '
+            select accession, cik, filed_date, deal_type, classifiers_agree
+            from deals') d
+        join postgres_query('pg', '
+            select cik, ticker from company_tickers') t
+          on cast(t.cik as varchar) = d.cik
+    """)
+
+
+def _cmd_outcomes(args: argparse.Namespace) -> int:
+    """Forward returns after an event. Pure SQL, no LLM.
+
+    This is the cheapest question in the system and the one every expensive
+    thing depends on: if a signal has not historically preceded anything,
+    nothing built on top of it can. So it runs before the embeddings, not
+    after them.
+    """
+    from marketradar import storage
+    from marketradar.screens import outcomes, volatility
+
+    con = storage.connect(attach_postgres=True)
+    print("reading price history ...")
+    prices = _outcome_prices(con)
+    actions = volatility.read_actions(con)
+    con.register("outcome_px", prices)
+    bars = con.execute("select count(*) from outcome_px").fetchone()[0]
+    print(f"  {bars:,} bars")
+
+    studies = []
+    if args.study in ("form4", "both"):
+        studies.append(("form4_cluster", "FORM 4 PURCHASE CLUSTERS",
+                        _cluster_events(con, args.clusters),
+                        ("role", "flag", "size")))
+    if args.study in ("deals", "both"):
+        studies.append(("deal_8k", "8-K DEAL CANDIDATES",
+                        _deal_events(con), ("deal_type", "confidence")))
+
+    for key, title, events, groups in studies:
+        con.register("ev_in", events)
+        n_events = con.execute("select count(*) from ev_in").fetchone()[0]
+        if not n_events:
+            print(f"\n{title}: no events")
+            continue
+
+        res = outcomes.forward_returns(
+            con, events, prices, actions, benchmark=args.benchmark)
+        con.register("res_in", res)
+        # Materialise: every slice below would otherwise re-read the
+        # partitions from R2.
+        con.execute("drop table if exists scored")
+        con.execute("create table scored as select * from res_in")
+        scored = con.table("scored")
+        cov = outcomes.coverage(con, events, scored)
+
+        print()
+        print("=" * 78)
+        print(title)
+        print("=" * 78)
+        print(f"  events {cov['events']:,}   priced {cov['priced']:,} "
+              f"({cov['priced'] / max(1, cov['events']) * 100:.0f}%)"
+              f"   benchmark {args.benchmark}")
+
+        overall = outcomes.summarize(con, scored)
+        print()
+        print(outcomes.render(overall, "all events"))
+        rows = list(overall)
+        for group in groups:
+            sliced = outcomes.summarize(con, scored, group_by=group)
+            print()
+            print(outcomes.render(sliced, f"by {group}"))
+            rows.extend(sliced)
+
+        if not args.no_load:
+            n = outcomes.persist(
+                con, key, rows, events=cov["events"], priced=cov["priced"],
+                benchmark=args.benchmark)
+            print(f"\n  stored {n} summary rows")
+
+    if args.no_load:
+        print("\n--no-load: nothing stored")
     return EXIT_OK
 
 
@@ -878,6 +1047,14 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_form4(args)
         except Exception as exc:
             print(f"mr form4: error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "outcomes":
+        load_dotenv()
+        try:
+            return _cmd_outcomes(args)
+        except Exception as exc:
+            print(f"mr outcomes: error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "deals":
