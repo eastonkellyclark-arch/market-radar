@@ -272,3 +272,157 @@ SCRIPT: Final[str] = """
   });
 })();
 """
+
+
+# --- U5: the filing feed ------------------------------------------------
+
+
+def filings_html(rows: list[dict[str, Any]]) -> str:
+    """Recent filings of the seven watched form types, newest first."""
+    if not rows:
+        return ('<p class="empty">No filings stored. Run <code>mr edgar</code>.'
+                "</p>")
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["form_type"]] = counts.get(r["form_type"], 0) + 1
+    chips = "".join(
+        f'<button class="f" data-f="form" data-v="{_esc(k)}">{_esc(k)} '
+        f'<span class="count">{v}</span></button>'
+        for k, v in sorted(counts.items(), key=lambda kv: -kv[1])
+    )
+    body = "".join(
+        f'<tr data-form="{_esc(r["form_type"])}">'
+        f'<td class="tk">{_esc(r["form_type"])}</td>'
+        f'<td>{_esc(r["company"])}</td>'
+        f'<td class="note">{_esc(r["cik"] or "")}</td>'
+        f'<td class="note">{_esc(str(r["filed_at"])[:16])}</td>'
+        f'<td class="note">{_esc(r["accession"])}</td></tr>'
+        for r in rows
+    )
+    return f"""
+      <div class="filters">{chips}
+        <button class="f reset" data-f="formreset">all</button></div>
+      <table class="rows" id="filing-rows">
+        <thead><tr><th data-s="t">form</th><th data-s="t">company</th>
+          <th>cik</th><th data-s="t">filed</th><th>accession</th></tr></thead>
+        <tbody>{body}</tbody>
+      </table>"""
+
+
+# --- U6: Form 4 clusters ------------------------------------------------
+
+
+def clusters_html(rows: list[dict[str, Any]], role: str, floor: int) -> str:
+    """One role's clusters, with the dollar floor adjustable in the page.
+
+    The floor lives here rather than only in the CLI because it is a
+    hypothesis: one week of data suggested $50k and $1M, and the point of
+    making it a parameter was to move it after a month of reading. A number
+    you can only change by re-running a 14-minute fetch is not adjustable.
+
+    Rows are stored unfiltered, so lowering the floor reveals rather than
+    re-queries.
+    """
+    mine = [r for r in rows if r.get("role") == role]
+    if not mine:
+        return ('<p class="empty">No clusters stored. Run '
+                "<code>mr form4</code>.</p>")
+    mine.sort(key=lambda r: float(r.get("value") or 0), reverse=True)
+
+    body = []
+    for r in mine:
+        value = float(r.get("value") or 0)
+        marks = []
+        if r.get("planned_buys"):
+            marks.append(f'<span class="mk">{r["planned_buys"]} planned</span>')
+        if r.get("fund_like"):
+            marks.append(
+                f'<span class="mk fund" title="{_esc(r.get("fund_why",""))}">FUND</span>'
+            )
+        window = r["first"] if r["first"] == r["last"] else f'{r["first"]} to {r["last"]}'
+        body.append(
+            f'<tr class="cl" data-v="{value:.0f}" data-fund="{int(bool(r.get("fund_like")))}">'
+            f'<td class="tk">{_esc(r.get("symbol") or "-")}</td>'
+            f'<td class="note">{_esc(r["issuer_cik"])}</td>'
+            f'<td>{_esc(r.get("issuer_name") or "")[:34]}</td>'
+            f'<td class="note">{_esc(window)}</td>'
+            f'<td class="num">{r["n_buyers"]}</td>'
+            f'<td class="num" data-v="{value:.0f}">${value:,.0f}</td>'
+            f'<td class="note">{"".join(marks)}</td></tr>'
+            f'<tr class="cl-who" data-parent="{_esc(r["issuer_cik"])}">'
+            f'<td></td><td colspan="6" class="note">'
+            f'{_esc(", ".join(r.get("buyers", []))[:120])}</td></tr>'
+        )
+    return f"""
+      <div class="filters cl-controls">
+        <label class="flr">floor $<input type="number" class="cl-floor"
+          data-role="{_esc(role)}" value="{floor}" step="10000" min="0"></label>
+        <button class="f" data-f="fund" data-role="{_esc(role)}">hide FUND</button>
+        <span class="note cl-count" data-role="{_esc(role)}"></span>
+      </div>
+      <table class="rows cl-table" data-role="{_esc(role)}">
+        <thead><tr><th data-s="t">sym</th><th>cik</th><th data-s="t">issuer</th>
+          <th>window</th><th data-s="n" class="num">buyers</th>
+          <th data-s="n" class="num">value</th><th>flags</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>"""
+
+
+#: Filing-feed filtering and the cluster floor. Kept with the other inline
+#: script: one file, no build step.
+FEED_SCRIPT: Final[str] = """
+(function () {
+  var form = null;
+  document.querySelectorAll('button.f[data-f="form"]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      form = (form === b.dataset.v) ? null : b.dataset.v;
+      document.querySelectorAll('button.f[data-f="form"]').forEach(function (o) {
+        o.classList.toggle('sel', o.dataset.v === form);
+      });
+      document.querySelectorAll('#filing-rows tbody tr').forEach(function (r) {
+        r.hidden = !!form && r.dataset.form !== form;
+      });
+    });
+  });
+  var fr = document.querySelector('button.f[data-f="formreset"]');
+  if (fr) fr.addEventListener('click', function () {
+    form = null;
+    document.querySelectorAll('button.f[data-f="form"]').forEach(function (o) {
+      o.classList.remove('sel'); });
+    document.querySelectorAll('#filing-rows tbody tr').forEach(function (r) {
+      r.hidden = false; });
+  });
+
+  var hideFund = {};
+  function applyClusters(role) {
+    var table = document.querySelector('.cl-table[data-role="' + role + '"]');
+    var input = document.querySelector('.cl-floor[data-role="' + role + '"]');
+    if (!table || !input) return;
+    var floor = parseFloat(input.value || 0), shown = 0, total = 0;
+    table.querySelectorAll('tbody tr.cl').forEach(function (r) {
+      total++;
+      var ok = parseFloat(r.dataset.v) >= floor &&
+               !(hideFund[role] && r.dataset.fund === '1');
+      r.hidden = !ok;
+      var who = r.nextElementSibling;
+      if (who && who.classList.contains('cl-who')) who.hidden = !ok;
+      if (ok) shown++;
+    });
+    var c = document.querySelector('.cl-count[data-role="' + role + '"]');
+    if (c) c.textContent = shown + ' of ' + total + ' clusters';
+  }
+  document.querySelectorAll('.cl-floor').forEach(function (i) {
+    i.addEventListener('input', function () { applyClusters(i.dataset.role); });
+    applyClusters(i.dataset.role);
+  });
+  document.querySelectorAll('button.f[data-f="fund"]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var role = b.dataset.role;
+      hideFund[role] = !hideFund[role];
+      b.classList.toggle('sel', hideFund[role]);
+      b.textContent = hideFund[role] ? 'show FUND' : 'hide FUND';
+      applyClusters(role);
+    });
+  });
+})();
+"""

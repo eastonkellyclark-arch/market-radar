@@ -478,3 +478,39 @@ def test_flagged_clusters_are_kept_not_dropped() -> None:
     c = fund_cluster(["A Capital LLC", "B Management LP"], "PBLSX")
     assert c.fund_flag[0]
     assert c.value > 0 and len(c.buys) == 2
+
+
+def test_a_weekend_is_skipped_without_a_request(monkeypatch) -> None:
+    """SEC answers a weekend index with 403, not 404.
+
+    A --days window that spans a Saturday aborted the whole run. Skipping
+    without asking also saves the request.
+    """
+    import httpx
+
+    monkeypatch.setattr(form4, "user_agent", lambda: "x you@example.org")
+    asked = []
+
+    def handler(request):
+        asked.append(str(request.url))
+        return httpx.Response(200, text="")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert form4.daily_index_paths(date(2026, 9, 5), client=client) == []  # Sat
+    assert form4.daily_index_paths(date(2026, 9, 6), client=client) == []  # Sun
+    assert asked == [], "no request should be made for a weekend"
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_a_missing_weekday_index_is_a_holiday_not_a_failure(
+    monkeypatch, status
+) -> None:
+    """A real UA block fails every request, not one date -- and the UA is
+    validated before any of them."""
+    import httpx
+
+    monkeypatch.setattr(form4, "user_agent", lambda: "x you@example.org")
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(status))
+    )
+    assert form4.daily_index_paths(date(2026, 9, 7), client=client) == []

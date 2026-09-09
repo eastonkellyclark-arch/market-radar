@@ -37,6 +37,7 @@ code distribution comes first.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -358,6 +359,13 @@ def daily_index_paths(day: date, form_types: str | Iterable[str] = FORM4_TYPES,
     per-CIK would be thousands of requests to answer a question one file
     already answers.
     """
+    # Weekends have no index at all, and asking for one costs a request and
+    # returns 403 rather than 404 -- so a window that spans a Saturday used to
+    # abort the whole run. Skipped without asking; holidays still fall through
+    # to the status check below, because a holiday is not knowable from a date.
+    if day.weekday() >= 5:
+        return []
+
     base = manifest.get("edgar", "daily_index").location
     quarter = (day.month - 1) // 3 + 1
     url = f"{base}/{day.year}/QTR{quarter}/form.{day:%Y%m%d}.idx"
@@ -366,8 +374,13 @@ def daily_index_paths(day: date, form_types: str | Iterable[str] = FORM4_TYPES,
     client = client or httpx.Client(timeout=REQUEST_TIMEOUT, follow_redirects=True)
     try:
         resp = client.get(url, headers=headers)
-        if resp.status_code == 404:
-            log.info("no daily index for %s (weekend or holiday)", day)
+        # SEC answers a missing archive path with 403 as often as 404. A real
+        # User-Agent block would fail every request in the run, not one date,
+        # and the UA is validated before any of them -- so on a single date
+        # both codes mean "no index for that day".
+        if resp.status_code in (403, 404):
+            log.info("no daily index for %s (holiday?) -- HTTP %s",
+                     day, resp.status_code)
             return []
         resp.raise_for_status()
     except httpx.HTTPError as exc:
@@ -676,3 +689,87 @@ def fund_like(cluster: "Cluster") -> tuple[bool, str]:
     if not reasons:
         return False, ""
     return True, "all buyers are entities; " + ", ".join(reasons)
+
+
+# --- persistence --------------------------------------------------------
+
+CLUSTER_KIND: Final[str] = "form4_cluster"
+
+
+def cluster_key(cluster: Cluster) -> str:
+    """The natural key for a cluster, stored in ``signals.accession``.
+
+    A cluster spans several filings, so it has no single accession of its own.
+    (issuer, role, first day) identifies it: the window is greedy and
+    non-overlapping, so one issuer cannot open two clusters of the same role
+    on the same day. Re-running the same week upserts rather than duplicates.
+    """
+    return f"cluster:{cluster.issuer_cik}:{cluster.role}:{cluster.first.isoformat()}"
+
+
+def load(
+    found: dict[str, list[Cluster]],
+    con: Any = None,
+) -> dict[str, int]:
+    """Upsert clusters into ``signals``.
+
+    Stored unfiltered -- every cluster of 2+ buyers, whatever its value. The
+    dollar floors are presentation, not storage: a floor baked into the table
+    could only ever be raised later, and the whole point of making them
+    parameters was that one week of data is a hypothesis.
+    """
+    from marketradar import storage
+
+    con = con or storage.connect()
+    if not storage.postgres_attached(con):
+        raise Form4Error("No Postgres attached; cannot upsert clusters.")
+
+    def ex(sql: str) -> None:
+        con.execute("CALL postgres_execute('pg', ?)", [sql])
+
+    def q(sql: str) -> list[tuple]:
+        return con.execute("SELECT * FROM postgres_query('pg', ?)", [sql]).fetchall()
+
+    def lit(value: Any) -> str:
+        if value is None:
+            return "null"
+        return "'" + str(value).replace("'", "''") + "'"
+
+    before = q(f"select count(*) from signals where kind = '{CLUSTER_KIND}'")[0][0]
+    rows = [c for group in found.values() for c in group]
+
+    for chunk in (rows[i : i + 100] for i in range(0, len(rows), 100)):
+        values = []
+        for c in chunk:
+            flagged, why = c.fund_flag
+            payload = json.dumps({
+                "role": c.role,
+                "symbol": c.symbol,
+                "issuer_name": c.issuer_name,
+                "buyers": c.names,
+                "n_buyers": len(c.buyers),
+                "value": str(c.value),
+                "first": c.first.isoformat(),
+                "last": c.last.isoformat(),
+                "planned_buys": c.planned_buys,
+                "fund_like": flagged,
+                "fund_why": why,
+            }, separators=(",", ":"))
+            values.append(
+                "(null, {}, {}, timestamptz {}, {}::jsonb, null, {})".format(
+                    lit(CLUSTER_KIND), lit(SOURCE),
+                    lit(c.first.isoformat() + " 00:00:00+00"),
+                    lit(payload), lit(cluster_key(c)),
+                )
+            )
+        ex(
+            "insert into signals "
+            "(company_id, kind, source, occurred_at, payload, url, accession) "
+            f"values {', '.join(values)} "
+            "on conflict (kind, accession) where accession is not null "
+            "do update set payload = excluded.payload"
+        )
+
+    after = q(f"select count(*) from signals where kind = '{CLUSTER_KIND}'")[0][0]
+    return {"clusters": len(rows), "before": before, "after": after,
+            "inserted": after - before}

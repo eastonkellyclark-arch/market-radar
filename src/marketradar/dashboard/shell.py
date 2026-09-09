@@ -95,6 +95,8 @@ class Context:
     prices: dict[str, Any] = field(default_factory=dict)
     entities: dict[str, Any] = field(default_factory=dict)
     filings: dict[str, Any] = field(default_factory=dict)
+    recent_filings: list[dict[str, Any]] = field(default_factory=list)
+    clusters: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -133,9 +135,39 @@ def gather(con: duckdb.DuckDBPyConnection | None = None) -> Context:
     if rows:
         ctx.entities = {"companies": int(rows[0][0]), "tickers": int(rows[0][1])}
 
-    rows = q("select kind, count(*), max(occurred_at)::text "
+    rows = q("select kind, count(*) as n, max(occurred_at)::text as newest "
              "from signals group by kind")
     ctx.filings = {r[0]: {"count": int(r[1]), "latest": r[2]} for r in rows}
+
+    import json as _json
+
+    for acc, when, payload in q(
+        "select accession, occurred_at::text as when_utc, payload::text "
+        "from signals where kind = 'edgar_filing' "
+        "order by occurred_at desc limit 120"
+    ):
+        try:
+            body = _json.loads(payload)
+        except Exception:
+            continue
+        ctx.recent_filings.append({
+            "accession": acc, "filed_at": when,
+            "form_type": body.get("form_type", "?"),
+            "company": body.get("company", ""), "cik": body.get("cik"),
+        })
+
+    for acc, payload in q(
+        "select accession, payload::text from signals "
+        "where kind = 'form4_cluster' order by occurred_at desc limit 400"
+    ):
+        try:
+            body = _json.loads(payload)
+        except Exception:
+            continue
+        # accession is "cluster:<cik>:<role>:<first>"
+        parts = (acc or "").split(":")
+        body["issuer_cik"] = parts[1] if len(parts) > 2 else ""
+        ctx.clusters.append(body)
     return ctx
 
 
@@ -228,6 +260,24 @@ def _probe_liquidity(ctx: Context) -> tuple[str, str]:
     )
 
 
+def _cluster_count(ctx: Context, role: str) -> int:
+    return sum(1 for c in ctx.clusters if c.get("role") == role)
+
+
+def _probe_clusters_insider(ctx: Context) -> tuple[str, str]:
+    n = _cluster_count(ctx, "insider")
+    if not n:
+        return WAITING, "no clusters stored -- run `mr form4`"
+    return LIVE, f"{n} officer/director clusters stored, unfiltered"
+
+
+def _probe_clusters_tenpct(ctx: Context) -> tuple[str, str]:
+    n = _cluster_count(ctx, "ten_percent")
+    if not n:
+        return WAITING, "no clusters stored -- run `mr form4`"
+    return LIVE, f"{n} 10%-holder clusters stored, unfiltered"
+
+
 # --- the registry -------------------------------------------------------
 
 PANELS: Final[tuple[Panel, ...]] = (
@@ -260,10 +310,16 @@ PANELS: Final[tuple[Panel, ...]] = (
           "The seven watched form types: 4, 8-K, S-4, DEFM14A, SC 13D, "
           "SC TO-T, SC 13E-3.",
           probe=_probe_filings),
-    Panel("clusters", "Form 4 clusters", "Filings",
-          "Two lists, not one: officer/director clusters and 10%-holder "
-          "clusters, dollar-weighted, plan purchases flagged.",
-          weekend="Weekend 3"),
+    Panel("clusters_insider", "Form 4 clusters -- officers & directors",
+          "Filings",
+          "2+ distinct open-market buyers at one issuer inside 72 hours. "
+          "Dollar floor adjustable here, not only in the CLI.",
+          probe=_probe_clusters_insider),
+    Panel("clusters_tenpct", "Form 4 clusters -- 10% holders", "Filings",
+          "The same rule for holders with no officer or director role. Kept "
+          "apart because the medians are 78x apart, so one floor cannot "
+          "serve both.",
+          probe=_probe_clusters_tenpct),
     Panel("news", "News", "Filings",
           "GDELT and Finnhub headlines against watched issuers.",
           weekend="Weekend 3"),
@@ -337,6 +393,7 @@ def render(
     ctx: Context,
     panels: tuple[Panel, ...] = PANELS,
     digest: Any = None,
+    details: dict[str, Any] | None = None,
 ) -> str:
     """The page. With a digest, health/macro/screens get real bodies.
 
@@ -344,15 +401,25 @@ def render(
     because prices are unreachable is less useful than one that opens with
     the panel that says so.
     """
+    from marketradar.dashboard import detail as tk
+    from marketradar.dashboard import panels as body_html
+
     bodies: dict[str, str] = {}
     if digest is not None:
-        from marketradar.dashboard import panels as body_html
-
         bodies = {
             "health": body_html.health_html(digest),
             "macro": body_html.macro_html(digest),
             "screens": body_html.screens_html(digest),
         }
+        if details:
+            bodies["ticker"] = tk.panel_html()
+    if ctx.recent_filings:
+        bodies["filings"] = body_html.filings_html(ctx.recent_filings)
+    if ctx.clusters:
+        bodies["clusters_insider"] = body_html.clusters_html(
+            ctx.clusters, "insider", 50_000)
+        bodies["clusters_tenpct"] = body_html.clusters_html(
+            ctx.clusters, "ten_percent", 1_000_000)
 
     resolved = [(p, *p.resolve(ctx)) for p in panels]
     counts = {s: sum(1 for _, st, _ in resolved if st == s)
@@ -378,11 +445,17 @@ def render(
     )
     notes = "".join(f"<li>{_esc(n)}</li>" for n in ctx.notes)
     stamp = ctx.generated_at.strftime("%Y-%m-%d %H:%M UTC")
-    script = ""
-    if bodies:
-        from marketradar.dashboard.panels import SCRIPT
-
-        script = f"<script>{SCRIPT}</script>"
+    parts = []
+    if digest is not None:
+        parts.append(body_html.SCRIPT)
+    if ctx.recent_filings or ctx.clusters:
+        parts.append(body_html.FEED_SCRIPT)
+    if details:
+        parts.append(
+            "window.__TK__=" + json.dumps(details, separators=(",", ":")) + ";"
+        )
+        parts.append(tk.SCRIPT)
+    script = f"<script>{''.join(parts)}</script>" if parts else ""
 
     return f"""<!doctype html>
 <html lang="en"><head>
@@ -499,6 +572,37 @@ table.rows th.num {{ text-align:right; }}
 table.rows td {{ padding:3px 8px 3px 0; border-bottom:1px solid var(--rule); }}
 td.tk {{ font-weight:600; font-variant-numeric:tabular-nums; }}
 td.new {{ color:#0ca30c; font-size:9.5px; font-weight:700; width:26px; }}
+:root {{ --series:#2a78d6; --axis:#c3c2b7; --gapfill:rgba(250,178,25,.14); }}
+@media (prefers-color-scheme: dark) {{
+  :root:not([data-theme="light"]) {{ --series:#3987e5; --axis:#383835;
+    --gapfill:rgba(250,178,25,.10); }}
+}}
+:root[data-theme="dark"] {{ --series:#3987e5; --axis:#383835;
+  --gapfill:rgba(250,178,25,.10); }}
+.tk {{ border:1px solid var(--rule); border-radius:8px; padding:12px 14px;
+       margin:8px 0 12px; background:var(--plane); }}
+.tkhead {{ display:flex; align-items:baseline; gap:12px; margin-bottom:8px; }}
+.tkhead h4 {{ margin:0; font-size:15px; font-variant-numeric:tabular-nums; }}
+.tkhead .f {{ margin-left:auto; }}
+#tk-chart {{ width:100%; height:220px; display:block; }}
+.tkgaps {{ font-size:11.5px; color:var(--muted); margin:6px 0 10px; }}
+.tkcols {{ display:grid; gap:18px; grid-template-columns:1.4fr 1fr; }}
+.tkcols h5 {{ margin:0 0 4px; font-size:10.5px; text-transform:uppercase;
+              letter-spacing:.05em; color:var(--muted); font-weight:600; }}
+@media (max-width:720px) {{ .tkcols {{ grid-template-columns:1fr; }} }}
+.mk {{ display:inline-block; font-size:9.5px; font-weight:700; letter-spacing:.04em;
+       border:1px solid var(--rule); border-radius:3px; padding:0 4px;
+       margin-right:4px; color:var(--muted); }}
+.mk.fund {{ color:#fab219; border-color:#fab219; }}
+.cl-controls {{ align-items:center; }}
+.flr {{ font-size:11.5px; color:var(--ink-2); display:inline-flex;
+        align-items:center; gap:4px; }}
+.flr input {{ width:104px; font:inherit; font-size:11.5px; padding:2px 6px;
+  border:1px solid var(--rule); border-radius:4px; background:var(--surface);
+  color:var(--ink); }}
+tr.cl-who td {{ padding-top:0; border-bottom:1px solid var(--rule);
+                font-size:11px; }}
+tr.cl td {{ border-bottom:none; }}
 </style></head>
 <body>
 <h1>Market Radar</h1>
@@ -520,12 +624,14 @@ def write(
     con: duckdb.DuckDBPyConnection | None = None,
     ctx: Context | None = None,
     digest: Any = None,
+    details: dict[str, Any] | None = None,
 ) -> Path:
     """Render to a gitignored local file. There is no publish counterpart."""
     target = Path(path) if path else DEFAULT_OUTPUT
     target.parent.mkdir(parents=True, exist_ok=True)
     ctx = ctx or gather(con)
-    target.write_text(render(ctx, digest=digest), encoding="utf-8")
+    target.write_text(render(ctx, digest=digest, details=details),
+                      encoding="utf-8")
     return target
 
 

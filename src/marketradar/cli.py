@@ -174,6 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="clusters to print per list")
     p_f4.add_argument("--names", action="store_true",
                       help="list the buyers in each cluster")
+    p_f4.add_argument("--no-load", action="store_true",
+                      help="report only; do not store clusters in signals")
 
     # No publish flags: FRED is local-only. FRED redistributes the ICE BofA
     # series under permission, so they are not ours to republish, and there is
@@ -433,7 +435,21 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
             ctx.notes.append(f"Screens unavailable: {str(exc)[:160]}")
             print(f"  screens unavailable: {str(exc)[:120]}", file=sys.stderr)
 
-    target = shell.write(args.out, ctx=ctx, digest=digest)
+    details = None
+    if digest is not None and not args.fast:
+        from marketradar.dashboard import tickers
+        from marketradar.screens import volatility
+
+        try:
+            names = {m.ticker for sl in digest.screen.lists for m in sl.rows}
+            details = tickers.build(
+                con, volatility.read_prices(con, digest.day), names,
+                actions=volatility.read_actions(con),
+            )
+        except Exception as exc:
+            ctx.notes.append(f"Ticker detail unavailable: {str(exc)[:140]}")
+
+    target = shell.write(args.out, ctx=ctx, digest=digest, details=details)
     counts = shell.summary(ctx)
 
     print(f"wrote {target}")
@@ -497,6 +513,13 @@ def _cmd_form4(args: argparse.Namespace) -> int:
         window_days=args.window_days,
         min_buyers=args.min_buyers,
     )
+
+    if not args.no_load:
+        from marketradar import storage
+
+        stats = form4.load(found, con=storage.connect())
+        print(f"\nsignals: {stats['before']:,} -> {stats['after']:,} clusters "
+              f"(+{stats['inserted']:,}); stored unfiltered, floors are display")
 
     for role, floor in ((form4.INSIDER, args.insider_floor),
                         (form4.TEN_PERCENT, args.tenpct_floor)):

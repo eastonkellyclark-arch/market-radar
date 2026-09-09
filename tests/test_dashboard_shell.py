@@ -33,7 +33,8 @@ def ctx(**kw) -> shell.Context:
 def test_every_panel_in_the_build_order_is_declared() -> None:
     """Including the six that do not exist. The shell is the map."""
     ids = {p.id for p in shell.PANELS}
-    for expected in ("health", "macro", "screens", "clusters", "news",
+    for expected in ("health", "macro", "screens", "news",
+                     "clusters_insider", "clusters_tenpct",
                      "private", "review", "xbrl", "teardowns", "multiples",
                      "outcomes", "dcf", "decks", "ticker", "dod", "liquidity"):
         assert expected in ids, f"{expected} is missing from the panel map"
@@ -170,9 +171,33 @@ def test_the_page_reaches_for_nothing_external() -> None:
     the dashboard depend on being online to render yesterday's numbers.
     """
     page = shell.render(ctx())
+    _assert_no_external(page)
+
+
+#: The one URL allowed to appear. createElementNS needs it to make an SVG
+#: element; it is a namespace identifier and is never fetched. Named here so
+#: the exception is explicit rather than the rule quietly weakening.
+SVG_NS = "http://www.w3.org/2000/svg"
+
+
+def _assert_no_external(page: str) -> None:
+    stripped = page.replace(SVG_NS, "")
     for forbidden in ("http://", "https://", "fetch(", "<link", "src=",
                       "XMLHttpRequest", "import("):
-        assert forbidden not in page, f"page reaches for {forbidden}"
+        assert forbidden not in stripped, f"page reaches for {forbidden}"
+
+
+def test_the_chart_carries_no_external_reference_either() -> None:
+    """The ticker payload and chart script ship in the same file.
+
+    Checked separately because the map alone has no script, so the rule above
+    was passing without ever seeing the code that draws.
+    """
+    from marketradar.dashboard import detail
+
+    page = shell.render(ctx(), digest=None, details={"AAA": {"s": [[0, 1.0]]}})
+    assert detail.SCRIPT.strip()[:20] in page or "window.__TK__" in page
+    _assert_no_external(page)
 
 
 def test_the_map_alone_carries_no_script() -> None:
@@ -238,3 +263,27 @@ def test_console_output_stays_ascii() -> None:
         state, detail = panel.resolve(ctx())
         for text in (panel.title, state, detail):
             text.encode("ascii")
+
+
+# --- U6: two cluster panels ---------------------------------------------
+
+
+def test_clusters_are_two_panels_not_one() -> None:
+    """Same reasoning as the screen lists: the medians are 78x apart, so one
+    floor cannot serve both and one panel would imply it could."""
+    ids = {p.id for p in shell.PANELS}
+    assert {"clusters_insider", "clusters_tenpct"} <= ids
+    assert "clusters" not in ids
+
+
+def test_cluster_panels_wait_until_something_is_stored() -> None:
+    for probe in (shell._probe_clusters_insider, shell._probe_clusters_tenpct):
+        state, detail = probe(ctx(clusters=[]))
+        assert state == shell.WAITING
+        assert "mr form4" in detail
+
+
+def test_each_cluster_panel_counts_only_its_own_role() -> None:
+    rows = [{"role": "insider"}, {"role": "insider"}, {"role": "ten_percent"}]
+    assert "2 officer/director" in shell._probe_clusters_insider(ctx(clusters=rows))[1]
+    assert "1 10%-holder" in shell._probe_clusters_tenpct(ctx(clusters=rows))[1]
