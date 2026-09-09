@@ -491,6 +491,11 @@ class Cluster:
         return sum(1 for b in self.buys if b.planned)
 
     @property
+    def fund_flag(self) -> tuple[bool, str]:
+        """Marked, never dropped. See :func:`fund_like`."""
+        return fund_like(self)
+
+    @property
     def names(self) -> list[str]:
         seen, out = set(), []
         for b in self.buys:
@@ -603,3 +608,71 @@ def clusters(
     for role in out:
         out[role].sort(key=lambda c: c.value, reverse=True)
     return out
+
+
+# --- fund-issuer heuristic ---------------------------------------------
+#
+# Funds accumulating each other is real information; it is just not insider
+# conviction. So it is *marked*, never dropped -- excluding it now would mean
+# never learning whether it is noise. Revisit with a proper SIC filter once
+# XBRL lands and issuer type is a fact rather than an inference.
+
+#: Tokens that make a filer an organisation rather than a person. Matched on
+#: word boundaries so "Capital" in a firm name counts and a surname does not
+#: accidentally qualify.
+_ENTITY_TOKENS: Final[frozenset[str]] = frozenset({
+    "LLC", "LLP", "LP", "LTD", "INC", "CORP", "CORPORATION", "CO", "PLC",
+    "GP", "TRUST", "FUND", "FUNDS", "CAPITAL", "MANAGEMENT", "PARTNERS",
+    "ADVISORS", "ADVISERS", "HOLDINGS", "HOLDING", "GROUP", "ASSOCIATES",
+    "VENTURES", "INVESTMENT", "INVESTMENTS", "ASSET", "SA", "NV", "AG",
+    "BV", "GMBH", "COMPANY", "BANK", "INSURANCE", "REINSURANCE",
+})
+
+_WORD = re.compile(r"[A-Za-z][A-Za-z&.']*")
+
+#: NASDAQ gives open-end funds a five-letter symbol ending in X.
+_FUND_TICKER = re.compile(r"^[A-Z]{4}X$")
+
+#: Words in an issuer's own name that say it is a pooled vehicle.
+_FUND_ISSUER_TOKENS: Final[frozenset[str]] = frozenset({
+    "FUND", "FUNDS", "TRUST", "PORTFOLIO", "PORTFOLIOS", "LP", "PARTNERS",
+    "CAPITAL",
+})
+
+
+def looks_like_entity(name: str) -> bool:
+    """True when a filer name reads as an organisation rather than a person.
+
+    Deliberately crude and deliberately conservative: it exists to separate
+    "five funds bought each other" from "five executives bought", and the
+    expensive mistake is the second being mislabelled as the first.
+    """
+    words = {w.strip(".").upper() for w in _WORD.findall(name or "")}
+    return bool(words & _ENTITY_TOKENS)
+
+
+def fund_like(cluster: "Cluster") -> tuple[bool, str]:
+    """(flagged, why). Two conditions, both required.
+
+    Every buyer has to read as an organisation *and* the issuer has to look
+    like a pooled vehicle. Requiring both is what keeps Cascade Investment
+    buying alongside Bill Gates out of it -- one of those two buyers is a
+    person, so it stays an ordinary 10%-holder cluster.
+    """
+    names = cluster.names
+    if not names or not all(looks_like_entity(n) for n in names):
+        return False, ""
+
+    reasons = []
+    if cluster.symbol and _FUND_TICKER.match(cluster.symbol):
+        reasons.append("fund ticker")
+    if cluster.symbol is None:
+        reasons.append("no listed equity")
+    issuer_words = {w.strip(".").upper()
+                    for w in _WORD.findall(cluster.issuer_name or "")}
+    if issuer_words & _FUND_ISSUER_TOKENS:
+        reasons.append("fund in issuer name")
+
+    if not reasons:
+        return False, ""
+    return True, "all buyers are entities; " + ", ".join(reasons)

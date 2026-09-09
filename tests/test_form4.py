@@ -328,3 +328,153 @@ def test_a_missing_daily_index_is_a_weekend_not_an_error(monkeypatch) -> None:
         transport=httpx.MockTransport(lambda r: httpx.Response(404))
     )
     assert form4.daily_index_paths(date(2026, 9, 5), client=client) == []
+
+
+# --- clusters -----------------------------------------------------------
+
+
+def owner(cik, officer=False, ten=False, name=None):
+    return form4.Owner(cik=cik, name=name or f"Person {cik}",
+                       is_officer=officer, is_director=False,
+                       is_ten_percent=ten)
+
+
+def buy_txn(value, when, code="P", derivative=False):
+    return form4.Transaction(
+        code=code, shares=Decimal(str(value)), price=Decimal(1),
+        acquired_disposed="A", security_title="CS",
+        transaction_date=when, is_derivative=derivative)
+
+
+def filing(owners, txns, cik="0000000001", symbol="ACME",
+           period=date(2020, 1, 1), name="Acme Corp", planned=False):
+    return form4.Form4(
+        accession="a", document_type="4", period_of_report=period,
+        issuer_cik=cik, issuer_name=name, issuer_symbol=symbol,
+        owners=owners, transactions=txns, aff10b5_one=planned)
+
+
+D1, D3, D9 = date(2026, 9, 1), date(2026, 9, 3), date(2026, 9, 9)
+
+
+def test_two_insiders_inside_the_window_cluster() -> None:
+    found = form4.clusters([
+        filing([owner("1", officer=True)], [buy_txn(30_000, D1)]),
+        filing([owner("2", officer=True)], [buy_txn(30_000, D3)]),
+    ])
+    assert len(found[form4.INSIDER]) == 1
+    c = found[form4.INSIDER][0]
+    assert c.value == Decimal(60_000)
+    assert c.buyers == {"1", "2"}
+
+
+def test_buys_outside_the_window_do_not_cluster() -> None:
+    found = form4.clusters([
+        filing([owner("1", officer=True)], [buy_txn(30_000, D1)]),
+        filing([owner("2", officer=True)], [buy_txn(30_000, D9)]),
+    ])
+    assert found[form4.INSIDER] == []
+
+
+def test_the_window_keys_on_transaction_date_not_the_period() -> None:
+    """A late-filed Form 4 reports an old trade.
+
+    Grouping on periodOfReport pulled a 2025-10-24 transaction into a
+    September window in a sample week.
+    """
+    buys = form4.purchases([
+        filing([owner("1", officer=True)], [buy_txn(1, date(2025, 10, 24))],
+               period=date(2026, 9, 1))
+    ])
+    assert buys[0].on == date(2025, 10, 24)
+
+
+def test_a_cluster_below_its_floor_is_dropped() -> None:
+    fs = [filing([owner("1", officer=True)], [buy_txn(10, D1)]),
+          filing([owner("2", officer=True)], [buy_txn(10, D3)])]
+    assert form4.clusters(fs)[form4.INSIDER] == []
+    assert len(form4.clusters(fs, insider_floor=Decimal(1))[form4.INSIDER]) == 1
+
+
+def test_the_two_floors_are_independent() -> None:
+    """Sample-week medians were $339k and $26.4M -- 78x apart."""
+    assert form4.DEFAULT_TENPCT_FLOOR > form4.DEFAULT_INSIDER_FLOOR * 10
+
+
+def test_someone_who_is_both_counts_as_an_insider() -> None:
+    buys = form4.purchases([
+        filing([owner("9", officer=True, ten=True)], [buy_txn(1, D1)])])
+    assert buys[0].role == form4.INSIDER
+
+
+def test_a_joint_filing_divides_the_value_rather_than_double_counting() -> None:
+    """The same shares reported by several persons are one purchase."""
+    buys = form4.purchases([
+        filing([owner("1", officer=True), owner("2", officer=True)],
+               [buy_txn(100, D1)])])
+    assert sum(b.value for b in buys) == Decimal(100)
+
+
+def test_only_purchases_reach_a_cluster() -> None:
+    fs = [filing([owner("1", officer=True)], [buy_txn(1e9, D1, code="A")]),
+          filing([owner("2", officer=True)], [buy_txn(1e9, D3, code="M")])]
+    assert form4.clusters(fs)[form4.INSIDER] == []
+
+
+def test_placeholder_symbols_are_not_tickers() -> None:
+    """A company with no listed equity files N/A literally."""
+    for raw in ("N/A", "NONE", "-", "", "na"):
+        assert form4.display_symbol(raw) is None
+    assert form4.display_symbol("rsg") == "RSG"
+
+
+# --- the fund heuristic -------------------------------------------------
+
+
+def fund_cluster(names, symbol, issuer="Some Fund LP"):
+    owners = [owner(str(i), ten=True, name=n) for i, n in enumerate(names)]
+    return form4.clusters(
+        [filing(owners, [buy_txn(10_000_000, D1)], symbol=symbol, name=issuer)],
+        tenpct_floor=Decimal(1),
+    )[form4.TEN_PERCENT][0]
+
+
+def test_funds_buying_each_other_are_marked() -> None:
+    c = fund_cluster(["BlueArc Capital Management, LLC",
+                      "Pantheon Infrastructure Fund"], "PBLSX")
+    flagged, why = c.fund_flag
+    assert flagged
+    assert "all buyers are entities" in why
+
+
+def test_a_fund_alongside_a_person_is_not_marked() -> None:
+    """Cascade Investment buying beside Bill Gates is an ordinary cluster."""
+    c = fund_cluster(["CASCADE INVESTMENT, L.L.C.", "GATES WILLIAM H III"],
+                     "RSG", issuer="Republic Services Inc")
+    assert c.fund_flag[0] is False
+
+
+def test_an_issuer_with_no_listed_equity_is_a_signal_not_a_ticker() -> None:
+    c = fund_cluster(["Corbin Capital Partners, L.P.",
+                      "CCP Investment Accelerator, LLC"], "NONE")
+    flagged, why = c.fund_flag
+    assert flagged
+    assert "no listed equity" in why
+
+
+def test_executives_buying_are_never_marked_as_funds() -> None:
+    """The expensive mistake is a real insider cluster labelled as noise."""
+    owners = [owner("1", officer=True, name="HIGGINBOTHAM RICHARD A"),
+              owner("2", officer=True, name="Slotkin Judy S")]
+    c = form4.clusters(
+        [filing(owners, [buy_txn(500_000, D1)], symbol=None)],
+    )[form4.INSIDER][0]
+    assert c.fund_flag[0] is False
+
+
+def test_flagged_clusters_are_kept_not_dropped() -> None:
+    """Marked, never dropped -- excluding them means never learning whether
+    they are noise."""
+    c = fund_cluster(["A Capital LLC", "B Management LP"], "PBLSX")
+    assert c.fund_flag[0]
+    assert c.value > 0 and len(c.buys) == 2

@@ -510,14 +510,28 @@ def _cmd_form4(args: argparse.Namespace) -> int:
             continue
         print(f"    {'issuer':<10} {'cik':<12} {'window':<24} {'buyers':>6} "
               f"{'value':>16}  flags")
+        flagged = 0
         for c in rows[: args.top]:
-            flags = f"{c.planned_buys} planned" if c.planned_buys else ""
+            marks = []
+            if c.planned_buys:
+                marks.append(f"{c.planned_buys} planned")
+            is_fund, why = c.fund_flag
+            if is_fund:
+                flagged += 1
+                marks.append("FUND")
+            flags = ", ".join(marks)
             window = (f"{c.first}" if c.first == c.last
                       else f"{c.first} .. {c.last}")
             print(f"    {(c.symbol or '-'):<10} {c.issuer_cik:<12} {window:<24} "
                   f"{len(c.buyers):>6} ${c.value:>15,.0f}  {flags}")
+            if is_fund:
+                print(f"      ^ fund-like: {why}")
             if args.names:
                 print(f"      {', '.join(c.names)[:96]}")
+        if flagged:
+            print(f"    {flagged} of {min(len(rows), args.top)} marked FUND -- "
+                  "funds accumulating each other. Marked, never dropped: it is "
+                  "real information, just not insider conviction.")
     return EXIT_OK
 
 
