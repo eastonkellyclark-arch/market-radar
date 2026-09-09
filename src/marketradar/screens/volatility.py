@@ -73,6 +73,24 @@ SANITY_FLOOR: Final[str] = "0.01"
 
 LIQUID_MIN_DOLLAR_VOLUME: Final[int] = 5_000_000
 
+#: Sessions the average dollar volume is taken over. Thirty is about six
+#: trading weeks -- long enough that one unusual print does not move it, short
+#: enough to still describe the name as it trades now.
+ADV_WINDOW_SESSIONS: Final[int] = 30
+
+#: Sessions a name must have before the liquidity gate will speak for it.
+#:
+#: The decision, made explicit rather than left to a NULL: a name with fewer
+#: sessions than this is **excluded from the gated lists and appears in the
+#: ungated ones**. The gate claims "liquid over the last 30 sessions", and a
+#: name without 30 sessions has not earned that claim -- one big opening print
+#: would otherwise carry a two-day-old listing into the liquid lists.
+#:
+#: Nothing is hidden by this: every such name is still in the ungated list for
+#: its band, and the count of exclusions is reported. Lower it to see the
+#: previous behaviour.
+MIN_ADV_SESSIONS: Final[int] = 30
+
 #: Longest gap between consecutive bars that still counts as one continuous
 #: series. Beyond this the "previous close" is not a previous close, it is a
 #: different era -- and after a relisting, often a different company.
@@ -119,10 +137,22 @@ class Move:
     #: session. None when the bar falls outside every range the vendor knows.
     listing_id: date | None = None
     gap_days: int | None = None
+    #: Sessions the average dollar volume was actually taken over. A
+    #: three-day mean must not be presentable as a thirty-day one.
+    adv_sessions: int = 0
 
-    @property
-    def liquid(self) -> bool:
-        return self.avg_dollar_volume > LIQUID_MIN_DOLLAR_VOLUME
+    def liquid(self, min_sessions: int = MIN_ADV_SESSIONS) -> bool:
+        """Above the dollar gate, on enough history for the gate to mean it.
+
+        A method rather than a property because the session floor is a
+        parameter: presenting a two-day average as a liquidity measure is the
+        failure this guards, and how much history is enough is a judgement
+        that should be movable without editing the class.
+        """
+        return (
+            self.avg_dollar_volume > LIQUID_MIN_DOLLAR_VOLUME
+            and self.adv_sessions >= min_sessions
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,13 +253,30 @@ seq as (
     window w as (partition by ticker, listing_id order by date)
 ),
 adv as (
-    -- Also by listing. Averaging dollar volume across a relisting blends two
-    -- companies' liquidity into one number and gates on the blend.
-    select ticker, listing_id,
-           cast(avg(cast(close as decimal(38,12)) * volume) as decimal(38,12))
-        as avg_dollar_volume
+    -- A TRAILING window, not the whole partition.
+    --
+    -- This was `group by ticker, listing_id` over every row read, which is
+    -- accidentally recent while the partitions hold a few sessions and
+    -- silently becomes a multi-year average the moment history lands. A name
+    -- that traded $50M/day in early 2025 and $200k/day now would pass a $5M
+    -- gate on its own history. Twelve of the twenty-four lists are gated on
+    -- this number, and nothing would have failed.
+    --
+    -- Still partitioned by listing: averaging across a relisting blends two
+    -- companies' liquidity and gates on the blend.
+    --
+    -- adv_sessions is carried so the gate can say how much history the
+    -- average actually had, rather than presenting a three-day mean as if it
+    -- were thirty.
+    select ticker, listing_id, date,
+           cast(avg(cast(close as decimal(38,12)) * volume) over w
+                as decimal(38,12)) as avg_dollar_volume,
+           count(*) over w as adv_sessions
     from px
-    group by ticker, listing_id
+    window w as (
+        partition by ticker, listing_id order by date
+        rows between {adv_window} preceding and current row
+    )
 ),
 -- Every action strictly after the previous bar and up to and including this
 -- one. A range rather than an equality join: a gap in the price series (a
@@ -310,6 +357,7 @@ select
     cast(cast(priced.close as decimal(38,12)) * priced.volume
          as decimal(38,12))                                   as dollar_volume,
     adv.avg_dollar_volume,
+    adv.adv_sessions,
     priced.split_factor,
     priced.div_cash,
     priced.div_cash > 0                                       as is_ex_div,
@@ -320,6 +368,7 @@ select
 from priced
 join adv on adv.ticker = priced.ticker
          and adv.listing_id is not distinct from priced.listing_id
+         and adv.date = priced.date
 """
 
 
@@ -331,6 +380,7 @@ def moves(
     actions: duckdb.DuckDBPyRelation | None = None,
     adjust_dividends: bool = False,
     sanity_floor: str = SANITY_FLOOR,
+    adv_window: int = ADV_WINDOW_SESSIONS,
 ) -> duckdb.DuckDBPyRelation:
     """Every adjusted one-day move available, before ranking or filtering.
 
@@ -371,6 +421,7 @@ def moves(
         adjust_dividends="true" if adjust_dividends else "false",
         listing_expr=listing_expr,
         max_gap=MAX_GAP_DAYS,
+        adv_window=max(0, adv_window - 1),
     )
     return con.sql(sql)
 
@@ -385,10 +436,11 @@ def _to_move(row: tuple[Any, ...]) -> Move:
         ticker=row[0], date=row[1], security_type=row[2], exchange=row[3],
         band=row[4], close=row[5], adj_prev_close=row[6], pct_move=row[7],
         tick_move=row[8], tick_size=row[9], volume=int(row[10]),
-        dollar_volume=row[11], avg_dollar_volume=row[12], split_factor=row[13],
-        div_cash=row[14], is_ex_div=bool(row[15]),
-        listing_id=row[16],
-        gap_days=None if row[17] is None else int(row[17]),
+        dollar_volume=row[11], avg_dollar_volume=row[12],
+        split_factor=row[14], div_cash=row[15], is_ex_div=bool(row[16]),
+        listing_id=row[17],
+        gap_days=None if row[18] is None else int(row[18]),
+        adv_sessions=int(row[13] or 0),
     )
 
 
@@ -401,6 +453,11 @@ class ScreenResult:
     sanity_floor: str
     gap_excluded: int = 0
     unattributed: int = 0
+    #: Names above the dollar gate but short of the session floor. Kept
+    #: visible: they are in the ungated lists, not deleted.
+    thin_history: int = 0
+    adv_window: int = ADV_WINDOW_SESSIONS
+    min_adv_sessions: int = MIN_ADV_SESSIONS
 
 
 def screen(
@@ -413,6 +470,8 @@ def screen(
     adjust_dividends: bool = False,
     min_moves: int = MIN_MOVES,
     sanity_floor: str = SANITY_FLOOR,
+    adv_window: int = ADV_WINDOW_SESSIONS,
+    min_adv_sessions: int = MIN_ADV_SESSIONS,
 ) -> ScreenResult:
     """Build every top-N list for one trading day.
 
@@ -423,6 +482,7 @@ def screen(
     rel = moves(
         con, as_of=as_of, prices=prices, actions=actions,
         adjust_dividends=adjust_dividends, sanity_floor=sanity_floor,
+        adv_window=adv_window,
     )
     con.register("raw_moves", rel)
     kept = con.sql("select * from raw_moves where passes_floor and within_gap")
@@ -467,7 +527,10 @@ def screen(
                 if m.security_type == security_type and m.band == band
             ]
             for liquidity in ("all", "liquid"):
-                gated = pool if liquidity == "all" else [m for m in pool if m.liquid]
+                gated = (
+                    pool if liquidity == "all"
+                    else [m for m in pool if m.liquid(min_adv_sessions)]
+                )
                 for direction in DIRECTIONS:
                     # Sign first, then order. Sorting alone is not enough:
                     # on a short list "losers" would just be the gainers in
@@ -499,6 +562,13 @@ def screen(
         sanity_floor=sanity_floor,
         gap_excluded=int(gapped),
         unattributed=int(unattributed),
+        thin_history=sum(
+            1 for m in everything
+            if m.avg_dollar_volume > LIQUID_MIN_DOLLAR_VOLUME
+            and m.adv_sessions < min_adv_sessions
+        ),
+        adv_window=adv_window,
+        min_adv_sessions=min_adv_sessions,
     )
 
 
@@ -532,6 +602,12 @@ def render(result: ScreenResult, *, show_empty: bool = False) -> Iterator[str]:
             f"{result.gap_excluded:,} moves excluded for spanning a gap of "
             f"more than {MAX_GAP_DAYS} days (relisting or long halt; the "
             "prior close is not comparable)"
+        )
+    if result.thin_history:
+        yield (
+            f"{result.thin_history:,} names cleared the $5M gate on fewer "
+            f"than {result.min_adv_sessions} sessions and were left in the "
+            "ungated lists -- a short average is not a liquidity measure"
         )
     if result.unattributed:
         yield (

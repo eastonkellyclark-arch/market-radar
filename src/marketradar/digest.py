@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -66,6 +67,11 @@ MACRO_LOOKBACKS: Final[tuple[tuple[int, str], ...]] = ((30, "30d"), (365, "1y"))
 #: reported as degraded. Compared within the partition rather than against the
 #: live universe so the check needs no network and cannot itself fail.
 SWEEP_COVERAGE_FLOOR: Final[float] = 0.95
+
+#: Sessions the coverage baseline is taken over. Recent, not all-time: the
+#: question is "did tonight's sweep cover as much as recent ones", and a
+#: high-water mark from two years ago answers a different one.
+COVERAGE_BASELINE_SESSIONS: Final[int] = 10
 
 #: Trading days the price data may lag before it is called stale. Wide enough
 #: for a Friday close read after a Monday holiday.
@@ -149,16 +155,30 @@ def check_health(
     ).fetchall()
     by_date = {r[0]: int(r[1]) for r in rows}
     swept = by_date.get(day, 0)
-    expected = max(by_date.values()) if by_date else 0
+
+    # Baseline: the median of recent sessions, not the maximum over
+    # everything read. `max` over the union is the same latent shape as the
+    # old whole-partition ADV -- accidentally recent while the partitions
+    # hold three days, and a two-year high-water mark once history lands. A
+    # universe that has genuinely shrunk would then read as a truncated
+    # sweep every night. Median rather than mean so one odd session does not
+    # move the bar.
+    prior = [n for d, n in sorted(by_date.items()) if d < day]
+    recent = prior[-COVERAGE_BASELINE_SESSIONS:]
+    expected = int(statistics.median(recent)) if recent else swept
     if expected:
         share = swept / expected
         ok = share >= SWEEP_COVERAGE_FLOOR
+        against = (
+            f"median of {len(recent)} recent sessions" if recent
+            else "no prior session to compare against"
+        )
         items.append(
             HealthItem(
                 name="prices_eod_raw",
                 detail=f"{swept:,} / {expected:,} symbols ({share:.0%})",
                 ok=ok,
-                note="" if ok else "sweep looks truncated",
+                note="" if ok else f"sweep looks truncated vs the {against}",
             )
         )
     else:

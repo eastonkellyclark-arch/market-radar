@@ -7,7 +7,7 @@ likely to be wrong, and checking it should never depend on being able to send.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import duckdb
@@ -39,7 +39,13 @@ def screen_result() -> volatility.ScreenResult:
         "create table act (ticker varchar, ex_date date, "
         "split_factor decimal(18,8), div_cash decimal(18,8))"
     )
-    return volatility.screen(con, prices=con.table("px"), actions=con.table("act"))
+    # min_adv_sessions=1: these fixtures carry two sessions and are
+    # testing rendering, not the liquidity gate. The 30-session floor
+    # has its own tests in test_volatility.py.
+    return volatility.screen(
+        con, prices=con.table("px"), actions=con.table("act"),
+        min_adv_sessions=1,
+    )
 
 
 def make_digest(screen_result, **kw) -> digest_mod.Digest:
@@ -280,3 +286,64 @@ def test_html_escapes_and_wraps_the_same_text(digest) -> None:
     from html import unescape
     inner = unescape(html.split(">", 3)[-1].rsplit("</pre>", 1)[0])
     assert inner.strip().startswith("Market Radar - 2026-09-04")
+
+
+# --- the coverage baseline ---------------------------------------------
+
+
+def px_over(days_and_counts):
+    """A price table where each date carries a given number of tickers."""
+    con = duckdb.connect()
+    con.execute(
+        "create table px (ticker varchar, date date, close decimal(18,6), "
+        "volume bigint, security_type varchar, exchange varchar)"
+    )
+    for day, n in days_and_counts:
+        for i in range(n):
+            con.execute(
+                "insert into px values (?, ?, 10.0, 1000, 'stock', 'NYSE')",
+                [f"T{i:04d}", day],
+            )
+    return con
+
+
+def coverage_item(con, day):
+    items = digest_mod.check_health(
+        con, day=day, prices=con.table("px"), prior_day=None
+    ).items
+    return next(i for i in items if i.name == "prices_eod_raw")
+
+
+def test_coverage_compares_against_recent_sessions_not_an_all_time_high() -> None:
+    """The same latent shape as the old whole-partition ADV.
+
+    A universe that has genuinely shrunk would read as a truncated sweep
+    every night if the baseline were the maximum over everything read.
+    """
+    days = [(date(2026, 1, 5), 900)]                       # two years ago
+    days += [(date(2026, 8, 20) + timedelta(days=n), 100) for n in range(10)]
+    days += [(date(2026, 9, 4), 100)]                      # today, healthy
+    item = coverage_item(px_over(days), date(2026, 9, 4))
+    assert item.ok, item.detail
+    assert "100 / 100" in item.detail
+
+
+def test_a_genuinely_truncated_sweep_still_fails() -> None:
+    days = [(date(2026, 8, 20) + timedelta(days=n), 100) for n in range(10)]
+    days += [(date(2026, 9, 4), 40)]
+    item = coverage_item(px_over(days), date(2026, 9, 4))
+    assert not item.ok
+    assert "recent sessions" in item.note
+
+
+def test_one_odd_session_does_not_move_the_baseline() -> None:
+    """Median, not mean."""
+    days = [(date(2026, 8, 20) + timedelta(days=n), 100) for n in range(9)]
+    days += [(date(2026, 8, 29), 5)]            # one bad night
+    days += [(date(2026, 9, 4), 100)]
+    assert coverage_item(px_over(days), date(2026, 9, 4)).ok
+
+
+def test_the_first_ever_session_has_nothing_to_compare_against() -> None:
+    item = coverage_item(px_over([(date(2026, 9, 4), 100)]), date(2026, 9, 4))
+    assert item.ok

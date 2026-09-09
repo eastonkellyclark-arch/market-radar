@@ -176,13 +176,14 @@ def test_lag_does_not_reach_across_a_relisting() -> None:
         ("AAAP", date(2026, 6, 24), 26.000, L2),
     ])
     rel = vol.moves(con, prices=con.table("px"), actions=con.table("act"))
-    got = {r[1]: r for r in rel.fetchall()}
+    got = {r[1]: dict(zip(rel.columns, r)) for r in rel.fetchall()}
 
     # The first bar of the new listing has no prior bar *in that listing*, so
     # there is no move for it at all -- which is the correct answer.
     assert date(2026, 6, 23) not in got
     # (26.000 - 25.095) / 25.095 -- both bars from the new listing.
-    assert got[date(2026, 6, 24)][7] == pytest.approx(Decimal("3.606296"), abs=1e-4)
+    assert got[date(2026, 6, 24)]["pct_move"] == pytest.approx(
+        Decimal("3.606296"), abs=1e-4)
 
 
 def test_dollar_volume_is_averaged_within_a_listing() -> None:
@@ -193,9 +194,9 @@ def test_dollar_volume_is_averaged_within_a_listing() -> None:
         ("REC", date(2026, 6, 24), 1, L2),
     ])
     rel = vol.moves(con, prices=con.table("px"), actions=con.table("act"))
-    rows = {r[1]: r for r in rel.fetchall()}
+    rows = {r[1]: dict(zip(rel.columns, r)) for r in rel.fetchall()}
     # The new listing's ADV is its own, not blended with the old $100 one.
-    assert float(rows[date(2026, 6, 24)][12]) == pytest.approx(900_000)
+    assert float(rows[date(2026, 6, 24)]["avg_dollar_volume"]) == pytest.approx(900_000)
 
 
 def test_the_gap_guard_catches_a_long_halt_inside_one_listing() -> None:
@@ -205,9 +206,9 @@ def test_the_gap_guard_catches_a_long_halt_inside_one_listing() -> None:
         ("HALT", date(2026, 8, 3), 4, L1),      # 210 days, same listing
     ])
     rel = vol.moves(con, prices=con.table("px"), actions=con.table("act"))
-    row = rel.fetchall()[0]
-    assert row[17] > vol.MAX_GAP_DAYS      # gap_days
-    assert row[19] is False                # within_gap
+    row = dict(zip(rel.columns, rel.fetchall()[0]))
+    assert row["gap_days"] > vol.MAX_GAP_DAYS
+    assert row["within_gap"] is False
 
 
 def test_a_normal_holiday_weekend_is_not_a_gap() -> None:
@@ -216,7 +217,8 @@ def test_a_normal_holiday_weekend_is_not_a_gap() -> None:
         ("OK", date(2026, 9, 8), 11, L1),      # Fri -> Tue over Labor Day
     ])
     rel = vol.moves(con, prices=con.table("px"), actions=con.table("act"))
-    assert rel.fetchall()[0][19] is True
+    row = dict(zip(rel.columns, rel.fetchall()[0]))
+    assert row["within_gap"] is True
 
 
 def test_gapped_moves_are_excluded_and_counted(monkeypatch) -> None:

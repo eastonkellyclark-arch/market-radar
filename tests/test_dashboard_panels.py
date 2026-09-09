@@ -34,7 +34,13 @@ def build(rows) -> volatility.ScreenResult:
             )
     con.execute("create table act (ticker varchar, ex_date date, "
                 "split_factor decimal(18,8), div_cash decimal(18,8))")
-    return volatility.screen(con, prices=con.table("px"), actions=con.table("act"))
+    # min_adv_sessions=1: these fixtures carry two sessions and are
+    # testing rendering, not the liquidity gate. The 30-session floor
+    # has its own tests in test_volatility.py.
+    return volatility.screen(
+        con, prices=con.table("px"), actions=con.table("act"),
+        min_adv_sessions=1,
+    )
 
 
 def digest_for(result) -> digest_mod.Digest:

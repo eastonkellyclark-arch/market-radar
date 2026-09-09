@@ -7,7 +7,7 @@ be checkable without any of that.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import duckdb
@@ -228,7 +228,10 @@ def test_liquid_set_is_parallel_and_does_not_remove_from_all(con) -> None:
     add_price(con, "DEEP", D3, "10.000000", volume=10_000_000)
     add_price(con, "DEEP", D4, "11.000000", volume=10_000_000)
 
-    result = run(con)
+    # min_adv_sessions=1: these fixtures carry two sessions by design, and
+    # the point under test is that the gated set is parallel rather than
+    # subtractive. The session floor has its own test below.
+    result = run(con, min_adv_sessions=1)
     every = only(result, security_type="stock", band="$10+",
                  direction="gainers", liquidity="all")
     liquid = only(result, security_type="stock", band="$10+",
@@ -325,3 +328,95 @@ def test_output_is_quantized_to_the_storage_scale(con) -> None:
     # 3.000000 / 3 is exact; the widened intermediate is what protects the
     # cases that are not.
     assert rel.fetchall()[0][6] == Decimal("1.000000")
+
+
+# --- the ADV window -----------------------------------------------------
+
+
+def test_adv_is_a_trailing_window_not_the_whole_partition(con) -> None:
+    """The bug the backfill would have switched on.
+
+    A name that traded $50M/day two years ago and $200k/day now must not pass
+    a $5M gate on its own history. With the old whole-partition average it
+    did, and nothing failed -- the number was valid, just answering a
+    question nobody asked.
+    """
+    for n in range(40):
+        add_price(con, "FADED", date(2026, 1, 1) + timedelta(days=n),
+                  "10.000000", volume=5_000_000 if n < 10 else 1_000)
+
+    rel = vol_moves(con)
+    rows = {r["date"]: r for r in rel}
+    early = rows[date(2026, 1, 5)]
+    late = rows[date(2026, 2, 9)]
+
+    assert early["avg_dollar_volume"] > late["avg_dollar_volume"] * 100, (
+        "the window is not trailing -- old volume is still in the average"
+    )
+
+
+def vol_moves(con, **kw):
+    rel = vol.moves(con, prices=con.table("px"), actions=con.table("act"), **kw)
+    return [dict(zip(rel.columns, r)) for r in rel.fetchall()]
+
+
+def test_the_window_is_capped_at_its_length(con) -> None:
+    for n in range(50):
+        add_price(con, "LONG", date(2026, 1, 1) + timedelta(days=n),
+                  "10.000000", volume=1_000_000)
+    sessions = {r["adv_sessions"] for r in vol_moves(con)}
+    assert max(sessions) == vol.ADV_WINDOW_SESSIONS
+
+
+def test_adv_sessions_reports_the_real_sample_size(con) -> None:
+    """A three-day mean must not be presentable as a thirty-day one."""
+    for n in range(4):
+        add_price(con, "NEW", date(2026, 9, 1) + timedelta(days=n),
+                  "10.000000", volume=10_000_000)
+    assert max(r["adv_sessions"] for r in vol_moves(con)) == 4
+
+
+# --- the session floor --------------------------------------------------
+
+
+def test_a_thin_name_is_excluded_from_the_gated_lists(con) -> None:
+    """The decision, made explicit: the gate claims "liquid over 30 sessions",
+    and a name without 30 sessions has not earned that claim."""
+    add_price(con, "IPO", D3, "10.000000", volume=10_000_000)
+    add_price(con, "IPO", D4, "11.000000", volume=10_000_000)
+
+    result = run(con)
+    every = only(result, security_type="stock", band="$10+",
+                 direction="gainers", liquidity="all")
+    liquid = only(result, security_type="stock", band="$10+",
+                  direction="gainers", liquidity="liquid")
+
+    assert [m.ticker for m in every.rows] == ["IPO"], "still in the ungated list"
+    assert liquid.rows == [], "and out of the gated one"
+    assert result.thin_history == 1
+
+
+def test_the_exclusion_is_counted_and_reported(con) -> None:
+    """Nothing is hidden: it is in the ungated list and the count is printed."""
+    add_price(con, "IPO", D3, "10.000000", volume=10_000_000)
+    add_price(con, "IPO", D4, "11.000000", volume=10_000_000)
+    text = "\n".join(vol.render(run(con)))
+    assert "fewer than 30 sessions" in text
+    assert "ungated" in text
+
+
+def test_the_session_floor_is_a_parameter(con) -> None:
+    add_price(con, "IPO", D3, "10.000000", volume=10_000_000)
+    add_price(con, "IPO", D4, "11.000000", volume=10_000_000)
+    result = run(con, min_adv_sessions=1)
+    liquid = only(result, security_type="stock", band="$10+",
+                  direction="gainers", liquidity="liquid")
+    assert [m.ticker for m in liquid.rows] == ["IPO"]
+    assert result.thin_history == 0
+
+
+def test_a_thin_name_below_the_dollar_gate_is_not_counted_as_thin(con) -> None:
+    """thin_history means "would have qualified but for the sample size"."""
+    add_price(con, "TINY", D3, "10.000000", volume=1)
+    add_price(con, "TINY", D4, "11.000000", volume=1)
+    assert run(con).thin_history == 0
