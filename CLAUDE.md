@@ -220,6 +220,45 @@ rollups all differ from how a company is known. Fuzzy match into a review
 queue; never auto-merge entities above a similarity threshold without a
 human-confirmable record.
 
+**The price universe is survivor-only, and that breaks deal studies in the
+one place it matters.** Tiingo's supported-ticker list is *current* listings,
+so a company that was acquired is not in the history at all — not truncated,
+absent. Checked directly: LNKD, WFM, TWTR, ATVI and VMW all return zero bars.
+An acquisition target is by definition a company that stopped being listed,
+so any forward-return study keyed on tickers measures **acquirers and failed
+deals, never takeout premiums**. The 8-K population shows the same curve from
+the other side: 3,406 joinable Item 1.01/2.01 filings in 2016 against 8,101
+in 2025, while total filings per year stayed flat near 12,000 — the
+difference is ten years of delisting, not ten years of growth.
+
+Do not fix this by widening the ticker map. SEC's `company_tickers.json` is
+also current-only, and even a perfect historical CIK→ticker map would resolve
+to symbols we hold no prices for. It needs a point-in-time universe, which is
+a data purchase, not a query. Until then: state the bias whenever a study
+reports an outcome, and never describe such a result as "returns after a
+deal" when it is "returns after a deal, among companies that survived it".
+
+Watch for the second-order version too. A recycled ticker makes a dead
+company look alive — SGEN carries bars through 2026 because a different
+issuer took the symbol after Seagen was acquired in 2023. The 30-day anchor
+guard in `screens/outcomes.py` rejects those, the same way the gap guard does
+in the volatility screens.
+
+**`corporate_actions` is materially incomplete, and nothing warns you.** It
+holds 365 splits across eleven years and 2,947 tickers, which is far short of
+reality. AYTU's 1-for-20 reverse split of 2023-01-06 is simply absent, and
+its absence reads as a genuine +1,751% move. Thirteen such events moved one
+study's mean excess return from +5% to +944% while its median stayed at +5%.
+
+This is the failure mode the "adjust at query time" rule was written to
+prevent, arriving through the back door: the adjustment is applied correctly
+to an action table that does not contain the action. The volatility screens
+read the same table, so this is not confined to the outcome study.
+`screens/outcomes.py` flags a move past 300% with no action on record as
+`suspect_unadjusted` and counts it in the open rather than dropping it
+silently — the same band holds real takeouts. Backfilling the actions
+properly is still owed.
+
 **Most "similar historical deals" is SQL, not vectors.** Filter first on SIC
 code, deal size bucket, cash vs stock, era. Use embeddings only to rank within
 that result set. Forward-return outcomes are a pure SQL join against local

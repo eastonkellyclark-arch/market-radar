@@ -457,7 +457,7 @@ broken one; a panel that says "waiting on the 10-year backfill" is not.
 | News | not built | W3 |
 | 8-K deals | LIVE | W3-T3 |
 | Deal multiples | not built | beyond |
-| Historical outcomes | not built | beyond |
+| Historical outcomes | LIVE | W3-T3 |
 | DCF / 3-statement | not built | beyond |
 | Pitch decks | not built | beyond |
 
@@ -555,7 +555,19 @@ what they say.
 
 - `signals/edgar_rss.py` — poller, filtered by form type
 - `signals/form4.py` — parser + cluster detection (multi-exec, 72h window)
-- `signals/deals.py` — 8-K item code extraction, deal filings → `deals` table
+- `signals/deals.py` — 8-K Items 1.01/2.01 → `deals` table. **Measure the
+  base rate before building the extractor**: Item 1.01 is "Entry into a
+  Material Definitive Agreement" and only ~16% of it is M&A (949 8-Ks,
+  2026-08-31 to 09-04). EX-2.x is the primary classifier — Reg S-K 601(b)(2)
+  reserves exhibit 2 for a plan of acquisition, so the filer already did the
+  work — with the text heuristic second. Store both and whether they agreed;
+  disagreement is a review queue, not an error.
+- `screens/outcomes.py` — forward returns at +1/+5/+30 **trading sessions**
+  against a benchmark. Pure SQL, no LLM, so it precedes the expensive
+  machinery rather than justifying it afterwards. Anchor on the date the
+  event became *public* (a Form 4 is filed two business days after the
+  trade), and read the survivorship note in CLAUDE.md before believing any
+  number it produces.
 - `sources/sec_suspensions.py`
 - `sources/gdelt.py` and `sources/finnhub_news.py` → `signals`
 
@@ -566,6 +578,8 @@ what they say.
   clusters and 10%-holder clusters, kept apart for the same reason ETFs are
   kept apart from stocks. Dollar-weighted, plan purchases flagged.
 - `U7` news panel — replaces the "not built" placeholder
+- `U11` 8-K deals panel — ships with W3-T3, not after it
+- `U12` historical outcomes panel — ships with the study
 
 **Exit:** a merger filing lands and appears in your digest *and on the
 dashboard* the same day.
@@ -617,9 +631,8 @@ three-year trend, and clear a review queue without writing SQL.
   which tags resolved and which fell through is the fastest way to find the
   next branch it needs.
 - `U11` 8-K deals panel — shipped with W3-T3, replacing the placeholder
-- `U12` deal multiples and historical outcome distributions — the forward
-  return join is pure SQL and needs no LLM, so this panel can precede every
-  embedding
+- `U12` deal multiples — the outcome half shipped in W3-T3; multiples wait
+  on target financials, which are disclosed in under 10% of deals
 - `U13` DCF / 3-statement panel
 - `U14` deck preview — the generated pitch deck, before it is a file
 
