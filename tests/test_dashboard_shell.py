@@ -92,16 +92,39 @@ def test_no_database_leaves_health_waiting_rather_than_crashing() -> None:
     assert state == shell.WAITING
 
 
-def test_the_liquidity_gate_is_waiting_on_a_fix_not_on_data() -> None:
-    """It is a correctness gap the backfill activates, not a data gap.
+DEEP = {str(y): {"rows": 1_500_000, "max_date": "2026-09-08"}
+        for y in range(2016, 2027)}
 
-    Twelve of the twenty-four lists are gated on a number that silently
-    becomes a multi-year average once history lands.
-    """
-    state, detail = shell._probe_liquidity(ctx())
+
+def test_the_liquidity_gate_goes_live_once_there_is_history() -> None:
+    state, detail = shell._probe_liquidity(ctx(prices=DEEP))
+    assert state == shell.LIVE
+    assert "30-session" in detail
+    assert "11 years" in detail
+
+
+def test_the_liquidity_gate_waits_when_there_is_no_history() -> None:
+    """A sweep-only partition is tens of thousands of rows, not millions."""
+    thin = {"2026": {"rows": 42_484, "max_date": "2026-09-08"}}
+    state, _ = shell._probe_liquidity(ctx(prices=thin))
     assert state == shell.WAITING
-    assert "trailing-window" in detail
-    assert "12 of the 24" in detail
+
+
+def test_ticker_detail_moves_from_waiting_to_not_built() -> None:
+    """Blocked on the backfill, then blocked on U3. Different answers.
+
+    A panel that still said "waiting on the backfill" after the backfill
+    landed would be the shell lying about its own roadmap.
+    """
+    assert shell._probe_ticker_detail(ctx(prices={}))[0] == shell.WAITING
+    state, detail = shell._probe_ticker_detail(ctx(prices=DEEP))
+    assert state == shell.NOT_BUILT
+    assert "U3" in detail
+
+
+def test_day_over_day_goes_live_with_history() -> None:
+    assert shell._probe_day_over_day(ctx(prices={}))[0] == shell.WAITING
+    assert shell._probe_day_over_day(ctx(prices=DEEP))[0] == shell.LIVE
 
 
 # --- rendering ----------------------------------------------------------

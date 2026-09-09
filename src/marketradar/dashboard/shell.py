@@ -186,27 +186,45 @@ def _probe_filings(ctx: Context) -> tuple[str, str]:
     return LIVE, f"{row['count']:,} filings, latest {row['latest'][:16]}"
 
 
+#: A partition carrying the whole universe rather than a sample. The backfill
+#: put ~1.2M-2.7M rows in each year; a sweep-only partition holds tens of
+#: thousands. Used to answer "is there enough history for this panel to mean
+#: anything" from dataset_stats, without reading a byte from R2.
+DEEP_PARTITION_ROWS: Final[int] = 250_000
+
+
+def _deep_years(ctx: Context) -> int:
+    return sum(1 for v in ctx.prices.values() if v["rows"] >= DEEP_PARTITION_ROWS)
+
+
 def _probe_ticker_detail(ctx: Context) -> tuple[str, str]:
-    """Mechanically fine on three bars, and useless. That is worth saying."""
-    return WAITING, (
-        "the 10-year backfill -- most names carry a handful of sessions, so a "
-        "chart would be three points"
-    )
+    """The data arrived; the panel has not been built yet.
+
+    Worth distinguishing: this was blocked on the backfill and is now blocked
+    on U3, which is a different answer and a different queue.
+    """
+    years = _deep_years(ctx)
+    if not years:
+        return WAITING, "the 10-year backfill -- a chart would be three points"
+    return NOT_BUILT, f"Weekend 2.5 (U3); {years} years of history are ready"
 
 
 def _probe_day_over_day(ctx: Context) -> tuple[str, str]:
-    return WAITING, (
-        "two sessions of whole-universe history; the nightly sweep supplies "
-        "this without the backfill"
-    )
+    if _deep_years(ctx) < 1:
+        return WAITING, "two sessions of whole-universe history"
+    return LIVE, "NEW marks names absent from the same list last session"
 
 
 def _probe_liquidity(ctx: Context) -> tuple[str, str]:
-    """Not a data gap. A correctness gap that the backfill will activate."""
-    return WAITING, (
-        "a trailing-window ADV. Average dollar volume currently has no time "
-        "window, so it silently becomes a multi-year average once history "
-        "lands -- and 12 of the 24 lists are gated on it"
+    """Was a correctness gap, not a data gap. Both are now closed."""
+    years = _deep_years(ctx)
+    if not years:
+        return WAITING, (
+            "a trailing-window ADV and the history to compute it over"
+        )
+    return LIVE, (
+        f"30-session trailing average over {years} years; names with fewer "
+        "sessions stay in the ungated lists and are counted"
     )
 
 
@@ -448,6 +466,9 @@ td.mark {{ color:#d03b3b; font-weight:700; width:12px; }}
 .strong {{ font-weight:600; }}
 .up {{ color:#0ca30c; }} .down {{ color:#d03b3b; }}
 .empty {{ color:var(--muted); font-size:12.5px; }}
+ul.caveats {{ margin:6px 0 2px; padding-left:18px; color:var(--muted);
+              font-size:12px; }}
+ul.caveats li {{ margin:1px 0; }}
 .filters {{ display:flex; gap:6px; flex-wrap:wrap; margin:12px 0 14px; }}
 button.f {{
   font:inherit; font-size:11.5px; cursor:pointer; color:var(--ink-2);

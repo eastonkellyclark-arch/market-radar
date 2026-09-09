@@ -347,3 +347,20 @@ def test_one_odd_session_does_not_move_the_baseline() -> None:
 def test_the_first_ever_session_has_nothing_to_compare_against() -> None:
     item = coverage_item(px_over([(date(2026, 9, 4), 100)]), date(2026, 9, 4))
     assert item.ok
+
+
+def test_the_digest_reports_what_the_screen_dropped(screen_result) -> None:
+    """The defect: thin_history and gap_excluded printed only in `mr screens`.
+
+    4,249 names were held out of the gated lists on the first real run and the
+    digest said nothing about it.
+    """
+    from dataclasses import replace
+
+    loud = replace(screen_result, floor_excluded=63, gap_excluded=11,
+                   thin_history=4_249)
+    text = digest_mod.render_text(make_digest(loud))
+
+    assert "63 moves below the $0.01 sanity floor" in text
+    assert "11 moves spanning a gap of more than 30 days" in text
+    assert "4,249 names cleared the $5M gate" in text

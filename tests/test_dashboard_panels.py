@@ -131,10 +131,36 @@ def test_filters_cover_band_and_security_type() -> None:
     assert 'data-f="liq"' in page
 
 
-def test_the_screens_panel_says_the_gate_is_not_trustworthy_yet() -> None:
-    """The liquidity caveat travels with the lists it applies to."""
-    page = panels.screens_html(digest_for(build([("BIG", 100, 110, "stock", LIQUID)])))
-    assert "Liquidity gating is not yet trustworthy" in page
+def test_the_caveats_reach_the_panel(monkeypatch) -> None:
+    """Whatever the screen dropped travels with the lists it applies to.
+
+    These are shared with the digest and `mr screens` rather than restated
+    here: three renderers each writing their own is exactly how thin_history
+    ended up printed by one of them and neither of the other two.
+    """
+    from dataclasses import replace
+
+    result = build([("BIG", 100, 110, "stock", LIQUID)])
+    loud = replace(result, floor_excluded=7, gap_excluded=3, thin_history=4_249)
+    page = panels.screens_html(digest_for(loud))
+
+    assert "sanity floor" in page
+    assert "gap of more than" in page
+    assert "4,249 names cleared" in page
+    assert page.count("<li>") >= 3
+
+
+def test_the_three_renderers_cannot_drift_apart() -> None:
+    """The fix for the defect, not just the defect.
+
+    Every surface reads volatility.caveats; none of them writes its own.
+    """
+    import inspect
+
+    from marketradar import digest as digest_mod
+
+    for module in (panels, digest_mod):
+        assert "caveats(" in inspect.getsource(module), module.__name__
 
 
 def test_macro_renders_basis_points_not_percent() -> None:

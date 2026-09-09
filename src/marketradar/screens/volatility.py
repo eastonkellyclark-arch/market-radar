@@ -572,6 +572,40 @@ def screen(
     )
 
 
+def caveats(result: "ScreenResult") -> list[str]:
+    """What the screen dropped, and why. One list, three renderers.
+
+    These lived inline in each renderer, which is exactly how thin_history
+    ended up printed by `mr screens` and by neither the digest nor the
+    dashboard: a number was added in one place and two copies quietly stayed
+    behind. Anything that qualifies the lists belongs here.
+    """
+    out: list[str] = []
+    if result.floor_excluded:
+        out.append(
+            f"{result.floor_excluded:,} moves below the ${result.sanity_floor} "
+            "sanity floor (sub-penny quotes)"
+        )
+    if result.gap_excluded:
+        out.append(
+            f"{result.gap_excluded:,} moves spanning a gap of more than "
+            f"{MAX_GAP_DAYS} days -- a relisting or a long halt, where the "
+            "prior close is not comparable"
+        )
+    if result.thin_history:
+        out.append(
+            f"{result.thin_history:,} names cleared the $5M gate on fewer than "
+            f"{result.min_adv_sessions} sessions and stayed in the ungated "
+            "lists -- a short average is not a liquidity measure"
+        )
+    if result.unattributed:
+        out.append(
+            f"{result.unattributed:,} bars carry no listing_id, falling "
+            "outside every listing period the vendor knows about"
+        )
+    return out
+
+
 def _fmt_money(value: Decimal) -> str:
     v = float(value)
     if v >= 1_000_000_000:
@@ -591,29 +625,8 @@ def render(result: ScreenResult, *, show_empty: bool = False) -> Iterator[str]:
         f"{result.moves_screened:,} moves screened, "
         f"{sum(len(l.rows) for l in lists):,} rows across {len(lists)} lists"
     )
-    if result.floor_excluded:
-        yield (
-            f"{result.floor_excluded:,} moves excluded by the "
-            f"${result.sanity_floor} sanity floor "
-            f"(sub-penny quotes; lower --sanity-floor to include them)"
-        )
-    if result.gap_excluded:
-        yield (
-            f"{result.gap_excluded:,} moves excluded for spanning a gap of "
-            f"more than {MAX_GAP_DAYS} days (relisting or long halt; the "
-            "prior close is not comparable)"
-        )
-    if result.thin_history:
-        yield (
-            f"{result.thin_history:,} names cleared the $5M gate on fewer "
-            f"than {result.min_adv_sessions} sessions and were left in the "
-            "ungated lists -- a short average is not a liquidity measure"
-        )
-    if result.unattributed:
-        yield (
-            f"{result.unattributed:,} bars carry no listing_id -- outside "
-            "every listing period the vendor knows about"
-        )
+    for line in caveats(result):
+        yield line
 
     for sl in lists:
         if not sl.rows and not show_empty:

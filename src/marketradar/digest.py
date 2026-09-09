@@ -509,10 +509,12 @@ def _text_lines(digest: Digest) -> Iterator[str]:
     s = digest.screen
     lists = _visible_lists(digest)
     yield "SCREENS"
-    yield (
-        f"  {s.moves_screened:,} moves screened for {s.day.isoformat()}"
-        f"; {s.floor_excluded:,} below the ${s.sanity_floor} sanity floor"
-    )
+    yield f"  {s.moves_screened:,} moves screened for {s.day.isoformat()}"
+    # From volatility.caveats, not restated here: three renderers writing
+    # their own is how thin_history reached `mr screens` and neither of the
+    # other two.
+    for caveat in volatility.caveats(s):
+        yield f"  {caveat}"
     if digest.prior_day:
         yield f"  NEW = not in this list on {digest.prior_day.isoformat()}"
     else:

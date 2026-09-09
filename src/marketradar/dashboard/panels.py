@@ -132,6 +132,15 @@ def _signed(value: Decimal | None, units: str) -> str:
 # --- screens ------------------------------------------------------------
 
 
+def _notes_html(notes: list[str]) -> str:
+    """What the screen dropped. Shown as a list rather than a run-on line:
+    these are four different exclusions and they are read one at a time."""
+    if not notes:
+        return ""
+    items = "".join(f"<li>{_esc(n)}</li>" for n in notes)
+    return f'<ul class="caveats">{items}</ul>'
+
+
 def _row_html(m: volatility.Move, digest: Digest, fresh: set[str]) -> str:
     entry = digest.names.get(m.ticker)
     name = entry.name[:34] + (" ?" if entry.ambiguous else "") if entry else ""
@@ -194,13 +203,10 @@ def screens_html(digest: Digest) -> str:
     open_keys = default_expanded(lists)
     s = digest.screen
 
-    caveats = []
-    if s.floor_excluded:
-        caveats.append(f"{s.floor_excluded:,} below the ${s.sanity_floor} floor")
-    if s.gap_excluded:
-        caveats.append(f"{s.gap_excluded:,} spanning a >30d gap")
+    # Shared with the digest and `mr screens` -- see volatility.caveats.
+    notes = list(volatility.caveats(s))
     if not digest.prior_day:
-        caveats.append("no prior session, so NEW is unavailable")
+        notes.append("no prior session, so NEW is unavailable")
 
     bands = sorted({sl.band for sl in lists})
     secs = sorted({sl.security_type for sl in lists})
@@ -214,8 +220,8 @@ def screens_html(digest: Digest) -> str:
 
     return f"""
       <p class="note">{s.moves_screened:,} moves screened for
-        {s.day.isoformat()}{('; ' + '; '.join(caveats)) if caveats else ''}.
-        Liquidity gating is not yet trustworthy -- see the Liquidity gate panel.</p>
+        {s.day.isoformat()}.</p>
+      {_notes_html(notes)}
       <div class="filters">{chips}
         <button class="f reset" data-f="reset">all</button></div>
       {''.join(_list_html(sl, digest, _key(sl) in open_keys) for sl in lists)}"""
