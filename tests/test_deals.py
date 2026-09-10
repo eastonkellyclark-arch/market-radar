@@ -382,3 +382,41 @@ def test_no_target_financials_is_the_common_case() -> None:
         "entered into an Agreement and Plan of Merger with Foo Holdings, Inc. "
         + "z" * 200))
     assert deal.target_financials == "none_disclosed"
+
+
+def test_load_deduplicates_on_accession() -> None:
+    """One 8-K filed by a parent and a subsidiary is listed under both CIKs.
+    Both copies in one batch made Postgres reject the whole statement:
+    "ON CONFLICT DO UPDATE command cannot affect row a second time"."""
+    captured: list[str] = []
+
+    class FakeCon:
+        def execute(self, sql, params=None):
+            if params and isinstance(params[0], str):
+                captured.append(params[0])
+            return self
+
+        def fetchall(self):
+            return [(0,)]
+
+        def sql(self, _):
+            return None
+
+    import marketradar.storage as _storage
+
+    real = _storage.postgres_attached
+    _storage.postgres_attached = lambda con: True
+    try:
+        one = deals.extract(filing(), body(
+            "entered into an Agreement and Plan of Merger with Foo Holdings, "
+            "Inc. " + "z" * 200))
+        with pytest.raises(Exception):
+            # assert_fresh will object to the fake relation; what matters is
+            # the SQL built before it, captured above.
+            deals.load([one, one], con=FakeCon())
+    finally:
+        _storage.postgres_attached = real
+
+    inserts = [s for s in captured if s.startswith("insert into deals")]
+    assert len(inserts) == 1
+    assert inserts[0].count("'0000006845-26-000087'") == 1

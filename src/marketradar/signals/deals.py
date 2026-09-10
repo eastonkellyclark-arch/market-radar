@@ -881,7 +881,18 @@ def load(deals: Iterable[Deal], con: Any = None, *, min_rows: int = 1) -> dict[s
     """
     from marketradar import storage
 
-    rows = list(deals)
+    # Deduplicate on accession before the insert, keeping the last seen.
+    #
+    # One 8-K can reach us twice: a filing made by a parent and a subsidiary
+    # is listed under both CIKs, and Postgres rejects the whole statement
+    # with "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    # when both land in one batch. The accession identifies the filing, so
+    # the second copy is the same document, not a second deal.
+    unique: dict[str, Deal] = {}
+    for deal in deals:
+        unique[deal.accession] = deal
+    rows = list(unique.values())
+
     con = con or storage.connect(attach_postgres=True)
     if not storage.postgres_attached(con):
         raise DealError("No Postgres attached; cannot upsert deals.")

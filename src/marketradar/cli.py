@@ -564,17 +564,28 @@ def _cluster_events(con, path: str | None):
 
 def _deal_events(con):
     """8-K deal candidates as events, joined to a ticker."""
+    # companies.cik is zero-padded and deals.cik is not, and a company can
+    # hold several tickers at once -- joining through company_tickers fanned
+    # 10,684 deals out into 13,686 rows, which would have weighted those
+    # events several times over in every median below.
     return con.sql("""
-        select d.accession as event_id, t.ticker,
-               d.filed_date as event_date, d.deal_type,
-               case when d.classifiers_agree then 'both agree'
-                    else 'review' end as confidence
-        from postgres_query('pg', '
-            select accession, cik, filed_date, deal_type, classifiers_agree
-            from deals') d
-        join postgres_query('pg', '
-            select cik, ticker from company_tickers') t
-          on cast(t.cik as varchar) = d.cik
+        select event_id, ticker, event_date, deal_type, confidence
+        from (
+            select d.accession as event_id, c.ticker,
+                   d.filed_date as event_date, d.deal_type,
+                   case when d.classifiers_agree then 'both agree'
+                        else 'review' end as confidence,
+                   row_number() over (partition by d.accession
+                                      order by c.id) as rn
+            from postgres_query('pg', '
+                select accession, cik, filed_date, deal_type, classifiers_agree
+                from deals') d
+            join postgres_query('pg', '
+                select id, cik, ticker from companies
+                where cik is not null and ticker is not null') c
+              on ltrim(c.cik, '0') = d.cik
+        )
+        where rn = 1
     """)
 
 
