@@ -195,9 +195,41 @@ def test_ticker_cells_are_addressable_for_the_detail_panel_later() -> None:
     assert 'data-ticker="BIG"' in page
 
 
+#: The one URL allowed in the page, and it is not a request: the SVG DOM API
+#: requires its namespace as a literal string. Allowlisted by exact value
+#: rather than by loosening the scan, so a real CDN link still fails.
+SVG_NS = "http://www.w3.org/2000/svg"
+
+
+def _assert_self_contained(page: str) -> None:
+    stripped = page.replace(SVG_NS, "")
+    for forbidden in ("http://", "https://", "src=", "<link", "fetch(",
+                      "XMLHttpRequest", "WebSocket", "import(", "@import"):
+        assert forbidden not in stripped, (
+            f"{forbidden!r} in the page. It is opened from file:// with no "
+            "server and no network -- anything that leaves the disk is a "
+            "broken panel for the one person who reads it."
+        )
+
+
 def test_the_full_page_stays_self_contained_with_a_digest() -> None:
     ctx = shell.Context(generated_at=datetime.now(timezone.utc), postgres=True)
     page = shell.render(ctx, digest=digest_for(build([("B", 100, 110, "stock", LIQUID)])))
     assert "<script>" in page
-    for forbidden in ("http://", "https://", "src=", "<link", "fetch("):
-        assert forbidden not in page
+    _assert_self_contained(page)
+
+
+def test_the_ticker_detail_script_is_scanned_too() -> None:
+    """The self-containment scan ran on a page rendered *without* ticker
+    detail, so ``tickers.SCRIPT`` -- the largest script in the page and the
+    only one that draws -- was never examined. A CDN link in it would have
+    shipped.
+    """
+    ctx = shell.Context(generated_at=datetime.now(timezone.utc), postgres=True)
+    details = {"B": {"bars": [{"d": 20000, "c": "1.0", "v": 1000}],
+                     "actions": [], "name": "B Corp"}}
+    page = shell.render(
+        ctx, digest=digest_for(build([("B", 100, 110, "stock", LIQUID)])),
+        details=details)
+    assert "createElementNS" in page, "the drawing script is in the page"
+    _assert_self_contained(page)

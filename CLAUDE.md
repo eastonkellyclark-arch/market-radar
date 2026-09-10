@@ -154,8 +154,47 @@ Names are for *display* and for *review*, never for joining. Where only a
 name exists, the answer is a review queue with a human-confirmable record --
 not a similarity threshold.
 
-**Jobs are idempotent.** Re-running yesterday's load produces the same result,
-never duplicates. Upsert on natural keys.
+**Every screen ends with a funnel.** The exact parallel of the freshness
+assertion on every loader, one step later in the pipeline: `assert_fresh`
+refuses to let a job exit green on empty data, and the funnel refuses to let
+a screen report a plausible list without saying what it discarded to get
+there.
+
+**A short list is either selective or broken, and the surviving count at each
+stage is what tells you which.** Five defects in the Form 5500 screen
+(2026-09-10) all survived a green suite, because a test encodes what its
+author believed about the data and each defect *was* a gap in that belief.
+Four were the same mistake -- the list contained something other than what
+the screen claimed to measure -- and the broken version consistently looked
+*more* plausible than the correct one. The one caught cheaply was caught by a
+stage count showing 922,340 -> 122,053 where a few thousand were expected.
+
+`screens/funnel.py` holds the shared type; a test walks `screens/` and fails
+the build on one that does not build a funnel. Each stage carries why it
+exists next to its count, a stage that empties the population is named, and a
+stage that removes more than 90% is marked for reading. Full write-up in
+docs/build-spec.md under "The screen failure mode".
+
+**Jobs are idempotent, *and* deterministic.** Re-running yesterday's load
+produces the same result, never duplicates. Upsert on natural keys.
+
+Idempotent writes are not enough on their own, and this is a distinction the
+codebase learned the hard way. `build_sponsors` picked the sponsor name with
+`any_value()`, and three loads of byte-identical input produced 22,680,
+22,685 and 22,686 review rows -- because which spelling of a name won decided
+whether that sponsor name-matched an SEC filer at all. Every write was a
+correct upsert. Every test passed.
+
+So: **no SQL function that picks a row from a group without saying which
+row.** `any_value`, `arbitrary`, `first`, `last` are banned in `sources/` and
+`screens/`; `min`/`max`/`min_by`/`max_by` on an explicit key are the fix,
+because they are a rule rather than a coin flip. A test in `tests/` parses
+every module in both packages and fails the build on one, ignoring SQL
+comments so the note explaining the ban is not the thing that trips it.
+
+The test that catches this at runtime is a load run *three times* on
+identical input with the full output compared -- counts included, not just
+row presence.
 
 **SEC requests** need a descriptive User-Agent with a real contact email, and
 must stay under 10 req/sec. Prefer bulk zips (`companyfacts.zip`, Financial
@@ -232,18 +271,111 @@ separate. One combined list means penny stocks win every day and you never see
 a $40 stock move again. Store tick-count move alongside percent; $0.0002 →
 $0.0003 is +50% and one tick.
 
-**XBRL tags are not consistent.** Revenue appears as `Revenues`,
-`RevenueFromContractWithCustomerExcludingAssessedTax`, `SalesRevenueNet`, and
-others depending on filer and year. The mapping lives in
-`sources/xbrl/tag_map.py` and is maintained by hand. Branch by SIC code —
-banks, insurers, and REITs need separate handling or they silently produce
-garbage. History mostly starts ~2009.
+**XBRL tags are not consistent, and it is one cliff rather than a mess.**
+Measured 2026-09-10 across seven quarters, 2013q1 to 2024q1. Revenue appears
+as `Revenues`, `RevenueFromContractWithCustomerExcludingAssessedTax`,
+`SalesRevenueNet` and others, but the variance is almost entirely an *era*
+effect: 78.2% of filers changed their income-statement top-line tag between
+2018 and 2019 when ASC 606 landed, against 11-20% in every other sampled
+interval. `SalesRevenue*` went from 48.4% of filers to 2.8% in that one year.
+
+So the map is era-keyed with **exactly one boundary** (fiscal years beginning
+on or after 2017-12-15), and the two halves are not equal work: pre-606 has
+419 distinct top-line tags with the top 5 covering 71.9%, post-606 has 133
+with the top 5 covering 93.0%. Build post-606 first; pre-2019 is a separate
+decision on evidence.
+
+**Banks, insurers, brokers and REITs are not a SIC branch — they are a
+different table.** 23.7% of filers in 2024q1 and 26.2% in 2013q1. A bank's
+top line is interest income and a REIT's earnings measure is FFO; forcing
+either into an operating-company shape produces numbers that are present,
+plausible and wrong.
+
+**Concepts resolve independently, and requiring a complete row is a silent
+filter.** Individually most concepts clear 90%+ for operating companies, but
+all ten on the same filer is 64.2% in 2024 and 51.6% in 2013. Never build one
+wide table and join against it: a consumer asking for two concepts should pay
+the coverage cost of two, not of ten it never reads. **Every concept carries
+its own coverage number wherever it is consumed** — a concept at 51% and one
+at 99% are both just a number in a column otherwise.
+
+**v1 is deliberately narrow** (decided 2026-09-10): post-606 only (2019
+forward), operating companies only, and six concepts — revenue, net income,
+assets, liabilities, equity, operating cash flow. Five are above 98% in 2024;
+revenue is 86.8% and is the one that matters, so its misses stay visible
+rather than averaged into a complete-row requirement. capex, shares, cash and
+operating income come back when a question needs them, each with its own
+coverage stated.
+
+**A company with no revenue is `absent`, not `unmapped`.** 4-10% of operating
+companies open their income statement with an expense because they are
+pre-revenue. That is a distinct value -- the same distinction as `not_stated`
+against `not_parsed`, and as `lapsed` against `declining` in the Form 5500
+series. Collapsing them makes the coverage number wrong in both directions.
+History mostly starts ~2009. Full numbers in docs/build-spec.md.
 
 **M&A detection is by SEC form type, not news.** 8-K Items 1.01/2.01, S-4,
 DEFM14A, SC 13D, SC TO-T, SC 13E-3. Filings are legally required, timestamped,
 and unambiguous. News is the noisy secondary signal.
 
 Measured 2026-09-10 and **news was declined**, so this is settled rather than aspirational. GDELT returns 14.3 articles per company per day and **13.4% of them name the company in the headline**; the rest are passing mentions, content farms and the company's own portal. The deciding test was lead time against real 8-K deal dates: coverage did appear before the filing, but not one leading article was about the deal -- they were insider-transaction reports we already parse from Form 4, unrelated PR, and stock-performance filler. Its API also cannot be swept (one request per five seconds, tighter under load), and the free bulk GKG fixes the rate limit without fixing the base rate. Full numbers in docs/build-spec.md under "News: measured, declined". Reopen on lead time, not on volume.
+
+**"Absent from the file" is not "declined to zero", and only one of them
+is a signal.** Measured 2026-09-10 while building the participant time
+series. A sponsor missing from a later plan year may have terminated the
+plan, been acquired, changed EIN, dropped under the filing threshold, or --
+overwhelmingly, in the newest year -- simply not filed yet. Filings lag the
+plan year by about eighteen months, so 2025 held roughly a third of 2024's
+filings while it was still being filed.
+
+Folding an absence into the participant series as a zero manufactures a
+cliff for a large share of the file, and a screen looking for shrinking
+headcount sorts exactly those to the top -- it would rank its own blind spot
+first. So presence and trend are **separate columns**: `status` is
+`filing`/`lapsed` and never carries a direction, `trend` is measured only
+between plan years the sponsor actually filed and only complete ones, and
+`pending_years` (still being filed, means nothing) is counted apart from
+`gap_years` (a complete year skipped, a real oddity). `unknown` is a real
+trend value and the most common one.
+
+The same shape recurs wherever a source has a reporting lag: a row that is
+not there yet and a row that is there and small are different facts, and
+the arithmetic that treats them alike never errors.
+
+**And it recurs one level down, at whatever the row is made of.** The first
+build of the participant series keyed correctly on the sponsor and then
+compared an aggregate whose *membership* drifts: a sponsor's set of filed
+plans changes year to year, so "everything it filed in 2022" against
+"everything it filed in 2024" is two different things with the difference
+called headcount. Edward Don & Company filed two plans for 2022 and one for
+2024 and read as −46%. The comparison now runs over the plans present at
+both ends, keyed on `(ein, plan_num)`. Before comparing two aggregates
+across time, ask what the set is made of and whether the membership is the
+same at both ends.
+
+**Check what the column counts before naming it.** `TOT_PARTCP_BOY_CNT` is
+the obvious participant field on Form 5500 and it is not headcount: it
+includes retirees and separated ex-employees who still hold a balance.
+Active is 78% of total on the main form, and for an old institution far
+less — Boca Raton Regional Hospital reports 934 participants and 388 active.
+A trend on the total finds pension plans distributing balances, which every
+old employer does, and the first mature-target list was hospitals,
+universities and charities doing exactly that.
+`TOT_ACT_PARTCP_BOY_CNT`/`SF_TOT_ACT_PARTCP_BOY_CNT` is the one that means
+employees. The general rule: when a source offers a total and a component,
+read the field definition rather than the field name — the total is usually
+a superset of what you want, and it never errors.
+
+**Some numbers are floors, and a floor is not a measurement.** Form 5500's
+`PLAN_EFF_DATE` gives the oldest plan a sponsor still files, which bounds
+how long the company has existed without being its age -- a firm founded in
+1971 whose 401(k) started in 1985 reads as 1985. The error runs one way
+only: it understates, which hides targets rather than inventing them. That
+asymmetry is what makes it usable as a screen input and unusable as a
+reported fact, so it renders as `≥N years` and never as `N years`. Same
+rule as the Form 5500 headcount *range* (sum across plans is a ceiling,
+largest single plan a floor) and the survivor-only price universe: state
+the direction of the error wherever the number is shown.
 
 **Form 5500 sponsor names are messy.** DBAs, legal entity names, and subsidiary
 rollups all differ from how a company is known. Fuzzy match into a review

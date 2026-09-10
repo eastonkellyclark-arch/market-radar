@@ -46,6 +46,16 @@ log = logging.getLogger(__name__)
 #: Gitignored, and named so it is obvious why. See docs/build-spec.md.
 DEFAULT_OUTPUT: Final[Path] = Path(".dashboard") / "index.html"
 
+#: Shown in place of a digest-backed body when the digest was skipped. The
+#: panel is not empty because the data is missing -- it is empty because this
+#: render did not build the thing that fills it, and those are different.
+NO_DIGEST: Final[str] = (
+    '<p class="empty">Rendered with <code>--fast</code>, which skips the '
+    "digest &mdash; so this panel has no body. The data may well be there; "
+    "this page just did not build it. Re-run <code>mr dashboard</code> "
+    "without <code>--fast</code>.</p>"
+)
+
 LIVE: Final[str] = "live"
 WAITING: Final[str] = "waiting"
 NOT_BUILT: Final[str] = "not built"
@@ -356,6 +366,20 @@ def _probe_private(ctx: Context) -> tuple[str, str]:
                   f"plan year {stats.get('plan_year')}")
 
 
+def _probe_mature(ctx: Context) -> tuple[str, str]:
+    """Driven by render(), which builds the series from the year parquets."""
+    stats = getattr(ctx, "_mature_stats", None) or {}
+    if not stats:
+        return WAITING, ("no multi-year series -- run `mr form5500` for "
+                         "2022-2024, then `mr targets`")
+    years = stats.get("years") or ()
+    if len(years) < 2:
+        return WAITING, (f"only plan year {years[0] if years else '?'} is "
+                         "loaded; a trend needs two complete years")
+    return LIVE, (f"{stats.get('candidates', 0):,} candidates over plan years "
+                  f"{years[0]}-{years[-1]}")
+
+
 def _probe_outcomes(ctx: Context) -> tuple[str, str]:
     if not ctx.outcomes:
         return WAITING, "no study stored -- run `mr outcomes`"
@@ -431,6 +455,12 @@ PANELS: Final[tuple[Panel, ...]] = (
           "the source working rather than failing. NAICS, headcount range, "
           "DFE trustees filterable as their own category.",
           probe=_probe_private),
+    Panel("mature", "Mature targets", "Private",
+          "Old private employers whose headcount has stopped growing. Age is "
+          "a floor from the oldest plan still filed, headcount is a range, "
+          "and a sponsor that stopped filing is excluded rather than read as "
+          "a decline.",
+          probe=_probe_mature),
     Panel("review", "Entity review queue", "Private",
           "Sponsors whose name matched an SEC filer while their EIN did not. "
           "~23k rows, not 800k: EIN is on 100% of filings, so everything "
@@ -499,6 +529,8 @@ def render(
     details: dict[str, Any] | None = None,
     private: list[dict[str, Any]] | None = None,
     private_stats: dict[str, Any] | None = None,
+    mature: list[dict[str, Any]] | None = None,
+    mature_stats: dict[str, Any] | None = None,
 ) -> str:
     """The page. With a digest, health/macro/screens get real bodies.
 
@@ -509,35 +541,44 @@ def render(
     from marketradar.dashboard import detail as tk
     from marketradar.dashboard import panels as body_html
 
+    # **Every renderer is called unconditionally.** Each one owns its empty
+    # case and returns a message naming the command that fills it. Gating
+    # these on `if <data>:` made all nine of those messages unreachable, so a
+    # panel with zero rows rendered byte-identical to one that was never
+    # wired up -- which is the exact distinction this shell exists to draw,
+    # and it was broken for every panel at once.
     bodies: dict[str, str] = {}
     if digest is not None:
-        bodies = {
-            "health": body_html.health_html(digest),
-            "macro": body_html.macro_html(digest),
-            "screens": body_html.screens_html(digest),
-        }
-        if details:
-            bodies["ticker"] = tk.panel_html()
-    if ctx.recent_filings:
-        bodies["filings"] = body_html.filings_html(ctx.recent_filings)
-    if ctx.clusters:
-        bodies["clusters_insider"] = body_html.clusters_html(
-            ctx.clusters, "insider", 50_000)
-        bodies["clusters_tenpct"] = body_html.clusters_html(
-            ctx.clusters, "ten_percent", 1_000_000)
-    if ctx.deals:
-        bodies["deals"] = body_html.deals_html(ctx.deals)
-    if ctx.outcomes:
-        bodies["outcomes"] = body_html.outcomes_html(ctx.outcomes)
-    if ctx.review:
-        bodies["review"] = body_html.review_html(ctx.review, ctx.review_counts)
-    if private:
-        bodies["private"] = body_html.private_html(
-            private, private_stats or {})
+        bodies["health"] = body_html.health_html(digest)
+        bodies["macro"] = body_html.macro_html(digest)
+        bodies["screens"] = body_html.screens_html(digest)
+    else:
+        # Four panels take their body from the digest, and their probes read
+        # dataset_stats instead -- so without a digest they chipped *live*
+        # with an empty slot, which is how `--fast` quietly produced a page
+        # whose screens panel looked broken rather than skipped. Say which it
+        # is, in the panel, rather than leaving it to be diagnosed.
+        for pid in ("health", "macro", "screens"):
+            bodies[pid] = NO_DIGEST
+    if details:
+        bodies["ticker"] = tk.panel_html()
+    elif digest is None:
+        bodies["ticker"] = NO_DIGEST
+    bodies["filings"] = body_html.filings_html(ctx.recent_filings)
+    bodies["clusters_insider"] = body_html.clusters_html(
+        ctx.clusters, "insider", 50_000)
+    bodies["clusters_tenpct"] = body_html.clusters_html(
+        ctx.clusters, "ten_percent", 1_000_000)
+    bodies["deals"] = body_html.deals_html(ctx.deals)
+    bodies["outcomes"] = body_html.outcomes_html(ctx.outcomes)
+    bodies["review"] = body_html.review_html(ctx.review, ctx.review_counts)
+    bodies["private"] = body_html.private_html(private or [], private_stats or {})
+    bodies["mature"] = body_html.mature_html(mature or [], mature_stats or {})
 
-    # Stashed so _probe_private can see what render() loaded without the
-    # probe signature growing a parameter every panel does not need.
+    # Stashed so the probes can see what render() loaded without the probe
+    # signature growing a parameter every panel does not need.
     object.__setattr__(ctx, "_private_stats", private_stats or {})
+    object.__setattr__(ctx, "_mature_stats", mature_stats or {})
     resolved = [(p, *p.resolve(ctx)) for p in panels]
     counts = {s: sum(1 for _, st, _ in resolved if st == s)
               for s in (LIVE, WAITING, NOT_BUILT)}
@@ -569,7 +610,7 @@ def render(
         parts.append(body_html.FEED_SCRIPT)
     if ctx.deals:
         parts.append(body_html.DEALS_SCRIPT)
-    if private or ctx.review:
+    if private or mature or ctx.review:
         parts.append(body_html.PRIVATE_SCRIPT)
     if details:
         parts.append(
@@ -715,6 +756,28 @@ td.new {{ color:#0ca30c; font-size:9.5px; font-weight:700; width:26px; }}
        border:1px solid var(--rule); border-radius:3px; padding:0 4px;
        margin-right:4px; color:var(--muted); }}
 .mk.fund {{ color:#fab219; border-color:#fab219; }}
+.mk.stale {{ color:#898781; border-color:#898781; }}
+/* The survivorship marker on the excess columns. A caveat that lives only
+   in a docstring is a caveat nobody reading the number ever sees. */
+.bias {{ display:block; font-size:9px; font-weight:600; color:#fab219;
+         letter-spacing:.03em; text-transform:none; }}
+.bias-note {{ border-left:2px solid #fab219; padding-left:9px; }}
+/* The participant sparkline. A year the sponsor did not file is a *gap* --
+   drawn as an empty slot rather than a zero-height bar, because the whole
+   point of the series is that an absence is not a headcount of nothing. */
+.spark {{ display:inline-flex; align-items:flex-end; gap:2px; height:16px; }}
+.spark .sp {{ display:inline-block; width:5px; background:var(--series);
+  border-radius:1px; }}
+.spark .sp.gap {{ height:16px; width:5px; background:var(--gapfill);
+  border-bottom:1px dashed var(--axis); }}
+td.spark-cell {{ width:64px; }}
+/* Trend is a status, so each carries a glyph and a word as well as a hue. */
+.tr {{ font-size:11.5px; font-weight:600; white-space:nowrap; }}
+.tr-growing {{ color:#0ca30c; }}
+.tr-declining {{ color:#d03b3b; }}
+.tr-flat {{ color:var(--ink-2); }}
+.tr-unknown {{ color:var(--muted); font-weight:500; }}
+td.trend {{ white-space:nowrap; font-size:11.5px; }}
 /* Status colours, not series colours: REVIEW is the warning step and 3-05 the
    good one, and both carry a word so the state is never colour alone. */
 .mk.rev {{ color:#fab219; border-color:#fab219; }}
@@ -761,6 +824,8 @@ def write(
     details: dict[str, Any] | None = None,
     private: list[dict[str, Any]] | None = None,
     private_stats: dict[str, Any] | None = None,
+    mature: list[dict[str, Any]] | None = None,
+    mature_stats: dict[str, Any] | None = None,
 ) -> Path:
     """Render to a gitignored local file. There is no publish counterpart."""
     target = Path(path) if path else DEFAULT_OUTPUT
@@ -768,7 +833,8 @@ def write(
     ctx = ctx or gather(con)
     target.write_text(
         render(ctx, digest=digest, details=details,
-               private=private, private_stats=private_stats),
+               private=private, private_stats=private_stats,
+               mature=mature, mature_stats=mature_stats),
         encoding="utf-8",
     )
     return target

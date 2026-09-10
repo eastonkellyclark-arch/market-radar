@@ -8,15 +8,23 @@ failing the moment the first source module is written incorrectly.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
+from typing import Final
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "marketradar"
 SOURCES = SRC / "sources"
+SCREENS = SRC / "screens"
 
 
 def _source_modules() -> list[Path]:
     """Every real loader module. ``__init__.py`` is package scaffolding."""
     return sorted(p for p in SOURCES.glob("*.py") if p.name != "__init__.py")
+
+
+def _screen_modules() -> list[Path]:
+    """Every screen. They do not load data, but they do shape what is read."""
+    return sorted(p for p in SCREENS.glob("*.py") if p.name != "__init__.py")
 
 
 def test_sources_package_exists() -> None:
@@ -78,6 +86,67 @@ def test_every_source_asserts_freshness() -> None:
         "Every pipeline stage ends with a freshness assertion — a job that "
         "exits green on empty data is the failure mode this project cares "
         "most about."
+    )
+
+
+#: SQL that picks one row from a group without saying which one. Every one of
+#: these is a legitimate function and every one of them makes the output of a
+#: job depend on the order DuckDB happened to scan in.
+NONDETERMINISTIC_PICKS: Final[tuple[str, ...]] = (
+    "any_value", "arbitrary", "first", "last", "reservoir_sample", "random",
+)
+
+
+def _sql_strings(tree: ast.AST) -> list[str]:
+    """String literals with the SQL comments stripped out.
+
+    SQL lives in string literals here, and so does the prose explaining why a
+    given function is banned -- ``-- min(), not any_value()`` sits inside the
+    query it is describing. Scanning the raw string would make the comment
+    that documents the rule the thing that fails it.
+    """
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            body = re.sub(r"--[^\n]*", "", node.value)
+            body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+            out.append(body)
+    return out
+
+
+def test_no_nondeterministic_row_picks_in_pipeline_sql() -> None:
+    """A job run twice on identical input must produce identical output.
+
+    Not "must not write duplicates" -- that is idempotency, and this codebase
+    already had it when the bug landed. ``build_sponsors`` picked the sponsor
+    name with ``any_value()``, and three loads of byte-identical input
+    produced 22,680, 22,685 and 22,686 review rows, because which spelling
+    won decided whether the sponsor name-matched an SEC filer at all. Every
+    write was a correct upsert. Every existing test passed.
+
+    The class of defect is a function that picks a row from a group without
+    saying which row, so this bans them from ``sources/`` and ``screens/``.
+    ``min``/``max``/``min_by``/``max_by`` say which row and are the fix: they
+    are a rule rather than a coin flip, which is the entire difference.
+    """
+    offenders: list[str] = []
+    scanned = 0
+    for module in _source_modules() + _screen_modules():
+        tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+        scanned += 1
+        for sql in _sql_strings(tree):
+            for fn in NONDETERMINISTIC_PICKS:
+                if re.search(rf"\b{fn}\s*\(", sql, flags=re.I):
+                    offenders.append(f"  {module.name}: {fn}(")
+
+    assert scanned, "the invariant is vacuous; no modules were scanned"
+    assert not offenders, (
+        "Non-deterministic row picks in pipeline SQL:\n"
+        + "\n".join(sorted(set(offenders)))
+        + "\n\nThese choose a row from a group without saying which one, so "
+        "the same input gives a different answer per run. Use min()/max() or "
+        "min_by()/max_by() on an explicit key instead. Jobs are idempotent "
+        "(CLAUDE.md), and idempotent writes of drifting values still drift."
     )
 
 

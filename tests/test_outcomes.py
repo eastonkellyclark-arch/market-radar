@@ -233,3 +233,46 @@ def test_summary_excludes_suspects_and_counts_them(con) -> None:
 def test_no_horizons_is_an_error_not_an_empty_table(con) -> None:
     with pytest.raises(outcomes.OutcomeError):
         run(con, horizons=())
+
+
+# --- the bias runs the same way as the number ---------------------------
+
+
+def test_the_survivorship_caveat_is_printed_with_the_numbers() -> None:
+    """Not only in a docstring. A reader who sees the excess return without
+    it reads a measurement of who is still listed as a fact about deals."""
+    from marketradar.screens import outcomes
+
+    text = outcomes.render([], "test study")
+    assert "biased downward" in text.lower()
+    assert "higher than this" in text.lower()
+
+
+def test_the_caveat_names_the_direction_not_only_its_existence() -> None:
+    """'There is survivorship bias' is not actionable. Which way it pushes
+    the number is: completing a deal delists the target, so the survivors are
+    weighted toward deals that failed and the correction goes up."""
+    from marketradar.screens import outcomes
+
+    caveat = outcomes.SURVIVOR_CAVEAT.lower()
+    assert "delists" in caveat
+    assert "failed" in caveat
+    assert "higher" in caveat
+
+
+def test_the_panel_marks_the_excess_columns_themselves() -> None:
+    """The caveat has to reach the cell, not just sit at the top of a page
+    somebody scrolled past."""
+    from marketradar.dashboard import panels
+
+    page = panels.outcomes_html([{
+        "study": "8-K deals", "slice": "all", "horizon": 30, "n": 8000,
+        "median_ret": "-0.01", "mean_ret": "-0.01",
+        "median_excess": "-0.0236", "mean_excess": "-0.02",
+        "win_rate": "0.44", "median_run_up": "0.01", "n_suspect": 3,
+        "events": 10689, "priced": 8000, "benchmark": "SPY",
+    }])
+    assert "biased" in page
+    assert "-2.36%" in page
+    # and the direction, next to the number rather than in a tooltip alone
+    assert "correction goes" in page.lower() or "goes\n            <strong>up" in page

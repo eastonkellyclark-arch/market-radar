@@ -93,3 +93,37 @@ def test_prices_has_the_restart_flag() -> None:
 def test_selftest_has_the_staleness_injector() -> None:
     args = build_parser().parse_args(["selftest", "--inject-staleness"])
     assert args.inject_staleness is True
+
+
+def test_the_targets_command_is_registered() -> None:
+    parser = build_parser()
+    actions = [a for a in parser._actions if a.dest == "command"]
+    assert "targets" in actions[0].choices
+
+
+def test_a_single_plan_year_yields_no_series_rather_than_a_wrong_one(
+    tmp_path, monkeypatch
+) -> None:
+    """A trend needs two complete years. With one published file the panels
+    must degrade to no trend, not to a flat one."""
+    from marketradar import cli
+
+    (tmp_path / "form5500_sponsors_2024.parquet").write_bytes(b"")
+    con, built = cli._series_con(str(tmp_path))
+    assert con is None and built is None
+
+
+def test_no_published_years_is_not_an_error(tmp_path) -> None:
+    from marketradar import cli
+
+    assert cli._sponsor_parquets(str(tmp_path)) == {}
+    assert cli._series_con(str(tmp_path)) == (None, None)
+
+
+def test_a_file_that_is_not_a_plan_year_is_skipped(tmp_path) -> None:
+    """Something else in the directory must not become plan year zero."""
+    from marketradar import cli
+
+    (tmp_path / "form5500_sponsors_notes.parquet").write_bytes(b"")
+    (tmp_path / "form5500_sponsors_2024.parquet").write_bytes(b"")
+    assert list(cli._sponsor_parquets(str(tmp_path))) == [2024]

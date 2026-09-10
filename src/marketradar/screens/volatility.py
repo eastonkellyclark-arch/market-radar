@@ -648,6 +648,35 @@ def screen(
     )
 
 
+def funnel(result: "ScreenResult") -> "funnel_mod.Funnel":
+    """The screen's population, stage by stage.
+
+    Every one of these counts already existed on :class:`ScreenResult` and
+    was reported as prose in :func:`caveats`. Prose is what a reader skims;
+    an ordered count is what makes a stage that removed everything obvious.
+    See :mod:`marketradar.screens.funnel` for why this is not optional.
+    """
+    from marketradar.screens import funnel as funnel_mod
+
+    screened = result.moves_screened
+    after_floor = screened - result.floor_excluded
+    after_gap = after_floor - result.gap_excluded
+    after_suspect = after_gap - result.action_suspect
+    ranked = sum(len(sl.rows) for sl in result.lists)
+    return funnel_mod.build(
+        "volatility",
+        ("one-day moves", screened, "every adjusted move available"),
+        ("above the floor", after_floor,
+         f"${result.sanity_floor}; below it a percentage is noise"),
+        ("no long gap", after_gap,
+         f"a move across more than {MAX_GAP_DAYS} days is not a move"),
+        ("action-explained", after_suspect,
+         "gains that are almost certainly unrecorded reverse splits"),
+        ("ranked into lists", ranked,
+         f"top {TOP_N} per list, 24 lists, names repeat across them"),
+    )
+
+
 def caveats(result: "ScreenResult") -> list[str]:
     """What the screen dropped, and why. One list, three renderers.
 

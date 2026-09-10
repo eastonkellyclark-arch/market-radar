@@ -638,6 +638,14 @@ def _bar(value: float | None) -> str:
     )
 
 
+#: One sentence, shared with the CLI and the spec so the three cannot drift.
+_SURVIVOR: Final[str] = (
+    "Biased downward: a completed deal delists the target and leaves the "
+    "sample; a collapsed one keeps trading and stays. The survivors are "
+    "weighted toward deals that failed, so the true figure is higher."
+)
+
+
 def outcomes_html(rows: list[dict[str, Any]]) -> str:
     """Forward returns after an event, by slice and horizon.
 
@@ -699,10 +707,22 @@ def outcomes_html(rows: list[dict[str, Any]]) -> str:
             Benchmark {_esc(head.get("benchmark") or "SPY")}; horizons are
             trading sessions from the last close before the event, so
             <strong>+1d is the event session itself</strong>.</p>
+          <p class="note bias-note"><strong>Every excess figure below is
+            biased downward.</strong> The {events - priced:,} events that
+            produced no return did not drop out at random &mdash; completing
+            an acquisition delists the target, so it has no forward close and
+            leaves the sample, while a deal that collapsed keeps trading and
+            stays in it. What survives to be measured is weighted toward
+            deals that <em>failed</em>, which is also the population that
+            gives back the announcement move. The correction goes
+            <strong>up</strong>, by an unknown amount.</p>
           <table class="rows">
             <thead><tr><th>slice</th><th class="num">h</th>
               <th class="num">n</th><th class="num">median</th>
-              <th class="num">median excess</th><th class="num">mean excess</th>
+              <th class="num" title="{_esc(_SURVIVOR)}">median excess
+                <span class="bias">&darr;biased</span></th>
+              <th class="num" title="{_esc(_SURVIVOR)}">mean excess
+                <span class="bias">&darr;biased</span></th>
               <th class="num">win</th><th class="num">run-up</th>
               <th class="num">drop</th></tr></thead>
             <tbody>{''.join(body)}</tbody>
@@ -742,6 +762,92 @@ NAICS_LABELS: Final[dict[str, str]] = {
     "524210": "insurance agencies and brokerages",
     "523900": "other financial investment activities",
 }
+
+
+#: How a trend reads in the panels. Colour never carries the meaning on its
+#: own -- each pairs a glyph with a word, per the status rule.
+TREND_MARK: Final[dict[str, tuple[str, str]]] = {
+    "growing": ("\u2191", "growing"),
+    "flat": ("\u2192", "flat"),
+    "declining": ("\u2193", "declining"),
+    "unknown": ("\u00b7", "one year"),
+}
+
+
+def trend_html(row: dict[str, Any]) -> str:
+    """One sponsor's participant trend, with its absences spelled out.
+
+    Three things share this cell and must not be confused for each other: the
+    direction across the years the sponsor *filed*, the years it has not filed
+    yet, and the years it skipped. A sponsor that stopped filing shows
+    ``lapsed`` and no direction at all -- never a fall to zero, which is what
+    a series that zero-filled absences would show and what a decline screen
+    would rank first.
+    """
+    trend = row.get("trend") or "unknown"
+    glyph, label = TREND_MARK.get(trend, TREND_MARK["unknown"])
+    pct = row.get("pct_change")
+    if row.get("status") == "lapsed":
+        last = row.get("last_year")
+        return (f'<span class="mk stale" title="last filed for plan year '
+                f'{last}. Terminated, acquired, re-EIN&#39;d or below the '
+                f'filing threshold -- not a headcount decline">'
+                f'lapsed {_esc(last)}</span>')
+    move = "" if pct is None else f" {pct:+.0%}"
+    span = ""
+    if (row.get("years_filed") or 0) >= 2:
+        span = f" {row.get('first_year')}&ndash;{row.get('last_year')}"
+    pending = int(row.get("pending_years") or 0)
+    gaps = int(row.get("gap_years") or 0)
+    added = int(row.get("plans_added") or 0)
+    dropped = int(row.get("plans_dropped") or 0)
+    extra = ""
+    if pending:
+        extra += (f'<span class="note" title="that plan year is still being '
+                  f'filed, so the absence carries no information"> '
+                  f'+{pending} pending</span>')
+    if gaps:
+        extra += (f'<span class="note" title="complete plan years the sponsor '
+                  f'skipped between two it filed"> {gaps} gap</span>')
+    if added or dropped:
+        # The trend already excludes these plans. Shown because a sponsor
+        # whose plan set churned is a weaker reading than one whose plans are
+        # identical at both ends, even though neither is distorted by it.
+        bits = ([f"+{added}"] if added else []) + ([f"-{dropped}"] if dropped
+                                                   else [])
+        extra += (f'<span class="note" title="plans present at only one end. '
+                  f'Left out of the trend: a plan opening or closing is a '
+                  f'fact about the filing, not about headcount">'
+                  f' {"/".join(bits)} plans</span>')
+    return (f'<span class="tr tr-{_esc(trend)}" title="measured only between '
+            f'plan years the sponsor filed, and only complete ones">'
+            f'{glyph} {label}{move}</span>'
+            f'<span class="note">{span}</span>{extra}')
+
+
+def series_bars(row: dict[str, Any]) -> str:
+    """A bare inline sparkline of the filed years. No axis, no library.
+
+    Years the sponsor did not file are *gaps* in the row rather than zeros:
+    the shape of the series has to show the absence as an absence.
+    """
+    series = row.get("series") or []
+    if len(series) < 2:
+        return '<span class="note">&mdash;</span>'
+    points = [(int(d["year"]), int(d["participants"] or 0)) for d in series]
+    top = max(p for _, p in points) or 1
+    years = range(min(y for y, _ in points), max(y for y, _ in points) + 1)
+    have = dict(points)
+    cells = []
+    for y in years:
+        if y not in have:
+            cells.append('<i class="sp gap" title="no filing for '
+                         f'{y}"></i>')
+            continue
+        h = max(2, round(have[y] / top * 14))
+        cells.append(f'<i class="sp" style="height:{h}px" '
+                     f'title="{y}: {have[y]:,}"></i>')
+    return f'<span class="spark">{"".join(cells)}</span>'
 
 
 def naics_label(code: str | None) -> str:
@@ -799,6 +905,7 @@ def private_html(rows: list[dict[str, Any]], stats: dict[str, Any]) -> str:
         body.append(
             f'<tr class="pv" data-naics="{_esc(r.get("naics") or "")}" '
             f'data-dfe="{int(bool(r.get("is_dfe")))}" '
+            f'data-trend="{_esc(r.get("trend") or "")}" '
             f'data-head="{hi}">'
             f'<td class="tk">{_esc((r.get("sponsor_name") or "")[:38])}</td>'
             f'<td class="note">{_esc(r.get("state") or "")}</td>'
@@ -806,6 +913,8 @@ def private_html(rows: list[dict[str, Any]], stats: dict[str, Any]) -> str:
             f'{_esc(r.get("naics") or "-")}</td>'
             f'<td class="num">{r.get("plans") or 0}</td>'
             f'<td class="num">{head}</td>'
+            f'<td class="spark-cell">{series_bars(r)}</td>'
+            f'<td class="trend">{trend_html(r)}</td>'
             f'<td class="note">{"".join(marks)}</td></tr>'
         )
 
@@ -825,7 +934,17 @@ def private_html(rows: list[dict[str, Any]], stats: dict[str, Any]) -> str:
         {_esc(note)}</p>
       <p class="note">Headcount is a <strong>range</strong>: a sponsor with
         several plans counts the same people in each, so the largest single
-        plan is a floor and the sum across plans a ceiling.</p>
+        plan is a floor and the sum across plans a ceiling. The figure shown
+        is <strong>total participants</strong> &mdash; which counts retirees
+        and separated ex-employees still holding a balance, and runs about
+        a quarter above the active count. The trend uses active participants
+        instead, so the two columns are deliberately not the same measure.</p>
+      <p class="note">The trend is measured <strong>only between plan years
+        the sponsor actually filed</strong>, and only complete ones. A sponsor
+        missing from a later year reads as <em>lapsed</em> or <em>pending</em>
+        &mdash; never as a fall to zero. Filings lag the plan year by about
+        eighteen months, so the newest year is thin for everyone and an
+        absence there means nothing at all.</p>
       <div class="filters">{chips}
         <button class="f" data-f="dfeonly">DFE only</button>
         <button class="f reset" data-f="pvreset">all</button>
@@ -834,7 +953,116 @@ def private_html(rows: list[dict[str, Any]], stats: dict[str, Any]) -> str:
         <thead><tr><th data-s="t">sponsor</th><th>state</th>
           <th data-s="t">naics</th><th data-s="n" class="num">plans</th>
           <th data-s="n" class="num">participants</th>
+          <th>3y</th><th data-s="t">trend</th>
           <th>flags</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>"""
+
+
+#: How a nonprofit flag reads, and how strong its evidence is. Never a
+#: silent exclusion: the panel says how many were set aside and on what.
+_NP_MARK: Final[dict[str, tuple[str, str]]] = {
+    "plan_type": ("NP", "sponsors a 403(b) -- only a 501(c)(3) or a public "
+                        "school may, so this one is structural"),
+    "both": ("NP", "sponsors a 403(b) and sits in a nonprofit-dense NAICS"),
+    "naics": ("NP?", "in a nonprofit-dense NAICS. A guess -- this tier also "
+                     "catches for-profit hospitals and trade schools"),
+}
+
+
+def _nonprofit_mark(row: dict[str, Any]) -> str:
+    basis = row.get("nonprofit_basis")
+    if not basis or basis not in _NP_MARK:
+        return ""
+    label, why = _NP_MARK[basis]
+    return f'<span class="mk fund" title="{_esc(why)}">{label}</span>'
+
+
+def mature_html(rows: list[dict[str, Any]], stats: dict[str, Any]) -> str:
+    """Old private employers whose headcount has stopped growing.
+
+    **Every column here is a bound and the panel says which direction it is
+    wrong in.** Age is the effective date of the oldest plan the sponsor still
+    files, so a 1971 company that started its 401(k) in 1985 reads as 1985:
+    the screen can only ever understate age, which hides targets rather than
+    inventing them. Headcount is a range for the same reason it is in the
+    panel above. And a sponsor's absence from a later plan year is never
+    counted as a decline -- lapsed sponsors are excluded outright, because
+    "stopped filing" and "shrinking" are different facts and only one of them
+    is what this list is for.
+
+    Ordered by the age floor, oldest first -- the one input whose direction
+    is not a judgement call. There is deliberately no composite score: the
+    first version had one, every candidate in the top forty scored between
+    0.992 and 0.999 because all three components saturated, and what looked
+    like a ranking was a sort by headcount with three decimal places on it.
+    """
+    if not rows:
+        return ('<p class="empty">No mature-target candidates. Build the '
+                "series first: <code>mr form5500 --year 2022</code> (and "
+                "2023, 2024), then <code>mr targets</code>.</p>")
+
+    body = []
+    for r in rows:
+        # Active participants, matching what the screen filtered and ordered
+        # on. Showing the total here instead put 474 in a column whose band
+        # is 20 to 1,000 and whose CLI row said 96 -- the same sponsor, two
+        # different measures, no label saying so.
+        lo = int(r.get("active_last") or 0)
+        hi = int(r.get("active_sum") or 0)
+        head = f"{lo:,}" if lo == hi else f"{lo:,}&ndash;{hi:,}"
+        age = r.get("age_years")
+        eff = r.get("oldest_plan_eff")
+        body.append(
+            f'<tr class="mtg" data-naics="{_esc(r.get("naics") or "")}" '
+            f'data-state="{_esc(r.get("state") or "")}" '
+            f'data-trend="{_esc(r.get("trend") or "")}">'
+            f'<td class="tk">{_esc((r.get("sponsor_name") or "")[:38])}</td>'
+            f'<td class="note">{_esc(r.get("state") or "")}</td>'
+            f'<td class="note" title="{_esc(naics_label(r.get("naics")))}">'
+            f'{_esc(r.get("naics") or "-")}</td>'
+            f'<td class="num" title="the oldest plan still filed is from '
+            f'{_esc(eff)}. The company is at least this old and may be much '
+            f'older -- a plan cannot predate the firm">'
+            f'&ge;{0 if age is None else float(age):.0f}y</td>'
+            f'<td class="num">{head}</td>'
+            f'<td class="spark-cell">{series_bars(r)}</td>'
+            f'<td class="trend">{trend_html(r)}{_nonprofit_mark(r)}</td></tr>'
+        )
+
+    pop = stats.get("population") or {}
+    steps = " &rarr; ".join(
+        f'{k.replace("_", " ")} {v:,}' for k, v in pop.items()) if pop else ""
+    return f"""
+      <p class="note">Old, still filing, not growing, and matching no SEC
+        filer. <strong>{len(rows):,}</strong> candidates.
+        {f"Population: {steps}." if steps else ""}</p>
+      <p class="note"><strong>Age is a floor.</strong> It is the effective
+        date of the oldest plan the sponsor still files &mdash; a company
+        founded in 1971 whose plan started in 1985 reads as 1985. The column
+        can only understate, so it hides targets rather than inventing them,
+        and it ranks plan history rather than incorporation dates. The real
+        number needs state SoS or UCC filings, which this project has not
+        touched.</p>
+      <p class="note"><strong>Nonprofits are set aside, not deleted.</strong>
+        A college, a church or a museum clears every other filter here and
+        cannot be bought. Two tiers of evidence: sponsoring a 403(b) is
+        structural, since only a 501(c)(3) or a public school may, while a
+        nonprofit-dense NAICS code is a guess that also catches for-profit
+        hospitals and trade schools. Run
+        <code>mr targets --nonprofits only</code> to read what was set
+        aside.</p>
+      <p class="note"><strong>A lapse is not a decline.</strong> Sponsors that
+        stopped filing are excluded rather than ranked: terminated, acquired,
+        re-EIN'd and below-threshold all look identical here, and none of them
+        is the shrinking-headcount signal this list is for.</p>
+      <table class="rows" id="mature-rows">
+        <thead><tr><th data-s="t">sponsor</th><th>state</th><th data-s="t">naics</th>
+          <th data-s="n" class="num">age</th>
+          <th data-s="n" class="num" title="active participants: employees
+            still accruing, not the total, which counts retirees and
+            separated ex-employees holding a balance">active</th>
+          <th>3y</th><th data-s="t">trend</th></tr></thead>
         <tbody>{''.join(body)}</tbody>
       </table>"""
 

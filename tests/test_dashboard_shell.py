@@ -287,3 +287,63 @@ def test_each_cluster_panel_counts_only_its_own_role() -> None:
     rows = [{"role": "insider"}, {"role": "insider"}, {"role": "ten_percent"}]
     assert "2 officer/director" in shell._probe_clusters_insider(ctx(clusters=rows))[1]
     assert "1 10%-holder" in shell._probe_clusters_tenpct(ctx(clusters=rows))[1]
+
+
+# --- a live panel with no body is a bug ---------------------------------
+
+
+def test_a_live_panel_always_has_a_body() -> None:
+    """The probe and the body have independent sources, and nothing used to
+    check they agreed.
+
+    ``_probe_screens`` reads ``dataset_stats`` from Postgres while the body
+    comes from the digest, so ``mr dashboard --fast`` -- which skips the
+    digest -- produced a panel chipped **live**, carrying a confident
+    freshness line ("20,175,249 bars across 11 partitions"), with an empty
+    slot. Indistinguishable from a panel nobody wired up, which is the one
+    distinction this shell exists to draw.
+    """
+    from datetime import datetime, timezone
+
+    from marketradar.dashboard import shell
+
+    ctx = shell.Context(generated_at=datetime.now(timezone.utc), postgres=True)
+    page = shell.render(ctx)
+    offenders = []
+    for panel in shell.PANELS:
+        state, _ = panel.resolve(ctx)
+        if state != shell.LIVE:
+            continue
+        block = page.split(f'data-panel="{panel.id}"', 1)
+        if len(block) < 2:
+            offenders.append(f"{panel.id}: panel missing from the page")
+            continue
+        article = block[1].split("</article>", 1)[0]
+        if '<div class="slot"></div>' in article:
+            offenders.append(f"{panel.id}: chipped live with an empty slot")
+    assert not offenders, (
+        "Panels claiming live while rendering nothing:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nEither the probe is wrong or the body was not built. A panel "
+        "with no data must say so -- every renderer has an empty-state "
+        "message naming the command that fills it."
+    )
+
+
+def test_every_panel_body_renderer_handles_no_data() -> None:
+    """The nine empty-state messages were unreachable for months: every one
+    sat behind an ``if <data>:`` in render(), so a panel with zero rows
+    rendered byte-identical to one that did not exist."""
+    from marketradar.dashboard import panels
+
+    for fn, args in (
+        (panels.filings_html, ([],)),
+        (panels.deals_html, ([],)),
+        (panels.outcomes_html, ([],)),
+        (panels.private_html, ([], {})),
+        (panels.mature_html, ([], {})),
+        (panels.review_html, ([], {})),
+    ):
+        out = fn(*args)
+        assert 'class="empty"' in out, f"{fn.__name__} renders nothing for []"
+        assert "mr " in out, f"{fn.__name__} does not name the command to run"

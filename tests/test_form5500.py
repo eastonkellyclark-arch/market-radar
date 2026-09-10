@@ -23,12 +23,17 @@ MAIN_COLS = [
     "SPONSOR_DFE_NAME", "SPONS_DFE_DBA_NAME", "SPONS_DFE_EIN",
     "BUSINESS_CODE", "SPONS_DFE_MAIL_US_CITY", "SPONS_DFE_MAIL_US_STATE",
     "SPONS_DFE_MAIL_US_ZIP", "PLAN_NAME", "TOT_PARTCP_BOY_CNT",
-    "TYPE_DFE_PLAN_ENTITY_CD",
+    "TYPE_DFE_PLAN_ENTITY_CD", "PLAN_EFF_DATE", "SPONS_DFE_PN",
+    "TOT_ACT_PARTCP_BOY_CNT", "TYPE_PLAN_ENTITY_CD",
+    "TYPE_PENSION_BNFT_CODE",
 ]
 SF_COLS = [
     "SF_SPONSOR_NAME", "SF_SPONSOR_DFE_DBA_NAME", "SF_SPONS_EIN",
     "SF_BUSINESS_CODE", "SF_SPONS_US_CITY", "SF_SPONS_US_STATE",
     "SF_SPONS_US_ZIP", "SF_PLAN_NAME", "SF_TOT_PARTCP_BOY_CNT",
+    "SF_PLAN_EFF_DATE", "SF_PLAN_NUM",
+    "SF_TOT_ACT_PARTCP_BOY_CNT", "SF_PLAN_ENTITY_CD",
+    "SF_TYPE_PENSION_BNFT_CODE",
 ]
 
 
@@ -51,23 +56,36 @@ def make_zip(tmp: Path, kind: str, year: int, rows: list[dict]) -> f5.Archive:
     return f5.Archive(kind=kind, year=year, path=zip_path)
 
 
-def main_row(name, ein, naics="541110", participants="50", dfe="", **kw):
+def main_row(name, ein, naics="541110", participants="50", dfe="",
+             eff="1998-07-01", pn="001", active=None, entity="2",
+             pension="2E2J2K", **kw):
+    # Active defaults to the total: most tests are about something other than
+    # the retiree overhang, and the ones that are about it say so.
     row = {
         "SPONSOR_DFE_NAME": name, "SPONS_DFE_EIN": ein,
         "BUSINESS_CODE": naics, "SPONS_DFE_MAIL_US_STATE": "TX",
         "TOT_PARTCP_BOY_CNT": participants,
         "TYPE_DFE_PLAN_ENTITY_CD": dfe, "PLAN_NAME": f"{name} 401(K)",
+        "PLAN_EFF_DATE": eff, "SPONS_DFE_PN": pn,
+        "TOT_ACT_PARTCP_BOY_CNT": participants if active is None else active,
+        "TYPE_PLAN_ENTITY_CD": entity, "TYPE_PENSION_BNFT_CODE": pension,
     }
     row.update(kw)
     return row
 
 
-def sf_row(name, ein, naics="621111", participants="12", **kw):
+def sf_row(name, ein, naics="621111", participants="12",
+           eff="2011-01-01", pn="001", active=None, entity="2",
+           pension="2E2J2K", **kw):
     row = {
         "SF_SPONSOR_NAME": name, "SF_SPONS_EIN": ein,
         "SF_BUSINESS_CODE": naics, "SF_SPONS_US_STATE": "OH",
         "SF_TOT_PARTCP_BOY_CNT": participants,
-        "SF_PLAN_NAME": f"{name} SIMPLE",
+        "SF_PLAN_NAME": f"{name} SIMPLE", "SF_PLAN_EFF_DATE": eff,
+        "SF_PLAN_NUM": pn,
+        "SF_TOT_ACT_PARTCP_BOY_CNT": participants if active is None else active,
+        "SF_PLAN_ENTITY_CD": entity,
+        "SF_TYPE_PENSION_BNFT_CODE": pension,
     }
     row.update(kw)
     return row
@@ -145,10 +163,10 @@ def test_a_placeholder_ein_is_not_an_ein(con, tmp_path) -> None:
 
 def test_sponsors_are_one_row_per_ein_not_per_plan(con, tmp_path) -> None:
     """A company with a 401(k) and a cafeteria plan files twice and is one
-    company."""
+    company. Two plans, so two plan numbers -- DOL's own key for a plan."""
     archives = [make_zip(tmp_path, "main", 2024, [
-        main_row("ACME INC", "123456789", participants="40"),
-        main_row("ACME INC", "123456789", participants="25"),
+        main_row("ACME INC", "123456789", participants="40", pn="001"),
+        main_row("ACME INC", "123456789", participants="25", pn="501"),
     ])]
     f5.load_filings(con, archives, tmp_path / "work")
     assert f5.build_sponsors(con) == 1
@@ -158,6 +176,37 @@ def test_sponsors_are_one_row_per_ein_not_per_plan(con, tmp_path) -> None:
     # The sum double-counts the same people, so it is an upper bound and the
     # max a lower one. Both are carried; neither is "the headcount".
     assert row == (2, 65, 40)
+
+
+def test_two_filings_of_one_plan_are_one_plan(con, tmp_path) -> None:
+    """An amended filing repeats the plan. Counting both inflates the
+    sponsor's headcount by a whole plan and inflates its plan count too."""
+    archives = [make_zip(tmp_path, "main", 2024, [
+        main_row("ACME INC", "123456789", participants="40", pn="001"),
+        main_row("ACME INC", "123456789", participants="42", pn="001"),
+    ])]
+    f5.load_filings(con, archives, tmp_path / "work")
+    f5.build_sponsors(con)
+    row = con.execute(
+        "select plans, participants_sum, participants_max from f5500_sponsors"
+    ).fetchone()
+    assert row == (1, 42, 42), "the amendment is the same plan, not a second one"
+
+
+def test_a_plan_with_no_number_is_still_one_plan(con, tmp_path) -> None:
+    """The number is missing on a small number of filings. Falling back to
+    the plan name keeps them as separate plans rather than collapsing every
+    unnumbered plan a sponsor has into one."""
+    archives = [make_zip(tmp_path, "main", 2024, [
+        main_row("ACME INC", "123456789", participants="40", pn="",
+                 PLAN_NAME="ACME 401K"),
+        main_row("ACME INC", "123456789", participants="25", pn="",
+                 PLAN_NAME="ACME CAFETERIA"),
+    ])]
+    f5.load_filings(con, archives, tmp_path / "work")
+    f5.build_sponsors(con)
+    assert con.execute(
+        "select plans from f5500_sponsors").fetchone()[0] == 2
 
 
 # --- resolution ---------------------------------------------------------
@@ -355,3 +404,31 @@ def test_two_loads_of_the_same_input_agree_exactly(tmp_path) -> None:
     assert seen[0] == seen[1] == seen[2], (
         "the same input produced different output across runs"
     )
+
+
+def test_the_two_forms_do_not_share_an_entity_vocabulary(con, tmp_path) -> None:
+    """``SF_PLAN_ENTITY_CD`` looks like ``TYPE_PLAN_ENTITY_CD`` and is not.
+
+    On the main form 1 means multiemployer; on the short form it means
+    single-employer and covers 795,824 of 798,006 filings for 2024. Reading
+    both with one mapping marked the entire private population as union
+    trusts and removed 800,287 sponsors from the mature-target screen -- and
+    it read as a working filter, because the survivors were plausible and the
+    only visible symptom was a smaller number.
+
+    So the short form contributes no entity code at all, the same way it
+    contributes no DFE code.
+    """
+    archives = [
+        make_zip(tmp_path, "main", 2024,
+                 [main_row("UNION TRUST BOARD", "111111111", entity="1")]),
+        make_zip(tmp_path, "short", 2024,
+                 [sf_row("SMALL DENTAL PRACTICE", "222222222", entity="1")]),
+    ]
+    f5.load_filings(con, archives, tmp_path / "work")
+    f5.build_sponsors(con)
+    got = dict(con.execute(
+        "select sponsor_name, is_multiemployer from f5500_sponsors").fetchall())
+    assert got["UNION TRUST BOARD"] is True
+    assert got["SMALL DENTAL PRACTICE"] is False, (
+        "the short form's code 1 is single-employer, not multiemployer")

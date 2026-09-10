@@ -16,6 +16,7 @@ import sys
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from typing import Final
 
 from marketradar import __version__
 
@@ -166,6 +167,39 @@ def build_parser() -> argparse.ArgumentParser:
                         help="NAICS codes to print (0 to skip)")
     p_5500.add_argument("--no-load", action="store_true",
                         help="report only; write no parquet and no queue rows")
+
+    p_targets = sub.add_parser(
+        "targets",
+        help="old private employers whose headcount stopped growing",
+    )
+    p_targets.add_argument("--years", type=int, nargs="+", metavar="YYYY",
+                           help="plan years to build the series from "
+                                "(default: every published parquet found)")
+    p_targets.add_argument("--out", default=".cache/form5500", metavar="DIR",
+                           help="where the sponsor parquets live")
+    p_targets.add_argument("--min-age", type=int, default=None, metavar="Y",
+                           help="minimum years since the oldest plan still "
+                                "filed -- a floor on entity age, never the age")
+    p_targets.add_argument("--min-participants", type=int, default=None,
+                           metavar="N", help="headcount floor, read against "
+                                             "the largest single plan")
+    p_targets.add_argument("--max-participants", type=int, default=None,
+                           metavar="N", help="headcount ceiling")
+    p_targets.add_argument("--state", metavar="XX",
+                           help="only this state")
+    p_targets.add_argument("--naics", metavar="CODE",
+                           help="only NAICS codes starting with this")
+    p_targets.add_argument("--nonprofits", default="exclude",
+                           choices=("exclude", "only", "include"),
+                           help="colleges, churches and museums fit every "
+                                "other filter and cannot be bought. "
+                                "'only' shows what is being set aside")
+    p_targets.add_argument("--sort", default="age",
+                           choices=("age", "decline", "size", "smallest"),
+                           help="order the list (default age: the only input "
+                                "whose direction is not a judgement call)")
+    p_targets.add_argument("--top", type=int, default=40, metavar="N",
+                           help="rows to print (default 40)")
 
     p_audit = sub.add_parser(
         "actions-audit",
@@ -475,7 +509,31 @@ def _cmd_sec_tickers(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _private_rows(limit: int = 400):
+def _series_con(out_dir: str = ".cache/form5500"):
+    """One DuckDB holding the multi-year participant series, or None.
+
+    Built once and shared by both Form 5500 panels. Two separate builds would
+    each stack every published year -- 858,480 sponsors a year -- to answer
+    questions about a few hundred rows, and would be free to disagree with
+    each other about who is lapsed.
+
+    Returns ``(con, TrendBuild)``, or ``(None, None)`` when fewer than two
+    plan years are published: one year is a valid state and a trend needs
+    two, so the panels degrade to no trend rather than refusing to draw.
+    """
+    import duckdb as _dd
+
+    from marketradar.sources import form5500
+
+    paths = _sponsor_parquets(out_dir)
+    if len(paths) < 2:
+        return None, None
+    con = _dd.connect()
+    form5500.build_history(con, paths)
+    return con, form5500.build_trend(con)
+
+
+def _private_rows(limit: int = 400, series=None):
     """Top private sponsors by headcount, plus the plan year's shape.
 
     Read from the parquet rather than Postgres: 858,480 sponsors is a data
@@ -493,26 +551,87 @@ def _private_rows(limit: int = 400):
     d = _dd.connect()
     d.register("spons", d.read_parquet(newest.as_posix()))
     stats = d.execute("""
-        select any_value(plan_year), count(*),
+        select min(plan_year), count(*),
                count(*) filter (where not by_ein and not name_matched),
                count(*) filter (where is_dfe),
                count(*) filter (where by_ein_listed),
                count(*) filter (where not by_ein and name_matched)
         from spons
     """).fetchone()
-    cols = ("sponsor_name", "state", "naics", "plans",
+    # ein is selected so the trend can be joined on row by row. Running a
+    # second query and zipping the two results would re-order ties
+    # independently -- the same class of defect as picking a name with
+    # any_value(), and just as invisible. `ein` also breaks the tie, so the
+    # order is a rule rather than whatever the scan produced.
+    cols = ("ein", "sponsor_name", "state", "naics", "plans",
             "participants_sum", "participants_max", "is_dfe")
     rows = d.execute(f"""
         select {', '.join(cols)} from spons
         where not by_ein
-        order by participants_max desc, plans desc limit {int(limit)}
+        order by participants_max desc, plans desc, ein limit {int(limit)}
     """).fetchall()
+    out = [dict(zip(cols, r)) for r in rows]
+
+    # The trend is a separate build over several plan years, and the panel
+    # renders fine without it: one published year is a valid state, and a
+    # panel that refused to draw until three existed would be worse than one
+    # whose trend column says "one year".
+    if series is not None:
+        for row in out:
+            row.update(_trend_for(series, row["ein"]))
     return (
-        [dict(zip(cols, r)) for r in rows],
+        out,
         {"plan_year": stats[0], "sponsors": stats[1], "private": stats[2],
          "dfe": stats[3], "listed": stats[4], "ambiguous": stats[5],
          "completeness": f"Source file {newest.name}."},
     )
+
+
+#: What the panels read out of the trend table. Named once so the private
+#: panel and the mature-target panel cannot render different columns.
+_TREND_COLS: Final[tuple[str, ...]] = (
+    "trend", "status", "pct_change", "first_year", "last_year",
+    "years_filed", "pending_years", "gap_years", "series",
+    "common_plans", "plans_added", "plans_dropped",
+    "matched_first", "matched_last",
+)
+
+
+def _trend_for(con, ein: str) -> dict:
+    """One sponsor's series. Queried per row rather than pulled as a dict.
+
+    The panel shows a few hundred sponsors out of 858,480, so materialising
+    the whole table to look up the ones on screen is the wrong way round.
+    """
+    row = con.execute(
+        f"select {', '.join(_TREND_COLS)} from f5500_trend where ein = ?",
+        [ein],
+    ).fetchone()
+    return dict(zip(_TREND_COLS, row)) if row else {}
+
+
+def _mature_rows(limit: int = 200, series=None, built=None):
+    """Mature-target candidates, plus the population each filter left."""
+    from marketradar.screens import mature_target
+
+    if series is None:
+        return [], {"years": tuple(sorted(_sponsor_parquets(".cache/form5500")))}
+
+    targets = mature_target.candidates(series, limit=limit)
+    rows = []
+    for t in targets:
+        row = {k: getattr(t, k) for k in (
+            "ein", "sponsor_name", "naics", "city", "state", "oldest_plan_eff",
+            "age_years", "participants_last", "participants_sum", "trend",
+            "pct_change", "first_year", "last_year", "years_filed",
+            "active_last", "active_sum", "is_multiemployer")}
+        row.update(_trend_for(series, t.ein))
+        rows.append(row)
+    return rows, {
+        "years": built.complete_years if built else (),
+        "candidates": len(targets),
+        "population": mature_target.population(series),
+    }
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
@@ -557,10 +676,23 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         except Exception as exc:
             ctx.notes.append(f"Ticker detail unavailable: {str(exc)[:140]}")
 
-    private, private_stats = _private_rows()
+    # One build, both panels. A panel that cannot be drawn says so in the
+    # shell rather than taking the whole page down with it.
+    series = built = None
+    try:
+        series, built = _series_con()
+    except Exception as exc:
+        ctx.notes.append(f"Participant series unavailable: {str(exc)[:140]}")
+    private, private_stats = _private_rows(series=series)
+    try:
+        mature, mature_stats = _mature_rows(series=series, built=built)
+    except Exception as exc:
+        mature, mature_stats = [], {}
+        ctx.notes.append(f"Mature targets unavailable: {str(exc)[:140]}")
     target = shell.write(args.out, ctx=ctx, digest=digest,
                          details=details, private=private,
-                         private_stats=private_stats)
+                         private_stats=private_stats,
+                         mature=mature, mature_stats=mature_stats)
     counts = shell.summary(ctx)
 
     print(f"wrote {target}")
@@ -755,6 +887,121 @@ def _cmd_form5500(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _sponsor_parquets(out_dir, years=None) -> dict:
+    """Published sponsor files on disk, keyed by plan year.
+
+    Reads whatever has been published rather than requiring a fixed set:
+    the series is built from the years that exist, and
+    :func:`form5500.build_trend` refuses outright if none of them is complete.
+    """
+    from pathlib import Path as _PP
+
+    found = {}
+    for path in sorted(_PP(out_dir).glob("form5500_sponsors_*.parquet")):
+        try:
+            year = int(path.stem.rsplit("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if years and year not in years:
+            continue
+        found[year] = path
+    return found
+
+
+def _cmd_targets(args: argparse.Namespace) -> int:
+    """Rank mature private employers from the multi-year participant series.
+
+    Age is a floor and headcount is a range, so every line prints both the
+    bound and its direction. The one thing this must never do is read a
+    sponsor's absence from a later plan year as a headcount decline; that
+    distinction lives in build_trend and the screen only consumes it.
+    """
+    import duckdb as _ddb
+
+    from marketradar.screens import mature_target
+    from marketradar.sources import form5500
+
+    paths = _sponsor_parquets(args.out, args.years)
+    if not paths:
+        print(f"No sponsor parquets in {args.out}. Run `mr form5500 --year "
+              "2024` (and 2023, 2022) first.", file=sys.stderr)
+        return EXIT_ERROR
+
+    con = _ddb.connect()
+    rows = form5500.build_history(con, paths)
+    print(f"{rows:,} sponsor-years from {len(paths)} plan years")
+    for shape in form5500.series_shape(con):
+        mark = " " if shape.complete else "*"
+        print(f"  {mark}{shape.plan_year}  {shape.sponsors:>9,} sponsors  "
+              f"{shape.note}")
+    built = form5500.build_trend(con)
+    print(f"\n{built}")
+
+    counts = dict(con.execute(
+        "select trend, count(*) from f5500_trend group by 1 order by 2 desc"
+    ).fetchall())
+    status = dict(con.execute(
+        "select status, count(*) from f5500_trend group by 1 order by 2 desc"
+    ).fetchall())
+    print("  trend :", ", ".join(f"{k} {v:,}" for k, v in counts.items()))
+    print("  status:", ", ".join(f"{k} {v:,}" for k, v in status.items()))
+    print("  a lapsed sponsor is a question, never a decline")
+
+    kw = {}
+    if args.min_age is not None:
+        kw["min_age_years"] = args.min_age
+    if args.min_participants is not None:
+        kw["min_participants"] = args.min_participants
+    if args.max_participants is not None:
+        kw["max_participants"] = args.max_participants
+
+    pop = mature_target.population(con)
+    print("\npopulation, filter by filter:")
+    for label, n in pop.items():
+        print(f"  {label:<16} {n:>9,}")
+
+    kw["sort"] = args.sort
+    kw["nonprofits"] = args.nonprofits
+    targets = mature_target.candidates(con, **kw)
+    if args.state:
+        targets = [t for t in targets if (t.state or "") == args.state.upper()]
+    if args.naics:
+        targets = [t for t in targets
+                   if (t.naics or "").startswith(args.naics)]
+
+    if targets:
+        # The concentration is what says whether the pool is the right
+        # population at all. Sorted by age the head of the list is old
+        # institutions, which is the sort working rather than the screen
+        # failing -- colleges are 2.9% of the pool, and the bulk is physician
+        # offices, law firms, dealerships, machine shops and small banks.
+        from collections import Counter as _Counter
+
+        mix = _Counter((t.naics or "??") for t in targets)
+        print("\ncandidates by NAICS:")
+        for code, n in mix.most_common(10):
+            print(f"  {code}  {n:>6,}  {n / len(targets):>5.1%}")
+
+    print(f"\n{len(targets):,} candidates"
+          + (f", showing {min(args.top, len(targets))}" if targets else ""))
+    for t in targets[:args.top]:
+        print(f"  {t.sponsor_name[:40]:<40} "
+              f"{(t.state or '--'):<3} {(t.naics or '------'):<6} "
+              f"{t.headcount_note:>13}  {t.age_note}")
+        print(f"         {t.trend:<10} "
+              f"{'' if t.pct_change is None else f'{t.pct_change:+.1%}'} "
+              f"over {t.first_year}-{t.last_year} "
+              f"({t.years_filed} years filed)")
+
+    if targets:
+        summary = mature_target.summarise(targets)
+        print(f"\n  median age floor {summary['median_age']:.0f}y, oldest "
+              f"plan {summary['oldest']}")
+        print("  age is a floor: the company is at least this old, and the "
+              "plan can only be younger than the firm")
+    return EXIT_OK
+
+
 def _cmd_actions_audit(args: argparse.Namespace) -> int:
     """Moves the action table cannot account for.
 
@@ -791,6 +1038,10 @@ def _cmd_actions_audit(args: argparse.Namespace) -> int:
     con.execute("create table audit_rows as select * from audit_rel")
     rows = con.execute("select * from audit_rows").fetchall()
 
+    for line in action_audit.funnel(con, prices,
+                                    con.table("audit_rows")).lines():
+        print(line)
+    print()
     stats = action_audit.summarize(con, con.table("audit_rows"))
     print()
     print(action_audit.health_line(stats))
@@ -842,6 +1093,9 @@ def _cmd_outcomes(args: argparse.Namespace) -> int:
         con.execute("drop table if exists scored")
         con.execute("create table scored as select * from res_in")
         scored = con.table("scored")
+        for line in outcomes.funnel(con, events, scored).lines():
+            print(line)
+        print()
         cov = outcomes.coverage(con, events, scored)
 
         print()
@@ -1152,6 +1406,12 @@ def _cmd_screens(args: argparse.Namespace) -> int:
         print(f"{result.moves_screened:,} moves screened, "
               f"{result.floor_excluded:,} below the ${result.sanity_floor} floor")
         print()
+    # The funnel first, always -- before any list. A short list is either
+    # selective or broken, and these counts are what tells you which.
+    for line in volatility.funnel(result).lines():
+        print(line)
+    print()
+    if args.summary:
         for line in volatility.summary(result.lists):
             print(line)
         return EXIT_OK
@@ -1279,6 +1539,14 @@ def main(argv: list[str] | None = None) -> int:
 
             label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
             print(f"mr form5500: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "targets":
+        load_dotenv()
+        try:
+            return _cmd_targets(args)
+        except Exception as exc:
+            print(f"mr targets: error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "actions-audit":

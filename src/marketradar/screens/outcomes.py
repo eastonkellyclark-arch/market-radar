@@ -19,6 +19,18 @@ anchoring on the prior close captures the reaction either way. Horizon ``h``
 is therefore ``h`` sessions after that anchor, and ``h=1`` is the filing
 session itself -- the announcement-day move.
 
+**The survivorship bias runs in the same direction as the answer, and that
+is the thing to hold on to.** The price universe is current listings only
+(see CLAUDE.md), so a target that was acquired has no +30-session close and
+drops out of the study. But dropping out is not random with respect to the
+outcome: *completing* the deal is what delists a company, while a deal that
+collapses leaves the target trading and in the sample. So the events that
+survive to be measured are disproportionately the ones that failed -- and
+failed deals are exactly the ones whose prices give back the announcement
+pop. A negative excess return here is therefore partly a measurement of who
+is left rather than of what deals do, and the correction, whatever its size,
+goes **up**. Never quote a number from this module without that beside it.
+
 **A raw forward return means nothing on its own.** A +4% 30-session return
 during a +4% market is zero information, and this system's whole population
 of events is concentrated in whatever the market happened to be doing. So
@@ -49,6 +61,16 @@ log = logging.getLogger(__name__)
 
 #: Sessions after the pre-event close. ``1`` is the event session itself.
 DEFAULT_HORIZONS: Final[tuple[int, ...]] = (1, 5, 30)
+
+#: The survivorship caveat, in one sentence, so the CLI, the panel and the
+#: spec cannot drift apart on it. Anything that renders an excess return
+#: renders this next to it.
+SURVIVOR_CAVEAT: Final[str] = (
+    "Survivor-biased downward: a completed deal delists the target and "
+    "leaves the sample, a collapsed one keeps trading and stays. What is "
+    "left is weighted toward deals that failed, so the true figure is "
+    "higher than this by an unknown amount."
+)
 
 #: Sessions before the anchor, reported alongside. A signal that only shows
 #: up after the move already happened is a different thing from one that
@@ -322,6 +344,40 @@ def coverage(
     return {"events": total, "priced": priced, "per_horizon": per}
 
 
+def funnel(
+    con: duckdb.DuckDBPyConnection,
+    events: duckdb.DuckDBPyRelation,
+    results: duckdb.DuckDBPyRelation,
+    horizons: Sequence[int] = DEFAULT_HORIZONS,
+) -> Any:
+    """The event population, stage by stage.
+
+    The drops here are structural rather than buggy -- a delisted target has
+    no +30-session close -- but they are *correlated with the outcome*, which
+    makes them the most dangerous kind of quiet loss in this codebase: the
+    survivors are systematically the deals that did not complete. The counts
+    were already computed by :func:`coverage`; this puts them in the order
+    they happen so a stage that lost everything is visible.
+
+    See :mod:`marketradar.screens.funnel`.
+    """
+    from marketradar.screens import funnel as funnel_mod
+
+    cov = coverage(con, events, results, horizons)
+    stages = [
+        ("events", cov["events"], "filings with a date and a ticker"),
+        ("priced at all", cov["priced"],
+         "we hold bars around the event date"),
+    ]
+    for h in horizons:
+        stages.append((
+            f"scored at +{h}", cov["per_horizon"].get(int(h), 0),
+            "survivor-only: an acquired target has no forward close"
+            if h == max(horizons) else "",
+        ))
+    return funnel_mod.build("outcomes", *stages)
+
+
 @dataclass(frozen=True, slots=True)
 class Summary:
     """One horizon's distribution, for one slice of the population."""
@@ -401,9 +457,17 @@ def summarize(
 
 
 def render(summaries: Iterable[Summary], title: str) -> str:
-    """Plain text, ASCII only -- the console here is cp1252."""
+    """Plain text, ASCII only -- the console here is cp1252.
+
+    The survivorship caveat prints with the numbers rather than living in a
+    docstring, because the bias runs in the same direction as the figure: a
+    reader who sees only the excess return reads a measurement of who is
+    still listed as a fact about what deals do.
+    """
     lines = [title, "-" * len(title)]
     lines.extend(s.line() for s in summaries)
+    lines.append("")
+    lines.append(f"  {SURVIVOR_CAVEAT}")
     return "\n".join(lines)
 
 

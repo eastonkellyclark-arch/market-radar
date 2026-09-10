@@ -566,8 +566,25 @@ what they say.
   against a benchmark. Pure SQL, no LLM, so it precedes the expensive
   machinery rather than justifying it afterwards. Anchor on the date the
   event became *public* (a Form 4 is filed two business days after the
-  trade), and read the survivorship note in CLAUDE.md before believing any
-  number it produces.
+  trade).
+
+  **Every excess return this produces is biased downward, and the bias runs
+  in the same direction as the number.** The price universe is current
+  listings only, so a target that was acquired has no +30-session close and
+  drops out of the study — but that drop is *not random with respect to the
+  outcome*. Completing the deal is precisely what delists the company, while
+  a deal that collapses leaves the target trading and in the sample. So the
+  events that survive to be measured are weighted toward the ones that
+  failed, and failed deals are exactly the population that gives back the
+  announcement pop.
+
+  A negative excess return here is therefore partly a measurement of who is
+  left, not of what deals do. The correction goes **up**, by an unknown
+  amount — unknown because closing it needs a point-in-time universe, which
+  is a data purchase rather than a query. The funnel's `priced` count shows
+  how much of the population was lost; it does not show which way. This
+  paragraph is why the caveat renders next to the figure in `U12` and in the
+  CLI rather than living in a docstring.
 - `sources/sec_suspensions.py`
 - ~~`sources/gdelt.py` and `sources/finnhub_news.py`~~ — **declined 2026-09-10 after measurement.** See "News: measured, declined" below.
 
@@ -692,26 +709,189 @@ public-match path**.
   plan year: 2026 does not exist yet and 2025 is a third the size of 2024
   (10 MB against 28 MB) because it is still being filed. 2024 is the newest
   complete year. A count that is small because the year is young must say so.
-- Participant-count time series and YoY deltas
-- `sources/usaspending.py` — contract awards
-- `screens/mature_target.py` — v1
+- **Participant-count time series and YoY deltas.** Built across plan years
+  from the published sponsor parquets, not by re-parsing the archives: the
+  EIN resolution and the DFE flag already live in those files, and a series
+  that disagreed with the private-company panel about who is private would
+  be worse than no series.
+
+  **"Participants fell" and "stopped filing" are different columns, and that
+  is the whole design.** A sponsor missing from a later plan year may have
+  terminated the plan, been acquired, changed EIN, dropped below the filing
+  threshold, or -- overwhelmingly, in the newest year -- simply not filed
+  yet. Filings lag the plan year by about eighteen months, so 2025 held a
+  third of 2024's filings while it was still being filed; treating an
+  absence as a zero would manufacture a cliff for most of the file, and a
+  screen looking for shrinking headcount would sort exactly those to the
+  top. So `f5500_trend` carries:
+
+  | column | says |
+  |---|---|
+  | `status` | `filing` or `lapsed` — presence, never a direction |
+  | `trend` | `growing`/`flat`/`declining`/`unknown`, measured **only between plan years the sponsor filed, and only complete ones** |
+  | `pending_years` | absences in a year still being filed. No information |
+  | `gap_years` | complete years skipped between two that were filed. A real oddity |
+
+  `unknown` is a real answer and the most common one: a sponsor with a single
+  filed year has no trend, and inventing one out of an absence is the bug.
+
+  **The same problem exists one level down, at the plan, and the first build
+  shipped with it.** A sponsor's *set* of filed plans is not stable between
+  years — plans open, merge, terminate, or get filed late — so comparing
+  everything it filed in 2022 against everything it filed in 2024 compares
+  two different things and calls the difference headcount. Edward Don &
+  Company filed two plans for 2022 and one for 2024 and read as −46%; The
+  Juilliard School's largest single plan went 1,473 → 500 → 981 while its
+  total barely moved, because with six plans *which* one is largest keeps
+  changing. So the trend compares only the plans present at **both** ends,
+  keyed on `(ein, plan_num)` — DOL's own identifier for a plan — and
+  `plans_added`/`plans_dropped` report the rest as counts.
+
+  **And the obvious participant column is not headcount.** Measured
+  2026-09-10: `TOT_PARTCP_BOY_CNT` counts retirees and separated
+  ex-employees who still hold a balance. Active is 78% of total on the main
+  form and 82% on the short form, and for an old institution far less —
+  Boca Raton Regional Hospital reports 934 participants and 388 active, J M
+  Smith 890 and 362. A trend on the total measures a pension plan paying
+  people out, which is what an old employer does whether or not it is
+  shrinking; the first version of the mature-target screen ranked on it and
+  returned a list of hospitals, universities and charities. The series runs
+  on `TOT_ACT_PARTCP_BOY_CNT` (95.2% of main filings, 99.9% of short), and a
+  plan that does not report it is left out of the comparison rather than
+  counted as zero.
+
+- **Entity age, as a floor.** `PLAN_EFF_DATE` gives the effective date of the
+  oldest plan a sponsor still files. That bounds how long the company has
+  existed and is never its age: a firm founded in 1971 whose 401(k) started
+  in 1985 reads as 1985, and one that terminated its original plan and
+  opened a new one in 2019 reads as 2019. The error only ever runs one way —
+  it *understates* age, hiding targets rather than inventing them — which is
+  what makes it usable as a screen input and unusable as a fact. Both ends of
+  the column are bounded because both hold typos: it runs 1876-11-11 to
+  2027-08-01 in the 2024 file, a century before ERISA at one end and in the
+  future at the other.
+
+  The real number needs state SoS or UCC filings. That is bulk state data
+  this project has not touched, and it is deliberately not a blocker: the
+  floor is the proxy until then.
+
+- `screens/mature_target.py` — v1. Old, sized, still filing, not growing, and
+  matching no SEC filer. Four filters, each dropping a population for a
+  stated reason, with `population()` reporting what each one removed — a
+  short list is either selective or broken, and the funnel is the difference.
+  `score` is a documented sort key over three visible components, not a
+  probability.
+- `sources/usaspending.py` — contract awards. **Deferred**, and additive
+  rather than blocking: nothing above depends on it.
 
 **UI:**
 
 - `U8` private-company panel — NAICS, employee count, three-year trend, with
-  DFEs filterable as their own category
+  DFEs filterable as their own category. The trend cell renders `lapsed` and
+  `pending` as themselves rather than as a direction, and the sparkline draws
+  a year with no filing as a *gap* rather than a zero-height bar — the two
+  look identical and mean opposite things.
 - `U9` entity review queue — **the ~23,000 sponsors whose name matched an SEC
   filer while their EIN did not.** Not 800k names: the private population has
   nothing to resolve against and needs no review. A *working* surface rather
   than a readout.
+- `U15` mature targets — the screen above, with age shown as `≥N years` and
+  its direction of error stated on the panel.
 
 **Exit:** query private companies in your target NAICS by employee count and
 three-year trend, and clear a review queue without writing SQL.
 
+### The screen failure mode
+
+Five defects were found in the Form 5500 screen on 2026-09-10, **after** the
+pipeline was green: tests passing, loads idempotent, output deterministic,
+dashboard rendering. Four of the five were the same mistake, and it is worth
+naming because it is not specific to Form 5500.
+
+**The list contained something other than what the screen claimed to
+measure.**
+
+| what was in the list | what the screen claimed | why it looked fine |
+|---|---|---|
+| sponsor totals over a plan set whose membership changed year to year | headcount change | Edward Don filed 2 plans for 2022 and 1 for 2024: −46% |
+| total participants, including retirees and separated ex-employees | employees | active is 78% of total, and far less at an old employer |
+| boards of trustees for multiemployer union plans | employers | a trade in decline looks exactly like a firm in decline |
+| `1900-01-01`, a placeholder | an effective date | an *LLC* reading as 127 years old |
+
+The fifth was different in kind and worse in character: the filter fixing the
+third defect used the main form's code vocabulary against the short form,
+where the same-named column means something else, and removed 800,287
+sponsors instead of 4,502.
+
+Three properties they share, and each one is a lesson that generalises:
+
+**A green suite cannot catch this.** A test encodes what its author believed
+about the data. Every one of these defects *was* a gap in that belief, so the
+tests were written to assert the wrong thing and passed doing it. Determinism
+checks, idempotency checks and freshness assertions all held throughout —
+they verify that the pipeline does the same thing every time, not that the
+thing is the right one.
+
+**The broken version looks better than the correct one.** This is the part
+that makes the failure mode dangerous rather than merely annoying. The
+800,287-sponsor filter produced a list of old colleges and firemen's relief
+funds: plausible, coherent, nothing visibly wrong. The correct filter
+produced a messier list. A reviewer eyeballing the output would have
+preferred the broken one.
+
+**Only the population counts said otherwise.** Four of the five were caught
+by reading the output and disbelieving it, which does not scale and depends
+on knowing the domain. The fifth — the only one caught cheaply and
+immediately — was caught by a funnel line showing 922,340 → 122,053 where a
+few thousand were expected.
+
+#### So: every screen ends with a funnel
+
+The rule, and it is the exact parallel of the freshness assertion on every
+loader:
+
+> **A short list is either selective or broken, and printing the surviving
+> count at each stage is what tells you which.**
+
+`assert_fresh` refuses to let a job exit green on empty data. The funnel
+refuses to let a screen report a plausible list without saying what it
+discarded to get there. Same failure, one step later in the pipeline.
+
+`screens/funnel.py` holds the shared type. Every screen builds one —
+volatility, Form 4 clusters, action audit, outcomes, mature targets — and a
+test in `tests/` parses each module and fails the build if one does not,
+the same enforcement `assert_fresh` gets. Two things are checked rather than
+merely printed:
+
+- **`emptied`** — a stage that took a non-zero population to zero. The list
+  is not short, it is gone, and that should be said rather than inferred
+  from a blank screen.
+- **`collapsed`** — a stage that removed more than 90% of what reached it.
+  Not an error; several honest stages do this. It is where a broken filter
+  hides, so it is marked and the reader decides.
+
+Each stage carries *why* it exists alongside its count, because a number with
+no reason attached is the number nobody checks.
+
+#### And the smaller rules that fell out
+
+- **Before comparing two aggregates across time, ask what the set is made of
+  and whether the membership is the same at both ends.** Keying correctly on
+  the entity is not enough if the thing being summed underneath it drifts.
+- **Read the field definition, not the field name.** When a source offers a
+  total and a component, the total is usually a superset of what you want and
+  substituting it never errors.
+- **Two files from one publisher can use one column name for two
+  vocabularies.** Check the code distribution per file before mapping it, and
+  treat a filter that removes far more or far less than expected as a bug
+  until proven otherwise.
+- **A flag whose evidence is invisible is a silent decision.** Where a
+  category has to be set aside — DFEs, multiemployer plans, nonprofits — the
+  row carries *why*, the count is reported, and a filter can bring them back.
+
 ### Beyond
 
-- **XBRL normalization** — the real project. Budget a month. `tag_map.py`
-  maintained by hand, branch by SIC code.
+- **XBRL normalization** — the real project, scoped below.
 - **Seed backfill** — 10 years of M&A 8-Ks, ~5,000 docs (not hundreds of
   thousands, because you filter by item code before embedding). Drains on
   leftover quota over a few weeks.
@@ -723,6 +903,269 @@ three-year trend, and clear a review queue without writing SQL.
 - DCF / 3-statement engine
 - python-pptx deck generation
 - FMCSA, OSHA, EPA, state licensing, state SoS/UCC as sectors demand
+
+### XBRL normalization — scope
+
+**The next thing to build, and the one that gates the rest.** Deal multiples
+need target financials, the DCF engine needs statements, and comparable-deal
+ranking needs a size bucket. All three read normalized fundamentals, so this
+comes before any of them. The seed backfill and similarity ranking do not
+depend on it and can drain leftover quota in parallel.
+
+Budget a month of weekends. The month is not spent writing the mapping — it
+is spent discovering which mappings are needed and proving the coverage.
+
+#### Measure before designing
+
+Weekend 4's plan was wrong until it was measured, and this one is a bigger
+version of the same risk, so **task one is a measurement, not a loader**.
+Download two quarters, and answer:
+
+1. How many distinct tags carry each core concept, and what is the coverage
+   curve — do the top 5 tags cover 80% of filers, or is it a long tail?
+2. What share of filers resolve *every* core concept cleanly? That number is
+   the honest ceiling on any screen built from this.
+3. How many filers fall into the SIC classes that need separate handling,
+   and what do they report instead?
+4. How often does a filer change tags between years for the same concept?
+   That decides whether the map is keyed on tag alone or on (tag, era).
+
+The measurement decides the design and is recorded beside it, as with Form
+5500's 44.2%.
+
+#### Measured 2026-09-10 — seven quarters, 2013q1 to 2024q1
+
+Task one is done and **the measurement changes the scope**, as it did for
+Form 5500. Seven `q1` datasets a few years apart, operating companies only
+(the exclusion is question 1 below), income-statement top line discovered
+from `pre.txt` rather than assumed from a tag list.
+
+**1. A quarter of filers are not comparable at all, and it is stable.**
+Not "needs a SIC branch" — genuinely a different statement:
+
+| | 2013q1 | 2024q1 |
+|---|---|---|
+| operating company | 73.7% | 73.4% |
+| bank / credit (SIC 6000–6199) | 10.5% | 9.5% |
+| REIT (6798) | 4.3% | 4.8% |
+| real estate / holding | 5.6% | 3.8% |
+| broker / exchange | 3.2% | 3.0% |
+| insurance | 2.6% | 2.6% |
+| **not comparable** | **26.2%** | **23.7%** |
+
+These belong in **their own table**, not in the same one behind a branch. A
+bank's top line is interest income and its balance sheet does not decompose
+into the same parts; a REIT's earnings measure is FFO. Forcing them into an
+operating-company shape produces numbers that are present, plausible and
+wrong — the exact failure the Form 5500 work spent a day on. v1 covers
+operating companies and *says* it covers operating companies.
+
+**2. The revenue tag is not one tag, and how bad that is depends entirely
+on the era.** Distinct tags appearing as the income-statement top line:
+
+| | 2013 | 2016 | 2018 | 2019 | 2020 | 2022 | 2024 |
+|---|---|---|---|---|---|---|---|
+| distinct top-line tags | 419 | 389 | 341 | 251 | 210 | 195 | **133** |
+| covered by the top 5 | 71.9% | 69.6% | 70.8% | 87.0% | 91.0% | 91.2% | **93.0%** |
+
+**3. It is one cliff, not rolling churn — and this is the answer to whether
+eleven years is worth loading.** Share of filers changing their top-line tag
+between consecutive sampled years:
+
+```
+2013 -> 2016   20.0%      (three years)
+2016 -> 2018   13.8%      (two years)
+2018 -> 2019   78.2%      <-- ASC 606
+2019 -> 2020   18.2%
+2020 -> 2022   15.5%
+2022 -> 2024   11.1%      (two years)
+```
+
+The tag families make the mechanism explicit:
+
+```
+             2013    2016    2018    2019    2020    2022    2024
+SalesRevenue* 48.1%  48.0%  48.4%   2.8%   0.1%   0.1%   0.0%
+Revenues      23.1%  21.3%  21.9%  33.2%  27.9%  23.7%  24.5%
+RevenueFrom-
+Contract*      0.0%   0.0%   0.0%  49.7%  58.0%  60.7%  62.2%
+```
+
+So the map is **era-keyed with exactly one boundary**, at fiscal years
+beginning on or after 15 December 2017. Two mappings, not a rolling mess —
+which is the good version of this answer. But the two are not equal work:
+the pre-606 era has three times the distinct tags and twenty points worse
+top-5 concentration, so **the older half is most of the effort and buys the
+worse coverage.** Build post-606 first, and treat pre-2019 as a separate
+decision made on evidence rather than a given.
+
+Baseline churn of 11–20% per sampled interval is not nothing either. A map
+keyed on tag alone will rot; it needs a coverage report that runs every load,
+which is what makes `U10` a requirement rather than a nicety.
+
+**4. The ceiling on all ten concepts together is far below any one of
+them.** Operating companies, per concept:
+
+| concept | 2013q1 | 2024q1 |
+|---|---|---|
+| liabilities | 99.0% | 99.9% |
+| operating cash flow | 98.1% | 99.7% |
+| assets | 98.0% | 99.7% |
+| equity | 96.4% | 98.2% |
+| net income | 94.1% | 99.6% |
+| shares | 91.9% | 95.1% |
+| cash | 91.4% | 96.6% |
+| operating income | 82.5% | 91.3% |
+| revenue | 82.4% | 86.8% |
+| capex | 74.4% | 79.9% |
+| **all ten on one filer** | **51.6%** | **64.2%** |
+
+Individually most concepts look solved. Together they are not: requiring all
+ten halves the population in 2013 and takes a third of it in 2024. **Any
+screen demanding a complete row silently discards a third of the market** —
+and it will not look like it is discarding anything, which is the whole
+lesson from the Form 5500 work. Pick concepts per question rather than
+building one wide table and joining against it.
+
+**5. Some filers have no revenue, and that is not a mapping failure.**
+Between 4.2% (2013) and 9.6% (2022) of operating companies open their income
+statement with an *expense* line — pre-revenue biotech and mining, mostly.
+Resolving revenue for them is impossible because there is none, and a
+resolver that treats it as a missing tag will chase it forever. Absent and
+unmapped are different, exactly as lapsed and declining are.
+
+#### v1 scope — decided 2026-09-10 on the numbers above
+
+**Post-606 only. 2019 forward.** One map, 133 top-line tags, 93% top-5
+coverage. Pre-2019 is a separate decision taken once the post-606 half is
+working and its real cost is on the table, not a phase two that is assumed
+into the plan now. The measurement says the older half is three times the
+tags for twenty points less concentration; that is a case to be made later
+with the machinery built, not a commitment to make today.
+
+**Operating companies only.** Banks, insurers, brokers and REITs — 23.7% of
+2024 filers — are out. Their own table later, or never: they are not a
+valuation target here, and building a shape nobody reads is worse than not
+building it. What matters is that they are *excluded by name and counted*,
+not silently absent, so a later reader knows the table is 76% of the market
+by construction rather than by accident.
+
+**Six concepts, not ten:**
+
+| concept | 2024q1 coverage |
+|---|---|
+| liabilities | 99.9% |
+| operating cash flow | 99.7% |
+| assets | 99.7% |
+| net income | 99.6% |
+| equity | 98.2% |
+| **revenue** | **86.8%** |
+
+Five sit above 98%. Revenue is the outlier at 86.8% and is also the one that
+matters most, which is exactly why it is **not** averaged into a
+complete-row requirement: a wide table demanding all six would report the
+intersection and hide which concept did the excluding. Its misses stay
+visible as its own number.
+
+Dropped from v1: **capex** (79.9%), **shares** (95.1%), **cash** (96.6%),
+**operating income** (91.3%). Each returns when a specific question needs
+it, carrying its own coverage figure — not as a speculative column that
+quietly drags the joint coverage down for every consumer.
+
+**No wide table. Concepts resolve per question.** The measurement is the
+argument: individually these clear 98%, together all ten reach 64.2%. A
+consumer that asks for revenue and net income should pay the coverage cost of
+revenue and net income, not of ten concepts it never reads.
+
+**Absent is a value, not a gap.** 4–10% of operating companies open their
+income statement with an expense because they have no revenue. That resolves
+to a distinct state — the same distinction as `not_stated` against
+`not_parsed`, and the same one as `lapsed` against `declining` in the Form
+5500 series. A pre-revenue biotech has no revenue; a filer using an unmapped
+tag has revenue we failed to find. Collapsing the two makes the coverage
+number a lie in both directions.
+
+**Every concept carries its coverage wherever it is consumed.** A concept at
+51% and one at 99% must not look identical downstream, and by default they
+do: both are a number in a column. This is the funnel rule applied to a
+normalizer, and it is the reason `U10` ships with `tag_map.py` rather than
+after it.
+
+**The coverage report ships with the map**, because 11–20% baseline churn
+between sampled years means it degrades quietly between now and whenever it
+is next read.
+
+#### Source: Financial Statement Data Sets, not companyfacts
+
+Two SEC bulk options, and the choice is not close:
+
+| | Financial Statement Data Sets | `companyfacts.zip` |
+|---|---|---|
+| shape | quarterly zips, `sub`/`num`/`pre`/`tag` tables | one ~1 GB JSON-per-company archive |
+| values | **as filed**, per accession | as *currently* reported |
+| restatements | each filing kept separately | overwritten |
+| metadata | SIC, fiscal period, form type in `sub.txt` | thin |
+
+**Point-in-time is the whole reason.** `companyfacts` gives today's view of
+history, with restatements folded in silently — the same defect as the
+yfinance fundamentals rule in CLAUDE.md, which is already stated there and
+already cost us a rule. An analog engine that compares a 2018 deal against
+2018 fundamentals must use what was *knowable in 2018*. The Data Sets keep
+each filing, so they can answer that; `companyfacts` cannot.
+
+~44 quarterly downloads for eleven years, matching the price history. Public
+domain, so the parquet goes to **GitHub Releases**, not R2.
+
+#### The core concept set, deliberately small
+
+Ten were proposed. **Six survived the measurement** — revenue, net income,
+assets, liabilities, equity, operating cash flow — see the v1 scope below for
+why the other four were dropped and what it would take to add them back.
+
+#### Why it is a month
+
+- **Tags are not consistent.** Revenue appears as `Revenues`,
+  `RevenueFromContractWithCustomerExcludingAssessedTax`, `SalesRevenueNet`
+  and others, varying by filer and by year — ASC 606 moved the whole market
+  onto a new tag around 2018, so the map is era-sensitive as well as
+  filer-sensitive.
+- **Banks, insurers and REITs need separate handling or they silently
+  produce garbage.** A bank has no revenue line in the ordinary sense; its
+  top line is interest income and its balance sheet does not decompose the
+  same way. Branch by SIC, and treat an unbranched financial as unresolved
+  rather than as a zero.
+- **History mostly starts ~2009.** Anything earlier is not there, and a
+  study spanning the boundary needs to say so.
+- **The coverage report is the deliverable, not a side effect.** `U10` ships
+  *with* `tag_map.py` rather than after it, because a panel showing which
+  tags resolved and which fell through is the fastest way to find the next
+  branch the map needs. This is the funnel rule applied to a normalizer: a
+  concept that resolves for 12% of filers and a concept that resolves for
+  98% look identical downstream, and only the count distinguishes them.
+
+#### Order
+
+1. `sources/xbrl/fetch.py` — the quarterly zips, cached and resumable.
+2. The measurement above, recorded in this document.
+3. `sources/xbrl/tag_map.py` + a resolver that reports coverage per concept
+   as a funnel, with unresolved filers named rather than dropped.
+4. ~~SIC branches for banks, insurers and REITs~~ — **out of v1.** They are
+   a separate table if they are ever built at all; see the v1 scope below.
+5. `U10` fundamentals panel, shipping with step 3.
+
+**Exit:** every core concept resolves for a stated share of filers, the
+unresolved are listed by SIC with the tags they used instead, and no
+downstream consumer reads a fundamental without also being able to read how
+many filers it covers.
+
+#### Decisions needed before starting
+
+- **Eleven years or fewer.** Matching the price history costs ~44 downloads
+  and a few GB of parquet; a 3-year slice is far cheaper and enough to build
+  the machinery. Recommendation: build on 2 quarters, then backfill wide.
+- **Whether unresolved filers block a release.** Recommendation: no. Ship
+  with coverage stated, because a normalizer that refuses to publish until
+  it is perfect never publishes.
 
 **UI, paired to each of the above rather than trailing them:**
 
@@ -769,10 +1212,40 @@ you have to remember.
   works. Normalized-name precision is 44.2% against EIN ground truth, and a
   matcher wrong more than half the time is worse than none because the errors
   are invisible. Do not add fuzzy matching to the public-match path.
-- **Weekend 4 is still not a weekend**, but for a different reason than
-  assumed. Sponsor resolution is no longer the hard part -- the volume is.
-  1,023,597 plans per year across two file formats, with participant time
-  series and YoY deltas on top.
+- **Weekend 4 is closed** (2026-09-10). Three plan years loaded, the
+  participant series built, the mature-target screen shipped with its funnel.
+  It was not a weekend: sponsor resolution turned out to be the easy part and
+  the volume was only the second hardest. The hard part was that five
+  separate things in the sponsor list were not employers with a headcount --
+  see "The screen failure mode" above.
+- **`sources/usaspending.py` is deferred, not dropped.** Federal contract
+  awards are additive to the private-company work rather than blocking it:
+  nothing in Weekend 4 reads them, and the mature-target screen does not
+  improve by knowing which sponsors hold contracts until there is a reason to
+  ask. Revisit when a sector needs it.
+
+- **A subsidiary of a public company reads as private.** Found in the
+  mature-target output on 2026-09-10: `ARCELORMITTAL TUBULAR PRODUCTS USA
+  LLC` ranks as a century-old private employer because *its* EIN matches no
+  SEC filer — the parent files with the SEC, the subsidiary sponsors the plan.
+  The EIN join is doing exactly what it should and the answer is still wrong
+  for the question being asked.
+
+  This is not fixable by loosening the join: matching on the name is the
+  44.2%-precision mistake, and there is no parent/subsidiary link in Form
+  5500. A partial fix exists in EX-21 subsidiary lists attached to 10-Ks,
+  which name subsidiaries in text and would give a real link for the filers
+  that matter. Until then the category is present and uncounted, so treat a
+  recognisable corporate name in the private list as a prompt to check rather
+  than as a finding.
+
+- **Mutual benefit societies are nonprofits the NAICS tier misses.** Also
+  from that output: `THE BRIDGEPORT FIREMEN'S SICK AND DEATH BENEFIT` (NAICS
+  541990) and `FINZER BROTHERS BENEFICIAL ASSOC` (327100) sit in
+  for-profit-coded sectors and sponsor no 403(b), so neither tier catches
+  them. Small in number and visible by name, which is why the flag is a
+  filter rather than a deletion — but it is a known hole in the weak tier
+  rather than a surprise.
 
 **Operational:**
 

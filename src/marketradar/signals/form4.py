@@ -591,6 +591,44 @@ def clusters(
     )
 
 
+def cluster_funnel(
+    buys_in: "Iterable[Buy]",
+    found: dict[str, list["Cluster"]],
+    *,
+    insider_floor: Decimal = DEFAULT_INSIDER_FLOOR,
+    tenpct_floor: Decimal = DEFAULT_TENPCT_FLOOR,
+    min_buyers: int = MIN_CLUSTER_BUYERS,
+    window_days: int = CLUSTER_WINDOW_DAYS,
+) -> "Any":
+    """What the clustering rule discarded, stage by stage.
+
+    The cluster screen has exactly the exposure the Form 5500 screen had: it
+    reports a handful of clusters out of millions of transactions, and a
+    handful is what both a working rule and a broken one produce. Nothing
+    here was checked before; the counts existed only as the length of the
+    final list.
+
+    See :mod:`marketradar.screens.funnel`.
+    """
+    from marketradar.screens import funnel as funnel_mod
+
+    buys = list(buys_in)
+    issuers = len({(b.issuer_cik, b.role) for b in buys})
+    clustered = sum(len(v) for v in found.values())
+    in_clusters = sum(len(c.buys) for v in found.values() for c in v)
+    return funnel_mod.build(
+        "form4 clusters",
+        ("open-market buys", len(buys), "Form 4 code P, after supersession"),
+        ("issuer-role groups", issuers,
+         "officers/directors and 10% holders are clustered apart"),
+        ("buys inside a cluster", in_clusters,
+         f"{min_buyers}+ distinct buyers within {window_days} days"),
+        ("clusters reported", clustered,
+         f"and past the dollar floor (${insider_floor:,.0f} insider, "
+         f"${tenpct_floor:,.0f} holder)"),
+    )
+
+
 def clusters_from_buys(
     buys_in: Iterable[Buy],
     *,

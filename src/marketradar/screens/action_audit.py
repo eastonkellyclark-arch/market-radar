@@ -192,6 +192,40 @@ def summarize(
     }
 
 
+def funnel(
+    con: duckdb.DuckDBPyConnection, prices: duckdb.DuckDBPyRelation,
+    found: duckdb.DuckDBPyRelation, *, floor: Decimal = PRICE_FLOOR,
+    max_gap_days: int = MAX_GAP_DAYS,
+) -> Any:
+    """The detector's population, stage by stage.
+
+    This screen reports a small number out of twenty million bars, which is
+    the exact shape that hides a broken filter: a price floor or a gap guard
+    that removed the whole population would produce "no unexplained moves",
+    and "no unexplained moves" is also what success looks like.
+
+    See :mod:`marketradar.screens.funnel`.
+    """
+    from marketradar.screens import funnel as funnel_mod
+
+    con.register("fn_prices", prices)
+    con.register("fn_found", found)
+    bars = con.execute("select count(*) from fn_prices").fetchone()[0]
+    priced = con.execute(
+        f"select count(*) from fn_prices where close >= {floor}").fetchone()[0]
+    stats = summarize(con, found)
+    return funnel_mod.build(
+        "action audit",
+        ("bars", int(bars), "every session in the scanned window"),
+        ("above the price floor", int(priced),
+         f"${floor}; dividing by a sub-penny quote invents percentages"),
+        ("unexplained moves", stats["total"],
+         f"a large one-session move with no action inside {max_gap_days} days"),
+        ("of those, jumps", stats["jumps"],
+         "the dangerous direction: a reverse split reads as a huge gain"),
+    )
+
+
 def health_line(stats: dict[str, Any]) -> str:
     """One ASCII line for the digest. The console here is cp1252."""
     if not stats["total"]:
