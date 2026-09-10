@@ -212,8 +212,23 @@ ACTIVE_WITHIN_DAYS: Final[int] = 30
 #: An optional ``-``/``.`` suffix is allowed so class variants match, but a
 #: bare prefix match is not, so a real ticker merely *starting* with these
 #: letters survives.
+#: The exchanges each run their own test-symbol family, and the first pass
+#: only knew NASDAQ's. The action detector found the rest by their prices:
+#: ZBZX contributed 26 "unexplained moves" and PTEST-Z printed a 0.05 -> 25.00
+#: jump, because a test symbol's quote is arbitrary by design. Listed
+#: explicitly rather than by substring: matching "TEST" anywhere would
+#: silently drop a real ticker, and a dropped ticker is invisible.
 TEST_SYMBOL: Final[re.Pattern[str]] = re.compile(
-    r"^(?:ATEST|ZTEST|TEST|Z[A-Z]ZZT)(?:[-.].*)?$"
+    r"^(?:"
+    # NASDAQ and NYSE: an optional single-letter prefix on TEST.
+    r"[A-Z]?TEST"
+    # NASDAQ's Z_ZZT family: ZAZZT, ZBZZT, ZVZZT, ZXZZT ...
+    r"|Z[A-Z]ZZT"
+    # Cboe BZX/BYX/EDGA/EDGX.
+    r"|ZBZX|ZBZY|ZTST|ZEXIT|ZIEXT"
+    # IEX.
+    r"|ZIEXT|IEXTEST"
+    r")(?:[-.].*)?$"
 )
 
 
@@ -1033,6 +1048,13 @@ def publish(
     return observed
 
 
+#: Rows per INSERT. One statement per row cost this table 90% of its
+#: contents: a 10-year backfill stages ~254,000 actions, and 254,000
+#: sequential round trips do not finish. 500 keeps the statement well inside
+#: any parameter limit while turning that into ~510 round trips.
+ACTION_BATCH: Final[int] = 500
+
+
 def upsert_corporate_actions(
     staging: Path, con: duckdb.DuckDBPyConnection | None = None
 ) -> int:
@@ -1040,6 +1062,19 @@ def upsert_corporate_actions(
 
     ON CONFLICT DO NOTHING against the (ticker, ex_date, source) natural key,
     so re-running a sweep never duplicates a split.
+
+    **Returns what landed, not what was attempted, and raises if they
+    differ.** The previous version issued one round trip per row and then
+    returned ``len(rows)`` regardless of outcome, so a run that inserted a
+    tenth of its rows reported complete success. The result was a
+    ``corporate_actions`` table holding 365 splits where the staged parquet
+    held 3,724 -- and since the volatility screens adjust from that table, a
+    1-for-20 reverse split (AYTU, 2023-01-06) sat in the data reading as a
+    genuine +1,751% move. Nothing warned, because the only number reported
+    was the one we hoped for.
+
+    The verification is an anti-join rather than a count comparison: equal
+    totals can still be the wrong rows.
     """
     files = sorted(staging.glob("actions_*.parquet"))
     if not files:
@@ -1057,16 +1092,46 @@ def upsert_corporate_actions(
         FROM read_parquet('{pattern}')
         """
     ).fetchall()
+    if not rows:
+        return 0
 
-    for ticker, ex_date, split_factor, div_cash, source in rows:
+    def lit(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    for start in range(0, len(rows), ACTION_BATCH):
+        batch = rows[start:start + ACTION_BATCH]
+        values = ", ".join(
+            f"({lit(ticker)}, date {lit(ex_date)}, {split_factor}, "
+            f"{div_cash}, {lit(source)})"
+            for ticker, ex_date, split_factor, div_cash, source in batch
+        )
         con.execute(
             "CALL postgres_execute('pg', ?)",
             [
                 "insert into corporate_actions "
-                "(ticker, ex_date, split_factor, div_cash, source) values ("
-                f"'{ticker}', date '{ex_date}', {split_factor}, {div_cash}, '{source}'"
-                ") on conflict (ticker, ex_date, source) do nothing"
+                "(ticker, ex_date, split_factor, div_cash, source) values "
+                f"{values} on conflict (ticker, ex_date, source) do nothing"
             ],
+        )
+
+    missing = con.execute(
+        f"""
+        SELECT count(*) FROM (
+            SELECT DISTINCT ticker, ex_date, source
+            FROM read_parquet('{pattern}')
+        ) staged
+        ANTI JOIN (
+            SELECT ticker, ex_date, source FROM postgres_query('pg',
+                'select ticker, ex_date, source from corporate_actions')
+        ) stored USING (ticker, ex_date, source)
+        """
+    ).fetchone()[0]
+    if missing:
+        raise TiingoError(
+            f"{missing:,} of {len(rows):,} staged corporate actions are not in "
+            "corporate_actions after the upsert. Refusing to report success: "
+            "the volatility screens adjust from this table, and a missing "
+            "reverse split reads as a real -95% day."
         )
     return len(rows)
 

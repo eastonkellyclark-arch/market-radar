@@ -418,3 +418,100 @@ def test_a_one_for_fifteen_reverse_split_still_adjusts_correctly() -> None:
     factor = tiingo._factor(0.0666666667, Decimal(1))
     adjusted = (Decimal("0.05") / factor).quantize(Decimal("0.000001"))
     assert adjusted == Decimal("0.750000")
+
+
+# --- corporate actions: the upsert that reported what it hoped for -------
+
+
+class _StubCon:
+    """Enough of a DuckDB connection to drive upsert_corporate_actions.
+
+    ``missing`` is what the verification anti-join will report.
+    """
+
+    def __init__(self, rows, missing):
+        self.rows = rows
+        self.missing = missing
+        self.statements: list[str] = []
+
+    def execute(self, sql, params=None):
+        if params and isinstance(params[0], str) and "insert into" in params[0]:
+            self.statements.append(params[0])
+            self._result = None
+        elif "ANTI JOIN" in sql:
+            self._result = (self.missing,)
+        elif "SELECT DISTINCT" in sql:
+            self._result = self.rows
+        else:
+            self._result = None
+        return self
+
+    def fetchall(self):
+        return self.rows
+
+    def fetchone(self):
+        return self._result
+
+
+def _staged_actions(tmp_path, n):
+    """A staging directory with one actions parquet, via DuckDB itself."""
+    import duckdb
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    con = duckdb.connect()
+    con.execute(
+        "create table a (ticker text, ex_date date, split_factor double, "
+        "div_cash double, source text)"
+    )
+    con.executemany(
+        "insert into a values (?, ?, ?, ?, 'tiingo')",
+        [(f"T{i}", date(2023, 1, 6), 0.05, 0.0) for i in range(n)],
+    )
+    out = (staging / "actions_00000.parquet").as_posix()
+    con.execute(f"copy a to '{out}' (format parquet)")
+    return staging
+
+
+def test_upsert_batches_instead_of_one_round_trip_per_row(tmp_path, monkeypatch):
+    """One statement per row cost this table 90% of its contents: a 10-year
+    backfill stages ~254,000 actions and that many round trips do not
+    finish."""
+    from marketradar import storage
+    from marketradar.sources import tiingo as t
+
+    monkeypatch.setattr(storage, "postgres_attached", lambda con: True)
+    staging = _staged_actions(tmp_path, 3)
+    rows = [(f"T{i}", date(2023, 1, 6), 0.05, 0.0, "tiingo") for i in range(1200)]
+    con = _StubCon(rows, missing=0)
+
+    assert t.upsert_corporate_actions(staging, con=con) == 1200
+    # 1200 rows at 500 per statement is three, not 1200.
+    assert len(con.statements) == 3
+    assert all(s.count("(") > 100 for s in con.statements)
+
+
+def test_upsert_raises_when_rows_did_not_land(tmp_path, monkeypatch):
+    """The original returned len(rows) whatever happened, so a run that wrote
+    a tenth of its rows reported complete success. corporate_actions ended up
+    with 365 splits where the parquet held 3,724, and the volatility screens
+    adjusted from it every morning."""
+    from marketradar import storage
+    from marketradar.sources import tiingo as t
+
+    monkeypatch.setattr(storage, "postgres_attached", lambda con: True)
+    staging = _staged_actions(tmp_path, 3)
+    rows = [("AYTU", date(2023, 1, 6), 0.05, 0.0, "tiingo")]
+    con = _StubCon(rows, missing=1)
+
+    with pytest.raises(t.TiingoError) as exc:
+        t.upsert_corporate_actions(staging, con=con)
+    assert "not in corporate_actions" in str(exc.value)
+
+
+def test_upsert_with_no_staged_actions_is_zero(tmp_path):
+    from marketradar.sources import tiingo as t
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert t.upsert_corporate_actions(empty, con=None) == 0

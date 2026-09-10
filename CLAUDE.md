@@ -244,20 +244,50 @@ issuer took the symbol after Seagen was acquired in 2023. The 30-day anchor
 guard in `screens/outcomes.py` rejects those, the same way the gap guard does
 in the volatility screens.
 
-**`corporate_actions` is materially incomplete, and nothing warns you.** It
-holds 365 splits across eleven years and 2,947 tickers, which is far short of
-reality. AYTU's 1-for-20 reverse split of 2023-01-06 is simply absent, and
-its absence reads as a genuine +1,751% move. Thirteen such events moved one
-study's mean excess return from +5% to +944% while its median stayed at +5%.
+**`corporate_actions` coverage has two separate causes, and only one was
+ours.** Diagnosed 2026-09-09 after the table was found holding 365 splits
+across eleven years.
 
-This is the failure mode the "adjust at query time" rule was written to
-prevent, arriving through the back door: the adjustment is applied correctly
-to an action table that does not contain the action. The volatility screens
-read the same table, so this is not confined to the outcome study.
-`screens/outcomes.py` flags a move past 300% with no action on record as
-`suspect_unadjusted` and counts it in the open rather than dropping it
-silently — the same band holds real takeouts. Backfilling the actions
-properly is still owed.
+*Cause one, fixed.* `upsert_corporate_actions` issued one round trip per row
+and then returned `len(rows)` regardless of outcome. A 10-year backfill
+stages about 254,000 actions; that many sequential round trips do not finish,
+and the function reported complete success having written a tenth of them.
+The staged parquet held 3,724 splits and Postgres held 365. It now inserts in
+batches of 500 and **verifies by anti-join against the staged set, raising if
+anything is missing** — the count it returns is what landed, not what it
+attempted. Backfilled from staging: 253,645 rows, 3,720 splits, 9,156
+tickers.
+
+*Cause two, not fixable at this plan.* Tiingo's per-bar `splitFactor` on
+`/prices` is itself incomplete, and worst on exactly the small tickers where
+reverse splits are constant. POWW, HSCSW and CAPS each report **zero**
+splits across their whole history while their raw closes jump 78x, 100x and
+1115x; SBFM reports four and misses a fifth. There is no separate
+corporate-actions endpoint to fall back on — `/tiingo/corporate-actions/...`
+returns 403 on Power, and fundamentals is DOW-30 only. Closing this gap
+means a different data plan, so **do not assume the action table is
+complete**, and do not "fix" a missing split by inferring the ratio from the
+price jump and writing it in: an inferred action is fabricated data in a
+table the screens trust.
+
+What exists instead is `screens/action_audit.py`, which needs no knowledge of
+the loader: a large one-session move with no action in the interval to
+explain it is a candidate missing split, whatever the cause. The digest
+health block reports the count over the last 7 sessions, which is the check
+that would have caught cause one on the first night. The residual backlog is
+about 3,300 unexplained jumps and 1,200 falls across 1,600 tickers.
+
+An unexplained jump is the dangerous direction: unadjusted, a reverse split
+reads as an enormous *gain* and tops a gainer list. PHD went 0.40 to 9.95 on
+2026-09-03 — a 1-for-25 reverse split with no action on record, worth
++2,388% in the screens.
+
+Exchange test symbols were leaking into the price history for the same
+reason nobody noticed the splits: nothing checked. `ZBZX` alone produced 26
+"unexplained moves" and `PTEST-Z` printed a 0.05 to 25.00 jump, because a
+test symbol's quote is arbitrary by design. `TEST_SYMBOL` now covers the
+NASDAQ, NYSE, Cboe and IEX families. Already-published partitions still carry
+them until a `--restate` sweep.
 
 **Most "similar historical deals" is SQL, not vectors.** Filter first on SIC
 code, deal size bucket, cash vs stock, era. Use embeddings only to rank within

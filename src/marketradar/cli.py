@@ -148,6 +148,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-load", action="store_true", help="fetch and report, store nothing"
     )
 
+    p_audit = sub.add_parser(
+        "actions-audit",
+        help="large price moves no corporate action explains (missing splits)",
+    )
+    p_audit.add_argument("--days", type=int, metavar="N",
+                         help="only scan the last N days (default: all history)")
+    p_audit.add_argument("--top", type=int, default=30, metavar="N",
+                         help="rows to print (default 30)")
+    p_audit.add_argument("--jump", default="1.00", metavar="RATIO",
+                         help="gain that counts as a candidate reverse split "
+                              "(default 1.00, i.e. +100%%)")
+    p_audit.add_argument("--fall", default="-0.60", metavar="RATIO",
+                         help="fall that counts as a candidate forward split "
+                              "(default -0.60)")
+
     p_out = sub.add_parser(
         "outcomes",
         help="forward returns after Form 4 clusters and 8-K deals (pure SQL)",
@@ -587,6 +602,50 @@ def _deal_events(con):
         )
         where rn = 1
     """)
+
+
+def _cmd_actions_audit(args: argparse.Namespace) -> int:
+    """Moves the action table cannot account for.
+
+    Two causes, and the detector does not care which: our upsert silently
+    dropped 90% of what it staged (fixed), and Tiingo's per-bar splitFactor
+    misses splits outright on small tickers (not fixable on this plan). A
+    large one-session move with no action to explain it is a candidate
+    missing split either way.
+    """
+    from decimal import Decimal as _D
+
+    from marketradar import storage
+    from marketradar.screens import action_audit, volatility
+
+    con = storage.connect(attach_postgres=True)
+    prices = _outcome_prices(con)
+    actions = volatility.read_actions(con)
+
+    since = None
+    if args.days:
+        from marketradar.clock import market_today
+
+        since = market_today() - _dt.timedelta(days=args.days)
+        print(f"scanning sessions since {since}")
+    else:
+        print("scanning all history")
+
+    found = action_audit.candidates(
+        con, prices, actions,
+        jump=_D(args.jump), fall=_D(args.fall), since=since,
+    )
+    con.register("audit_rel", found)
+    con.execute("drop table if exists audit_rows")
+    con.execute("create table audit_rows as select * from audit_rel")
+    rows = con.execute("select * from audit_rows").fetchall()
+
+    stats = action_audit.summarize(con, con.table("audit_rows"))
+    print()
+    print(action_audit.health_line(stats))
+    print()
+    print(action_audit.render(rows, limit=args.top))
+    return EXIT_OK
 
 
 def _cmd_outcomes(args: argparse.Namespace) -> int:
@@ -1058,6 +1117,14 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_form4(args)
         except Exception as exc:
             print(f"mr form4: error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "actions-audit":
+        load_dotenv()
+        try:
+            return _cmd_actions_audit(args)
+        except Exception as exc:
+            print(f"mr actions-audit: error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "outcomes":

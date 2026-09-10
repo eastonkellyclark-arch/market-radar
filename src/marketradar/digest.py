@@ -34,7 +34,7 @@ import logging
 import os
 import statistics
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Final, Iterable, Iterator
 
@@ -76,6 +76,18 @@ COVERAGE_BASELINE_SESSIONS: Final[int] = 10
 #: Trading days the price data may lag before it is called stale. Wide enough
 #: for a Friday close read after a Monday holiday.
 PRICE_STALENESS_DAYS: Final[int] = 4
+
+#: Sessions the unexplained-move audit looks back over. A week of trading:
+#: long enough that a split on Monday is still reported on Friday, short
+#: enough that the count means "new" rather than "outstanding".
+ACTION_AUDIT_SESSIONS: Final[int] = 7
+
+#: Unexplained moves tolerated before the health block calls it a problem.
+#: Not zero: a real stock genuinely doubles in a session sometimes, and a
+#: check that cries wolf nightly is a check nobody reads. Measured at 2-5 a
+#: session across 14,000 tickers, so a week normally lands near 20 -- this
+#: sits above that noise and below a systemic failure.
+ACTION_AUDIT_TOLERANCE: Final[int] = 40
 
 REQUEST_TIMEOUT: Final[float] = 30.0
 
@@ -136,6 +148,7 @@ def check_health(
     day: date,
     prices: duckdb.DuckDBPyRelation,
     prior_day: date | None,
+    actions: duckdb.DuckDBPyRelation | None = None,
 ) -> Health:
     """What would otherwise be invisible: partial sweeps and stalled feeds.
 
@@ -243,6 +256,42 @@ def check_health(
         )
     except Exception as exc:  # pragma: no cover - needs a live database
         items.append(HealthItem("companies", f"unavailable: {exc}"[:80], ok=False))
+
+    # Unexplained moves: a large single-session move with no corporate
+    # action to account for it. This is the check that would have caught a
+    # broken upsert leaving corporate_actions with 365 splits where 3,724
+    # were staged -- and it keeps working against the part that is not
+    # fixable, because Tiingo's per-bar splitFactor misses splits outright on
+    # small tickers and the Power plan has no corporate-actions endpoint.
+    #
+    # Scoped to the recent window. The all-time backlog is a fixed number
+    # until somebody works through it; a *new* unexplained move means a split
+    # happened last night and the screens are about to call it a gain.
+    if actions is not None:
+        try:
+            from marketradar.screens import action_audit
+
+            found = action_audit.candidates(
+                con, prices, actions,
+                since=day - timedelta(days=ACTION_AUDIT_SESSIONS),
+            )
+            stats = action_audit.summarize(con, found)
+            items.append(
+                HealthItem(
+                    name="unexplained moves",
+                    detail=(f"{stats['total']} in {ACTION_AUDIT_SESSIONS}d "
+                            f"({stats['jumps']} jumps, {stats['falls']} falls)"),
+                    ok=stats["total"] <= ACTION_AUDIT_TOLERANCE,
+                    note="" if stats["total"] <= ACTION_AUDIT_TOLERANCE else
+                         "candidate missing splits; a jump reads as a real "
+                         "gain in the screens",
+                )
+            )
+        except Exception as exc:  # a probe must not stop the digest
+            log.warning("action audit failed: %s", exc)
+            items.append(
+                HealthItem("unexplained moves", f"unavailable: {exc}"[:80],
+                           ok=False))
 
     if prior_day is None:
         items.append(
@@ -407,7 +456,8 @@ def build(
                 m.ticker for m in sl.rows if m.ticker not in before.get(key, set())
             }
 
-    health = check_health(con, day=result.day, prices=prices, prior_day=prior_day)
+    health = check_health(con, day=result.day, prices=prices,
+                          prior_day=prior_day, actions=actions)
 
     macro: list[MacroLine] = []
     latest = _latest_macro(con)
