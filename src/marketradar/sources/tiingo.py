@@ -231,6 +231,28 @@ TEST_SYMBOL: Final[re.Pattern[str]] = re.compile(
     r")(?:[-.].*)?$"
 )
 
+#: The same families as a RE2 pattern, for the publish-side filter. DuckDB
+#: cannot call a Python regex, and keeping the two spellings adjacent is the
+#: only thing that will keep them in step -- a test asserts they agree on
+#: every symbol in :data:`TEST_SYMBOL_EXAMPLES`.
+TEST_SYMBOL_SQL: Final[str] = (
+    r"^(?:[A-Z]?TEST|Z[A-Z]ZZT|ZBZX|ZBZY|ZTST|ZEXIT|ZIEXT|IEXTEST)([-.].*)?$"
+)
+
+#: Symbols the two spellings above must agree on. Every one of the excluded
+#: entries was observed in our own price history or in the action audit.
+TEST_SYMBOL_EXAMPLES: Final[tuple[tuple[str, bool], ...]] = (
+    ("TEST", True), ("ATEST", True), ("ZTEST", True), ("PTEST-Z", True),
+    ("NTEST", True), ("CTEST", True), ("ATEST.A", True),
+    ("ZVZZT", True), ("ZXZZT", True), ("ZBZX", True), ("ZBZY", True),
+    ("ZTST", True), ("ZEXIT", True), ("ZIEXT", True), ("IEXTEST", True),
+    # Real tickers that must survive. TESS and TESSCO start with the letters
+    # but are not test symbols; a substring match would have eaten both.
+    ("TSLA", False), ("TESS", False), ("TESSCO", False), ("ZTS", False),
+    ("ZBRA", False), ("TEAM", False), ("AZTA", False), ("ZION", False),
+    ("ZTO", False), ("ZS", False), ("PTC", False), ("TXT", False),
+)
+
 
 def include_row(row: dict[str, Any], cutoff: date | None) -> bool:
     """Whether one universe row belongs in the sweep.
@@ -995,12 +1017,20 @@ def publish(
             f"SELECT * FROM read_parquet('{_q(ref.location)}')"
         )
 
+    # Test symbols are excluded here as well as in the universe filter, and
+    # on both sides of the merge. The universe filter only governs what a
+    # *future* sweep fetches; rows already published carry forward through
+    # every merge until something drops them. ZBZX, ZTST and PTEST-Z reached
+    # the partitions before the filter knew about the Cboe and NYSE families,
+    # and a test symbol's quote is arbitrary by design -- PTEST-Z printed
+    # 0.05 -> 25.00, which is a +49,900% day in the screens.
     merged_sql = f"""
         SELECT * EXCLUDE (rn) FROM (
             SELECT *, row_number() OVER (
                 PARTITION BY ticker, date, source ORDER BY ingested_at DESC
             ) AS rn
             FROM ({source_sql})
+            WHERE NOT regexp_matches(upper(ticker), '{TEST_SYMBOL_SQL}')
         ) WHERE rn = 1
     """
 

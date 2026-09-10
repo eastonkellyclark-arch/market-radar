@@ -101,6 +101,32 @@ MIN_ADV_SESSIONS: Final[int] = 30
 #: leave holes of months or years: AAAP's was 3,045 days.
 MAX_GAP_DAYS: Final[int] = 30
 
+#: A one-session *gain* past this, with no corporate action in the interval,
+#: is suppressed as an unrecorded reverse split. 1.0 is +100%.
+#:
+#: Set where real moves thin out rather than where splits begin: a genuine
+#: one-session double exists and would be worth seeing, but corporate_actions
+#: is known incomplete -- Tiingo's per-bar splitFactor misses splits outright
+#: on small tickers -- and a false +2,388% at the top of a gainer list costs
+#: more than a true +150% missing from it.
+SUSPECT_JUMP: Final[Decimal] = Decimal("1.00")
+
+#: The fall side is *flagged and counted but still shown*, and the asymmetry
+#: is the point.
+#:
+#: A single threshold on abs(move) is silently jumps-only, because a price
+#: cannot fall more than 100% -- so the fall side needs its own, shallower
+#: number, and at that depth the two populations overlap. An unadjusted
+#: forward split is -50% (2-for-1) to -90% (10-for-1), and real one-session
+#: falls of that size are *common* in the bands this screen exists to watch:
+#: failed trials, fraud, dilution. Forward splits are also the rarer event
+#: here, because a cheap company does a reverse split, not a forward one.
+#:
+#: So suppressing a deep fall would delete real information most of the time,
+#: where suppressing a large jump removes obvious garbage most of the time.
+#: Different confidence, different treatment, both counted out loud.
+SUSPECT_FALL: Final[Decimal] = Decimal("-0.60")
+
 TOP_N: Final[int] = 20
 
 #: A screen that returns nothing must not exit green. This is the freshness
@@ -286,7 +312,11 @@ joined as (
     select
         seq.*,
         cast(coalesce(product(act.split_factor), 1) as decimal(38,12)) as split_factor,
-        cast(coalesce(sum(act.div_cash), 0) as decimal(18,6))          as div_cash
+        cast(coalesce(sum(act.div_cash), 0) as decimal(18,6))          as div_cash,
+        -- Counted, not inferred from split_factor: an action with a factor of
+        -- 1 (a dividend) is not the same fact as no action at all, and the
+        -- suspect flag below turns on exactly that difference.
+        count(act.ex_date)                                             as n_actions
     from seq
     left join act
         on act.ticker = seq.ticker
@@ -337,7 +367,25 @@ priced as (
         -- halt inside one listing, and it catches a listing range that is
         -- simply wrong -- the vendor's own metadata is the thing listing_id
         -- trusts, and this is what covers being let down by it.
-        ((date - prev_date) <= {max_gap}) as within_gap
+        ((date - prev_date) <= {max_gap}) as within_gap,
+        -- A move this large with no corporate action to explain it is almost
+        -- certainly an unrecorded split. corporate_actions is known
+        -- incomplete: Tiingo's per-bar splitFactor misses splits outright on
+        -- small tickers and the Power plan has no corporate-actions endpoint,
+        -- so this cannot be fixed by loading harder. PHD went 0.40 to 9.95 on
+        -- 2026-09-03 -- a 1-for-25 reverse split, +2,388% in the lists.
+        --
+        -- Suppressed by the caller and counted, never adjusted by an inferred
+        -- ratio: a made-up factor is fabricated data in the column the whole
+        -- screen trusts, and it would be indistinguishable from a real one
+        -- forever after.
+        (n_actions = 0 and
+         (effective_close - adj_prev_close) / adj_prev_close
+            > {suspect_jump}) as action_suspect,
+        -- Flagged, not suppressed. See SUSPECT_FALL.
+        (n_actions = 0 and
+         (effective_close - adj_prev_close) / adj_prev_close
+            < {suspect_fall}) as unexplained_fall
     from adjusted
 )
 select
@@ -364,7 +412,9 @@ select
     priced.listing_id,
     priced.gap_days,
     priced.passes_floor,
-    priced.within_gap
+    priced.within_gap,
+    priced.action_suspect,
+    priced.unexplained_fall
 from priced
 join adv on adv.ticker = priced.ticker
          and adv.listing_id is not distinct from priced.listing_id
@@ -422,6 +472,8 @@ def moves(
         listing_expr=listing_expr,
         max_gap=MAX_GAP_DAYS,
         adv_window=max(0, adv_window - 1),
+        suspect_jump=SUSPECT_JUMP,
+        suspect_fall=SUSPECT_FALL,
     )
     return con.sql(sql)
 
@@ -453,6 +505,14 @@ class ScreenResult:
     sanity_floor: str
     gap_excluded: int = 0
     unattributed: int = 0
+    #: Gains suppressed as unrecorded reverse splits. Suppressed rather than
+    #: shown, because a known-false +2,388% is worse than a visible absence --
+    #: and counted rather than dropped, because a silent absence is worse again.
+    action_suspect: int = 0
+    #: Deep falls with no action on record. Shown, because at that depth a
+    #: real crash and a forward split are indistinguishable and the real ones
+    #: are more common. See SUSPECT_FALL.
+    unexplained_falls: int = 0
     #: Names above the dollar gate but short of the session floor. Kept
     #: visible: they are in the ungated lists, not deleted.
     thin_history: int = 0
@@ -485,7 +545,13 @@ def screen(
         adv_window=adv_window,
     )
     con.register("raw_moves", rel)
-    kept = con.sql("select * from raw_moves where passes_floor and within_gap")
+    # action_suspect is suppressed here alongside the floor and the gap
+    # guard. The list is what gets read every morning, and a move the action
+    # table cannot explain is a number we know to be wrong.
+    kept = con.sql(
+        "select * from raw_moves "
+        "where passes_floor and within_gap and not action_suspect"
+    )
 
     observed = assert_fresh(
         "vol_screen", kept, partition="moves", min_rows=min_moves,
@@ -508,6 +574,14 @@ def screen(
     unattributed = con.execute(
         "select count(*) from raw_moves where date = ? and listing_id is null",
         [day],
+    ).fetchone()[0]
+    suspect = con.execute(
+        "select count(*) from raw_moves where date = ? and passes_floor "
+        "and within_gap and action_suspect", [day]
+    ).fetchone()[0]
+    deep_falls = con.execute(
+        "select count(*) from raw_moves where date = ? and passes_floor "
+        "and within_gap and unexplained_fall", [day]
     ).fetchone()[0]
 
     if not rows:
@@ -562,6 +636,8 @@ def screen(
         sanity_floor=sanity_floor,
         gap_excluded=int(gapped),
         unattributed=int(unattributed),
+        action_suspect=int(suspect),
+        unexplained_falls=int(deep_falls),
         thin_history=sum(
             1 for m in everything
             if m.avg_dollar_volume > LIQUID_MIN_DOLLAR_VOLUME
@@ -602,6 +678,23 @@ def caveats(result: "ScreenResult") -> list[str]:
         out.append(
             f"{result.unattributed:,} bars carry no listing_id, falling "
             "outside every listing period the vendor knows about"
+        )
+    if result.action_suspect:
+        n = result.action_suspect
+        out.append(
+            f"{n:,} gain{'' if n == 1 else 's'} suppressed: above "
+            f"{SUSPECT_JUMP:.0%} with no corporate action on record, so "
+            f"almost certainly an unrecorded reverse split. "
+            f"`mr actions-audit` lists {'it' if n == 1 else 'them'}; the "
+            "ratio is deliberately not inferred"
+        )
+    if result.unexplained_falls:
+        n = result.unexplained_falls
+        out.append(
+            f"{n:,} fall{'' if n == 1 else 's'} below {SUSPECT_FALL:.0%} "
+            f"carry no corporate action and {'is' if n == 1 else 'are'} "
+            "still shown -- at that depth a real collapse and a forward "
+            "split look the same, and the real ones are more common"
         )
     return out
 

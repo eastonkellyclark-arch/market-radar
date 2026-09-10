@@ -215,6 +215,8 @@ garbage. History mostly starts ~2009.
 DEFM14A, SC 13D, SC TO-T, SC 13E-3. Filings are legally required, timestamped,
 and unambiguous. News is the noisy secondary signal.
 
+Measured 2026-09-10 and **news was declined**, so this is settled rather than aspirational. GDELT returns 14.3 articles per company per day and **13.4% of them name the company in the headline**; the rest are passing mentions, content farms and the company's own portal. The deciding test was lead time against real 8-K deal dates: coverage did appear before the filing, but not one leading article was about the deal -- they were insider-transaction reports we already parse from Form 4, unrelated PR, and stock-performance filler. Its API also cannot be swept (one request per five seconds, tighter under load), and the free bulk GKG fixes the rate limit without fixing the base rate. Full numbers in docs/build-spec.md under "News: measured, declined". Reopen on lead time, not on volume.
+
 **Form 5500 sponsor names are messy.** DBAs, legal entity names, and subsidiary
 rollups all differ from how a company is known. Fuzzy match into a review
 queue; never auto-merge entities above a similarity threshold without a

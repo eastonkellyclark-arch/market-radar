@@ -569,7 +569,7 @@ what they say.
   trade), and read the survivorship note in CLAUDE.md before believing any
   number it produces.
 - `sources/sec_suspensions.py`
-- `sources/gdelt.py` and `sources/finnhub_news.py` → `signals`
+- ~~`sources/gdelt.py` and `sources/finnhub_news.py`~~ — **declined 2026-09-10 after measurement.** See "News: measured, declined" below.
 
 **UI:**
 
@@ -577,12 +577,64 @@ what they say.
 - `U6` Form 4 cluster panel — **two lists, not one**: officer/director
   clusters and 10%-holder clusters, kept apart for the same reason ETFs are
   kept apart from stocks. Dollar-weighted, plan purchases flagged.
-- `U7` news panel — replaces the "not built" placeholder
-- `U11` 8-K deals panel — ships with W3-T3, not after it
-- `U12` historical outcomes panel — ships with the study
+- ~~`U7` news panel~~ — **not built. News was measured and declined; see
+  below.**
 
 **Exit:** a merger filing lands and appears in your digest *and on the
 dashboard* the same day.
+
+#### News: measured 2026-09-10, declined
+
+Recorded here so it is not revisited from scratch. `sources/gdelt.py` and
+`sources/finnhub_news.py` are **not built on purpose**, and the reason is a
+measurement rather than a preference.
+
+GDELT's DOC 2.0 API is free and needs no key. Over 7 days, 18 companies
+sampled from our own universe, 1,800 articles:
+
+| measure | result |
+|---|---|
+| volume | 14.3 articles per company per day |
+| company named in the headline | **13.4%** |
+| stock-commentary domains | 4.5% |
+| listicle-shaped titles | 3.1% |
+
+86% of what a company-name query returns does not name that company in the
+headline — they are passing mentions in article bodies. The domain mix tells
+the rest: `163.com` supplied 218 of NetEase's 250 hits (NetEase's *own*
+portal), then `themarketsdaily.com` 130, `dailypolitical.com` 97,
+`tickerreport.com` 88. Home Depot's top result was "Tips on Selling Stuff
+from a Guy Who Sold a Lot of Stuff". Results are multi-language and
+unfiltered.
+
+The deciding test was lead time, because M&A detection here is already by
+form type and news only earns a place if it *precedes* the filing. For deals
+drawn from the `deals` table, GDELT was asked what it carried in the ten days
+before the 8-K:
+
+- 4 of 7 resolved deals had prior coverage, 1 same-day, 2 none at all
+- **but not one of the four "leading" articles was about the deal.** They
+  were: two insider-transaction reports (which Form 4 gives us directly,
+  parsed and dollar-weighted), one unrelated corporate PR, and one
+  stock-performance filler piece.
+
+So the lead is ambient coverage, and where it names a real event, that event
+is one we already detect from the filing itself, more reliably.
+
+Two further constraints found in passing:
+
+- **The API cannot be swept.** GDELT rate-limits at one request per five
+  seconds and tightens under sustained use: 12 of 30 companies failed at
+  6-second pacing, 8 of 15 at 10-second. 14,000 tickers is 19 hours at the
+  stated limit and not achievable in practice.
+- **The bulk path does not rescue it.** `data.gdeltproject.org/gdeltv2/`
+  publishes the whole GKG every 15 minutes as a ~4 MB zip, free and
+  unmetered, which *would* solve the rate limit. It does not solve the base
+  rate. 86% noise does not improve at volume, it only gets bigger.
+
+If this is reopened, the thing to re-measure is the lead time, not the
+volume. News becomes worth building the day it names an event before the
+filing does.
 
 ### Weekend 4 — Private company data
 

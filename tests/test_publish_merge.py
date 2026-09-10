@@ -208,28 +208,67 @@ def test_the_guard_names_the_direction_not_just_the_numbers(env, monkeypatch) ->
 def test_restate_replaces_the_partition_and_permits_removal(env) -> None:
     """Merging makes removal impossible without this.
 
-    Rows already published are carried forward forever, so purging symbols
-    that should never have been swept -- ZVZZT and the rest of the exchange
-    test tickers -- needs a way to say "the partition is exactly this".
+    Rows already published are carried forward forever, so purging anything
+    that should never have been swept needs a way to say "the partition is
+    exactly this". Uses an ordinary ticker: exchange test symbols are now
+    refused by the publish filter and can no longer demonstrate this, which
+    is the subject of the next test.
     """
     tmp_path, target, con = env
-    tiingo.publish(stage(tmp_path, "s1", [("AAA", D1, 10), ("ZVZZT", D1, 100)]),
+    tiingo.publish(stage(tmp_path, "s1", [("AAA", D1, 10), ("BBB", D1, 100)]),
                    PARTITION, con=con, min_rows=1, max_staleness_days=10_000)
     assert rows_at(con, target) == 2
 
     clean = stage(tmp_path, "clean", [("AAA", D1, 10)])
 
-    # A normal publish carries ZVZZT forward: the merge cannot remove it.
+    # A normal publish carries BBB forward: the merge cannot remove it.
     tiingo.publish(clean, PARTITION, con=con, min_rows=1,
                    max_staleness_days=10_000)
     assert rows_at(con, target) == 2
-    assert "ZVZZT" in {r[0] for r in published(con, target)}
+    assert "BBB" in {r[0] for r in published(con, target)}
 
     # A restatement replaces it outright.
     tiingo.publish(clean, PARTITION, con=con, min_rows=1,
                    max_staleness_days=10_000, restate=True)
     assert rows_at(con, target) == 1
     assert published(con, target)[0][0] == "AAA"
+
+
+def test_publish_refuses_exchange_test_symbols(env) -> None:
+    """The universe filter governs what a future sweep *fetches*; it cannot
+    remove what is already in a partition, and a merge carries those rows
+    forward forever. 37,211 rows across 26 test symbols reached the
+    partitions this way -- NTEST, PTEST, MTEST, CTEST, ZBZX, ZTST -- before
+    the filter knew about the NYSE, Cboe and IEX families. A test symbol's
+    quote is arbitrary by design: PTEST-Z printed 0.05 -> 25.00.
+    """
+    tmp_path, target, con = env
+    tiingo.publish(
+        stage(tmp_path, "s1", [("AAA", D1, 10), ("ZVZZT", D1, 100),
+                               ("PTEST-Z", D1, 25), ("NTEST", D1, 5)]),
+        PARTITION, con=con, min_rows=1, max_staleness_days=10_000,
+    )
+    assert rows_at(con, target) == 1
+    assert {r[0] for r in published(con, target)} == {"AAA"}
+
+
+def test_a_test_symbol_already_published_is_dropped_by_the_next_merge(env) -> None:
+    """Defence in depth: the filter runs on both sides of the merge, so a
+    partition that already holds one is cleaned by an ordinary publish
+    without needing a restatement."""
+    tmp_path, target, con = env
+    # Seed the partition directly, bypassing publish, to stand in for what
+    # the real partitions held before the filter existed.
+    seed = stage(tmp_path, "seed", [("AAA", D1, 10), ("ZBZX", D1, 99)])
+    con.execute(
+        f"COPY (SELECT * FROM read_parquet('{(seed / 'chunk_00000.parquet').as_posix()}')) "
+        f"TO '{target.as_posix()}' (FORMAT parquet)"
+    )
+    assert rows_at(con, target) == 2
+
+    tiingo.publish(stage(tmp_path, "s2", [("AAA", D2, 11)]), PARTITION,
+                   con=con, min_rows=1, max_staleness_days=10_000)
+    assert "ZBZX" not in {r[0] for r in published(con, target)}
 
 
 def test_restate_is_never_the_default(env) -> None:

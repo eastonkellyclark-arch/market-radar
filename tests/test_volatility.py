@@ -420,3 +420,99 @@ def test_a_thin_name_below_the_dollar_gate_is_not_counted_as_thin(con) -> None:
     add_price(con, "TINY", D3, "10.000000", volume=1)
     add_price(con, "TINY", D4, "11.000000", volume=1)
     assert run(con).thin_history == 0
+
+
+# --- unrecorded splits: suppressed, counted, never inferred -------------
+
+
+def test_a_move_with_no_action_on_record_is_suppressed(con) -> None:
+    """PHD went 0.40 to 9.95 on 2026-09-03 -- a 1-for-25 reverse split with
+    no corporate action stored, worth +2,388% at the top of a gainer list.
+    corporate_actions is known incomplete and cannot be completed on this
+    plan, so the screens must not present the number."""
+    add_price(con, "PHD", D3, "0.40")
+    add_price(con, "PHD", D4, "9.95")
+    add_price(con, "REAL", D3, "10.00")
+    add_price(con, "REAL", D4, "11.00")
+
+    result = run(con, as_of=D4, min_moves=1, min_adv_sessions=1)
+    shown = {m.ticker for sl in result.lists for m in sl.rows}
+    assert "PHD" not in shown
+    assert "REAL" in shown
+    assert result.action_suspect == 1
+
+
+def test_the_suppressed_count_is_visible_in_the_caveats(con) -> None:
+    """A silent absence is worse than a visible one. The whole point of
+    suppressing is that the reader is told."""
+    add_price(con, "PHD", D3, "0.40")
+    add_price(con, "PHD", D4, "9.95")
+    add_price(con, "REAL", D3, "10.00")
+    add_price(con, "REAL", D4, "11.00")
+
+    result = run(con, as_of=D4, min_moves=1, min_adv_sessions=1)
+    text = " ".join(vol.caveats(result))
+    assert "suppressed" in text
+    assert "1 gain suppressed" in text          # singular, not "1 moves"
+    assert "not inferred" in text
+
+
+def test_the_same_move_with_an_action_on_record_is_shown(con) -> None:
+    """The flag turns on the *absence* of an action, not on the size of the
+    move. A split we know about is adjusted and the move disappears legitimately."""
+    add_price(con, "OK", D3, "0.40")
+    add_price(con, "OK", D4, "9.95")
+    add_action(con, "OK", D4, split_factor="0.04")
+    add_price(con, "REAL", D3, "10.00")
+    add_price(con, "REAL", D4, "11.00")
+
+    result = run(con, as_of=D4, min_moves=1, min_adv_sessions=1)
+    assert result.action_suspect == 0
+    moves = {m.ticker: m for sl in result.lists for m in sl.rows}
+    assert "OK" in moves
+    # 0.40 / 0.04 = 10.00 adjusted prior close, against 9.95: a small fall.
+    assert abs(moves["OK"].pct_move) < Decimal("2")
+
+
+def test_a_dividend_does_not_excuse_an_unexplained_jump(con) -> None:
+    """n_actions is counted rather than read off split_factor: a dividend is
+    an action whose factor is 1, and treating factor == 1 as "no action"
+    would let a dividend launder a missing split."""
+    add_price(con, "DIV", D3, "0.40")
+    add_price(con, "DIV", D4, "9.95")
+    add_action(con, "DIV", D4, split_factor="1", div_cash="0.01")
+    add_price(con, "REAL", D3, "10.00")
+    add_price(con, "REAL", D4, "11.00")
+
+    result = run(con, as_of=D4, min_moves=1, min_adv_sessions=1)
+    # An action exists in the interval, so this is not flagged as unexplained.
+    # It is still a real +2,388% move on record -- that is the vendor's
+    # answer and the screen reports it rather than second-guessing.
+    assert result.action_suspect == 0
+    assert "DIV" in {m.ticker for sl in result.lists for m in sl.rows}
+
+
+def test_a_deep_fall_with_no_action_is_flagged_but_still_shown(con) -> None:
+    """The asymmetry is deliberate. A price cannot fall more than 100%, so a
+    symmetric threshold on abs(move) is silently jumps-only -- and at the
+    shallower depth a fall needs, a real collapse and a forward split are
+    indistinguishable while the real ones are more common. So the fall is
+    counted out loud and left in the list."""
+    add_price(con, "FWD", D3, "300.00")
+    add_price(con, "FWD", D4, "100.00")
+    add_price(con, "REAL", D3, "10.00")
+    add_price(con, "REAL", D4, "11.00")
+
+    result = run(con, as_of=D4, min_moves=1, min_adv_sessions=1)
+    assert result.action_suspect == 0
+    assert result.unexplained_falls == 1
+    assert "FWD" in {m.ticker for sl in result.lists for m in sl.rows}
+    assert "still shown" in " ".join(vol.caveats(result))
+
+
+def test_a_symmetric_threshold_would_have_been_jumps_only() -> None:
+    """Guards the reasoning, not just the behaviour: if someone collapses
+    these back into one constant, the fall side stops working silently."""
+    assert vol.SUSPECT_JUMP > 0
+    assert vol.SUSPECT_FALL > -1, "a fall past -100% is impossible"
+    assert abs(vol.SUSPECT_FALL) < vol.SUSPECT_JUMP

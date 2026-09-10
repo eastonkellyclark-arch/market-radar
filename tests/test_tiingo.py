@@ -515,3 +515,22 @@ def test_upsert_with_no_staged_actions_is_zero(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
     assert t.upsert_corporate_actions(empty, con=None) == 0
+
+
+def test_test_symbol_python_and_sql_spellings_agree():
+    """DuckDB cannot call a Python regex, so the pattern exists twice: the
+    universe filter governs what a future sweep fetches, the publish filter
+    drops what is already in a partition. Two spellings that disagree would
+    leak in exactly one direction and look fine from the other."""
+    import duckdb
+
+    from marketradar.sources import tiingo as t
+
+    con = duckdb.connect()
+    for symbol, expected in t.TEST_SYMBOL_EXAMPLES:
+        py = bool(t.TEST_SYMBOL.match(symbol))
+        sql = con.execute(
+            "select regexp_matches(upper(?), ?)", [symbol, t.TEST_SYMBOL_SQL]
+        ).fetchone()[0]
+        assert py is expected, f"python filter disagrees on {symbol}"
+        assert bool(sql) is expected, f"sql filter disagrees on {symbol}"
