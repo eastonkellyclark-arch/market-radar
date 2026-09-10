@@ -99,6 +99,8 @@ class Context:
     clusters: list[dict[str, Any]] = field(default_factory=list)
     deals: list[dict[str, Any]] = field(default_factory=list)
     outcomes: list[dict[str, Any]] = field(default_factory=list)
+    review: list[dict[str, Any]] = field(default_factory=list)
+    review_counts: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -210,6 +212,22 @@ def gather(con: duckdb.DuckDBPyConnection | None = None) -> Context:
             "median_run_up": row[10], "events": row[11], "priced": row[12],
             "benchmark": row[13],
         })
+
+    for status, n in q("select status, count(*) as n from entity_review "
+                       "group by status"):
+        ctx.review_counts[status] = int(n)
+    for row in q(
+        "select ein, plan_year, sponsor_name, matched_cik, matched_name, "
+        "match_basis, candidates, naics, state, participants, status "
+        "from entity_review where status = 'pending' "
+        "order by (match_basis <> 'exact_name'), candidates, ein limit 300"
+    ):
+        ctx.review.append({
+            "ein": row[0], "plan_year": row[1], "sponsor_name": row[2],
+            "matched_cik": row[3], "matched_name": row[4],
+            "match_basis": row[5], "candidates": row[6], "naics": row[7],
+            "state": row[8], "participants": row[9], "status": row[10],
+        })
     return ctx
 
 
@@ -320,6 +338,24 @@ def _probe_clusters_tenpct(ctx: Context) -> tuple[str, str]:
     return LIVE, f"{n} 10%-holder clusters stored, unfiltered"
 
 
+def _probe_review(ctx: Context) -> tuple[str, str]:
+    if not ctx.review_counts:
+        return WAITING, "queue is empty -- run `mr form5500`"
+    pending = ctx.review_counts.get("pending", 0)
+    done = sum(v for k, v in ctx.review_counts.items() if k != "pending")
+    return LIVE, (f"{pending:,} pending, {done:,} decided -- name matched, "
+                  "EIN did not")
+
+
+def _probe_private(ctx: Context) -> tuple[str, str]:
+    """Driven by render(), which loads the sponsor parquet."""
+    stats = getattr(ctx, "_private_stats", None) or {}
+    if not stats:
+        return WAITING, "no sponsor parquet -- run `mr form5500`"
+    return LIVE, (f"{int(stats.get('private') or 0):,} private sponsors, "
+                  f"plan year {stats.get('plan_year')}")
+
+
 def _probe_outcomes(ctx: Context) -> tuple[str, str]:
     if not ctx.outcomes:
         return WAITING, "no study stored -- run `mr outcomes`"
@@ -391,12 +427,15 @@ PANELS: Final[tuple[Panel, ...]] = (
           weekend="Weekend 3"),
 
     Panel("private", "Private companies", "Private",
-          "Form 5500 sponsors by NAICS, employee count, three-year trend.",
-          weekend="Weekend 4"),
+          "Form 5500 sponsors with no SEC match -- 94.8% of them, which is "
+          "the source working rather than failing. NAICS, headcount range, "
+          "DFE trustees filterable as their own category.",
+          probe=_probe_private),
     Panel("review", "Entity review queue", "Private",
-          "Fuzzy sponsor-name matches, confirmed or rejected by hand. A "
-          "working surface rather than a readout.",
-          weekend="Weekend 4"),
+          "Sponsors whose name matched an SEC filer while their EIN did not. "
+          "~23k rows, not 800k: EIN is on 100% of filings, so everything "
+          "else resolves exactly or is private.",
+          probe=_probe_review),
 
     Panel("xbrl", "XBRL fundamentals", "Analysis",
           "Normalised financials, plus which tags resolved and which fell "
@@ -458,6 +497,8 @@ def render(
     panels: tuple[Panel, ...] = PANELS,
     digest: Any = None,
     details: dict[str, Any] | None = None,
+    private: list[dict[str, Any]] | None = None,
+    private_stats: dict[str, Any] | None = None,
 ) -> str:
     """The page. With a digest, health/macro/screens get real bodies.
 
@@ -488,7 +529,15 @@ def render(
         bodies["deals"] = body_html.deals_html(ctx.deals)
     if ctx.outcomes:
         bodies["outcomes"] = body_html.outcomes_html(ctx.outcomes)
+    if ctx.review:
+        bodies["review"] = body_html.review_html(ctx.review, ctx.review_counts)
+    if private:
+        bodies["private"] = body_html.private_html(
+            private, private_stats or {})
 
+    # Stashed so _probe_private can see what render() loaded without the
+    # probe signature growing a parameter every panel does not need.
+    object.__setattr__(ctx, "_private_stats", private_stats or {})
     resolved = [(p, *p.resolve(ctx)) for p in panels]
     counts = {s: sum(1 for _, st, _ in resolved if st == s)
               for s in (LIVE, WAITING, NOT_BUILT)}
@@ -520,6 +569,8 @@ def render(
         parts.append(body_html.FEED_SCRIPT)
     if ctx.deals:
         parts.append(body_html.DEALS_SCRIPT)
+    if private or ctx.review:
+        parts.append(body_html.PRIVATE_SCRIPT)
     if details:
         parts.append(
             "window.__TK__=" + json.dumps(details, separators=(",", ":")) + ";"
@@ -708,13 +759,18 @@ def write(
     ctx: Context | None = None,
     digest: Any = None,
     details: dict[str, Any] | None = None,
+    private: list[dict[str, Any]] | None = None,
+    private_stats: dict[str, Any] | None = None,
 ) -> Path:
     """Render to a gitignored local file. There is no publish counterpart."""
     target = Path(path) if path else DEFAULT_OUTPUT
     target.parent.mkdir(parents=True, exist_ok=True)
     ctx = ctx or gather(con)
-    target.write_text(render(ctx, digest=digest, details=details),
-                      encoding="utf-8")
+    target.write_text(
+        render(ctx, digest=digest, details=details,
+               private=private, private_stats=private_stats),
+        encoding="utf-8",
+    )
     return target
 
 

@@ -325,7 +325,7 @@ Verified Stooq format (confirmed against the actual archive, 2026-09-04):
 
 | Source | Gives | Cadence |
 |---|---|---|
-| **DOL Form 5500** | Sponsor name, EIN, address, NAICS, participant counts (employee proxy), plan assets. ~800k plans, back to 1999. | Zipped CSVs, ~1st of month |
+| **DOL Form 5500** | Sponsor name, **EIN (on 100% of filings)**, address, NAICS, participant counts (employee proxy), plan assets. **Two datasets: `F_5500` main form and `F_5500_SF` short form. 1,023,597 plans for plan year 2024 alone** (225,591 + 798,006), back to 1999. The short form is where small private employers are. | Zipped CSVs, refreshed monthly; plan years lag, so the newest complete year trails by ~1.5 years |
 | **SAM.gov / USAspending** | Federal contract awards — real revenue for contractors | API + bulk |
 | **FMCSA** | Fleet size, safety records, operating authority (trucking/logistics) | Bulk |
 | **OSHA** | Facility inspections, site-level employee counts | Bulk |
@@ -638,24 +638,72 @@ filing does.
 
 ### Weekend 4 — Private company data
 
-Most unknowns of the four. Form 5500 sponsor names are messy — DBAs, legal
-entity names, and subsidiary rollups all differ from how a company is known.
-Fuzzy match into a review queue; never auto-merge above a threshold without a
-human-confirmable record. Budget more time than the other three weekends.
+**Measured 2026-09-10 before building, and the measurement changed the
+design.** The old plan here was "fuzzy match ~800k sponsor names into a
+permanent review queue". That is now known to be the wrong shape, and the
+numbers are recorded below so it is not proposed again.
 
-- `sources/form5500.py` — bulk loader → Parquet, partitioned by year
-- Entity resolution: sponsor names → `companies`
+Plan year 2024, both forms, 1,023,597 plans and 858,480 distinct sponsors:
+
+| tier | sponsors | share |
+|---|---|---|
+| EIN match to an SEC filer (authoritative) | 22,141 | 2.58% |
+| exact name match | 13,008 | 1.52% |
+| normalized name match | 41,913 | 4.88% |
+| any of the three | 45,547 | 5.31% |
+| no match — the private population | 812,933 | 94.69% |
+| EIN match to a *listed* filer | 2,159 | 0.25% |
+
+Two findings decide the build:
+
+**EIN is on every record.** Zero of 1,023,597 filings lack one. NAICS is on
+96–99.9%, state on 100%, and a DBA name on only 1.8% — so the DBA problem the
+old note warned about is real but rare, and it is not on the join path at
+all. Resolution keys on EIN.
+
+**Name matching is wrong more often than right.** Because EIN gives ground
+truth, name matching can be *scored* rather than assumed. Of the 22,141
+sponsors with an authoritative EIN match, exact name recall is 39.3% and
+normalized name recall 83.6% — but normalized name also produced 23,406
+matches with no EIN match, so its **best-case precision is 44.2%**. Fuzzy
+matching sits strictly below that. Collisions show why: 11 SEC filers share
+the normalized key `'energy'`, 9 share `'capital'`.
+
+A matcher that is wrong more than half the time is worse than no matcher,
+because the errors are invisible. So there is **no fuzzy matching on the
+public-match path**.
+
+- `sources/form5500.py` — bulk loader → Parquet, partitioned by plan year.
+  **Both forms.** `F_5500` is the main form (100+ participants, 225,591
+  filings for 2024) and `F_5500_SF` is the short form (under 100 participants,
+  798,006 filings). The short form is the private population; loading only
+  the main form gets a quarter of the data and the wrong quarter.
+- Entity resolution: **EIN → `companies`, never sponsor name.** Name matches
+  that disagree with EIN go to the review queue.
+- **DFE filings are flagged, not dropped.** 9,805 of the main form's 225,591
+  filings are Direct Filing Entities — master trusts, collective investment
+  funds, pooled separate accounts (`TYPE_DFE_PLAN_ENTITY_CD` in C/P/M/E/G/D).
+  They are trustees, not employers, and they dominate any plan-count-weighted
+  view: sorted by plans, the top of the "private" population is Transamerica
+  Life, State Street Global Advisors Trust and BNY Mellon. Excluded from
+  employer lists, marked as a category rather than deleted — same treatment
+  as the FUND flag on Form 4 clusters and the SPAC deal type.
+- **Partial plan years are visible, never silently thin.** Filings lag the
+  plan year: 2026 does not exist yet and 2025 is a third the size of 2024
+  (10 MB against 28 MB) because it is still being filed. 2024 is the newest
+  complete year. A count that is small because the year is young must say so.
 - Participant-count time series and YoY deltas
 - `sources/usaspending.py` — contract awards
 - `screens/mature_target.py` — v1
 
 **UI:**
 
-- `U8` private-company panel — NAICS, employee count, three-year trend
-- `U9` entity review queue — the fuzzy sponsor-name matches, confirmed or
-  rejected by hand. This one is a *working* surface rather than a readout,
-  and it is the panel most likely to justify the whole track: the alternative
-  is resolving 5500 sponsor names in a terminal.
+- `U8` private-company panel — NAICS, employee count, three-year trend, with
+  DFEs filterable as their own category
+- `U9` entity review queue — **the ~23,000 sponsors whose name matched an SEC
+  filer while their EIN did not.** Not 800k names: the private population has
+  nothing to resolve against and needs no review. A *working* surface rather
+  than a readout.
 
 **Exit:** query private companies in your target NAICS by employee count and
 three-year trend, and clear a review queue without writing SQL.
@@ -713,12 +761,18 @@ you have to remember.
 - **XBRL normalization.** Tag names vary for the same concept across filers and
   years. History mostly starts ~2009. Banks, insurers, and REITs need separate
   handling or they silently produce garbage.
-- **Form 5500 entity resolution.** Expect a manual review queue permanently.
-  Note this implies a human-confirmation interface that is not yet specced or
-  designed anywhere in this document.
-- **Weekend 4 is not a weekend.** Form 5500 sponsor resolution across ~800k
-  plans is a multi-week project. Weekends 1–3 build the equities product;
-  Weekend 4 starts a second product from zero.
+- **Form 5500 entity resolution.** ~~Expect a manual review queue
+  permanently.~~ **Measured 2026-09-10 and this was wrong.** EIN is present
+  on 100% of filings, so resolution is an exact join and the review queue is
+  ~23,000 name-matched-but-EIN-mismatched sponsors rather than 800k names.
+  The risk that remains is the opposite one: name matching *looks* like it
+  works. Normalized-name precision is 44.2% against EIN ground truth, and a
+  matcher wrong more than half the time is worse than none because the errors
+  are invisible. Do not add fuzzy matching to the public-match path.
+- **Weekend 4 is still not a weekend**, but for a different reason than
+  assumed. Sponsor resolution is no longer the hard part -- the volume is.
+  1,023,597 plans per year across two file formats, with participant time
+  series and YoY deltas on top.
 
 **Operational:**
 

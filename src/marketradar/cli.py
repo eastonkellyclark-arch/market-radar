@@ -148,6 +148,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-load", action="store_true", help="fetch and report, store nothing"
     )
 
+    p_5500 = sub.add_parser(
+        "form5500",
+        help="load DOL Form 5500 and resolve sponsors by EIN",
+    )
+    p_5500.add_argument("--year", type=int, default=2024, metavar="YYYY",
+                        help="plan year (default 2024, the newest complete "
+                             "one -- filings lag the plan year by ~18 months)")
+    p_5500.add_argument("--cache", default=".cache", metavar="DIR",
+                        help="where the DOL zips and sec_eins.parquet live")
+    p_5500.add_argument("--out", default=".cache/form5500", metavar="DIR",
+                        help="where to write the sponsor parquet")
+    p_5500.add_argument("--baseline", type=int, metavar="N",
+                        help="filings in the newest complete year, for the "
+                             "partial-year check")
+    p_5500.add_argument("--top-naics", type=int, default=10, metavar="N",
+                        help="NAICS codes to print (0 to skip)")
+    p_5500.add_argument("--no-load", action="store_true",
+                        help="report only; write no parquet and no queue rows")
+
     p_audit = sub.add_parser(
         "actions-audit",
         help="large price moves no corporate action explains (missing splits)",
@@ -456,6 +475,46 @@ def _cmd_sec_tickers(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _private_rows(limit: int = 400):
+    """Top private sponsors by headcount, plus the plan year's shape.
+
+    Read from the parquet rather than Postgres: 858,480 sponsors is a data
+    file, and the manifest sends government data to a Release. The panel
+    needs the head of the list, not the table.
+    """
+    from pathlib import Path as _PP
+
+    import duckdb as _dd
+
+    found = sorted(_PP(".cache/form5500").glob("form5500_sponsors_*.parquet"))
+    if not found:
+        return [], {}
+    newest = found[-1]
+    d = _dd.connect()
+    d.register("spons", d.read_parquet(newest.as_posix()))
+    stats = d.execute("""
+        select any_value(plan_year), count(*),
+               count(*) filter (where not by_ein and not name_matched),
+               count(*) filter (where is_dfe),
+               count(*) filter (where by_ein_listed),
+               count(*) filter (where not by_ein and name_matched)
+        from spons
+    """).fetchone()
+    cols = ("sponsor_name", "state", "naics", "plans",
+            "participants_sum", "participants_max", "is_dfe")
+    rows = d.execute(f"""
+        select {', '.join(cols)} from spons
+        where not by_ein
+        order by participants_max desc, plans desc limit {int(limit)}
+    """).fetchall()
+    return (
+        [dict(zip(cols, r)) for r in rows],
+        {"plan_year": stats[0], "sponsors": stats[1], "private": stats[2],
+         "dfe": stats[3], "listed": stats[4], "ambiguous": stats[5],
+         "completeness": f"Source file {newest.name}."},
+    )
+
+
 def _cmd_dashboard(args: argparse.Namespace) -> int:
     """Render the panel map to a local file and open it.
 
@@ -498,7 +557,10 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         except Exception as exc:
             ctx.notes.append(f"Ticker detail unavailable: {str(exc)[:140]}")
 
-    target = shell.write(args.out, ctx=ctx, digest=digest, details=details)
+    private, private_stats = _private_rows()
+    target = shell.write(args.out, ctx=ctx, digest=digest,
+                         details=details, private=private,
+                         private_stats=private_stats)
     counts = shell.summary(ctx)
 
     print(f"wrote {target}")
@@ -602,6 +664,95 @@ def _deal_events(con):
         )
         where rn = 1
     """)
+
+
+def _cmd_form5500(args: argparse.Namespace) -> int:
+    """Load DOL Form 5500 for one plan year and resolve sponsors by EIN.
+
+    Both forms. Resolution is an exact EIN join -- names are compared only to
+    populate the review queue, because normalized-name matching scores 44.2%
+    precision against EIN ground truth and a matcher wrong more than half the
+    time is worse than none.
+    """
+    from pathlib import Path as _P
+
+    import duckdb as _ddb
+
+    from marketradar import storage
+    from marketradar.sources import form5500
+
+    cache = _P(args.cache)
+    work = cache / "dol"
+    print(f"plan year {args.year}: fetching both forms")
+    archives = form5500.fetch(args.year, cache)
+    for a in archives:
+        print(f"  {a.kind:<6} {a.path.name}  "
+              f"{a.path.stat().st_size / 1e6:.1f} MB")
+
+    con = _ddb.connect()
+    filings = form5500.load_filings(con, archives, work)
+    print(f"\n{filings:,} filings")
+    for form, n, eins in con.execute(
+        "select form, count(*), count(distinct ein) from f5500_filings "
+        "group by form order by form"
+    ).fetchall():
+        print(f"  {form:<6} {n:>9,} filings  {eins:>8,} distinct EINs")
+
+    complete, why = form5500.completeness(
+        con, args.year, filings, baseline=args.baseline)
+    print(f"  {'complete' if complete else 'PARTIAL'}: {why}")
+
+    sponsors = form5500.build_sponsors(con)
+    print(f"\n{sponsors:,} distinct sponsors, keyed on EIN")
+
+    # SEC filers, for the EIN join. The EIN comes from the bulk submissions
+    # file; companies.ein is empty, which is why this is a parquet and not a
+    # table read.
+    filers_path = cache / "sec_eins.parquet"
+    if not filers_path.exists():
+        print(f"\n{filers_path} is missing -- cannot resolve without SEC EINs.",
+              file=sys.stderr)
+        return EXIT_ERROR
+    filers = con.read_parquet(filers_path.as_posix())
+    res = form5500.resolve(con, filers)
+
+    print(f"\nresolution, plan year {res.plan_year}")
+    print(f"  sponsors                    {res.sponsors:>9,}")
+    print(f"  EIN match to an SEC filer   {res.by_ein:>9,}  "
+          f"{res.by_ein / res.sponsors * 100:5.2f}%")
+    print(f"  ...of those, listed         {res.by_ein_listed:>9,}  "
+          f"{res.by_ein_listed / res.sponsors * 100:5.2f}%")
+    print(f"  name matched, EIN did not   {res.name_only:>9,}  "
+          f"{res.name_only / res.sponsors * 100:5.2f}%  -> review queue")
+    print(f"  private (no match at all)   {res.private:>9,}  "
+          f"{res.private_share * 100:5.2f}%  <- the population")
+    print(f"  DFE filers (flagged)        {res.dfe:>9,}  "
+          f"{res.dfe / res.sponsors * 100:5.2f}%  trustees, not employers")
+
+    if args.top_naics:
+        print("\ntop NAICS among the private population:")
+        for code, c, part in con.execute("""
+            select naics, count(*) as c, sum(participants_max) as p
+            from f5500_resolved
+            where not by_ein and not is_dfe and naics is not null
+            group by 1 order by 2 desc limit ?
+        """, [args.top_naics]).fetchall():
+            print(f"  {code}  {c:>8,} sponsors  {int(part or 0):>10,} participants")
+
+    if args.no_load:
+        print("\n--no-load: nothing stored, nothing written")
+        return EXIT_OK
+
+    out = form5500.publish(con, args.year, _P(args.out))
+    print(f"\npublished {out.partition}: {out.row_count:,} sponsors")
+
+    rows = form5500.review_rows(con)
+    stats = form5500.load_review_queue(
+        rows, con=storage.connect(attach_postgres=True))
+    print(f"review queue: {stats['inserted']:,} new, "
+          f"{stats['pending']:,} pending, {stats['after']:,} total")
+    print("  decided rows are never reopened by a re-run")
+    return EXIT_OK
 
 
 def _cmd_actions_audit(args: argparse.Namespace) -> int:
@@ -1117,6 +1268,17 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_form4(args)
         except Exception as exc:
             print(f"mr form4: error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "form5500":
+        load_dotenv()
+        try:
+            return _cmd_form5500(args)
+        except Exception as exc:
+            from marketradar.freshness import StaleDataError
+
+            label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
+            print(f"mr form5500: {label}: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "actions-audit":

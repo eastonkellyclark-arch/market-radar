@@ -718,3 +718,274 @@ def outcomes_html(rows: list[dict[str, Any]]) -> str:
         splits, which measures our corporate-actions coverage, not the
         market.</p>
       {''.join(blocks)}"""
+
+
+# --- Weekend 4: private companies and the review queue ------------------
+
+#: NAICS codes seen often enough in the Form 5500 private population to be
+#: worth naming on screen. Not a lookup table for all of NAICS -- just the
+#: head of the distribution, so a code is readable without a second window.
+NAICS_LABELS: Final[dict[str, str]] = {
+    "541990": "professional / scientific / technical services",
+    "621111": "offices of physicians",
+    "621210": "offices of dentists",
+    "541110": "offices of lawyers",
+    "812990": "personal services",
+    "541600": "management / consulting services",
+    "238900": "specialty trade contractors",
+    "813000": "religious / grantmaking / civic organizations",
+    "611000": "educational services",
+    "238220": "plumbing, heating and air-conditioning contractors",
+    "561000": "administrative and support services",
+    "722500": "restaurants",
+    "236000": "construction of buildings",
+    "524210": "insurance agencies and brokerages",
+    "523900": "other financial investment activities",
+}
+
+
+def naics_label(code: str | None) -> str:
+    if not code:
+        return "unclassified"
+    return NAICS_LABELS.get(code, code)
+
+
+def private_html(rows: list[dict[str, Any]], stats: dict[str, Any]) -> str:
+    """Private companies from Form 5500, by NAICS and headcount.
+
+    **This panel's population is the 94.8% that matches nothing.** Sponsors
+    that resolve to an SEC filer are public companies we already track from
+    the other end; the ones with no match are the reason to read Form 5500 at
+    all, so "unresolved" is the filter for the panel rather than a problem
+    reported by it.
+
+    Two headcount columns, not one. A sponsor with several plans counts the
+    same people in each, so the sum across plans is an upper bound and the
+    largest single plan is a lower one. Neither is the headcount, and showing
+    only one would imply a precision this data does not have.
+
+    DFE sponsors -- master trusts, collective investment funds, pooled
+    separate accounts -- are filterable as their own category rather than
+    dropped. They are trustees, not employers, and they dominate any
+    plan-weighted view: sorted by plans the top of this list would be
+    Transamerica Life and BNY Mellon.
+    """
+    if not rows:
+        return ('<p class="empty">No Form 5500 sponsors loaded. Run '
+                "<code>mr form5500</code>.</p>")
+
+    by_naics: dict[str, int] = {}
+    for r in rows:
+        code = r.get("naics") or ""
+        by_naics[code] = by_naics.get(code, 0) + 1
+    chips = "".join(
+        f'<button class="f" data-f="naics" data-v="{_esc(k)}" '
+        f'title="{_esc(naics_label(k))}">{_esc(k or "none")} '
+        f'<span class="count">{v:,}</span></button>'
+        for k, v in sorted(by_naics.items(), key=lambda kv: -kv[1])[:12]
+    )
+
+    body = []
+    for r in rows:
+        marks = []
+        if r.get("is_dfe"):
+            marks.append(
+                '<span class="mk fund" title="a trustee or pooled vehicle, '
+                'not an employer">DFE</span>'
+            )
+        lo = int(r.get("participants_max") or 0)
+        hi = int(r.get("participants_sum") or 0)
+        head = f"{lo:,}" if lo == hi else f"{lo:,}&ndash;{hi:,}"
+        body.append(
+            f'<tr class="pv" data-naics="{_esc(r.get("naics") or "")}" '
+            f'data-dfe="{int(bool(r.get("is_dfe")))}" '
+            f'data-head="{hi}">'
+            f'<td class="tk">{_esc((r.get("sponsor_name") or "")[:38])}</td>'
+            f'<td class="note">{_esc(r.get("state") or "")}</td>'
+            f'<td class="note" title="{_esc(naics_label(r.get("naics")))}">'
+            f'{_esc(r.get("naics") or "-")}</td>'
+            f'<td class="num">{r.get("plans") or 0}</td>'
+            f'<td class="num">{head}</td>'
+            f'<td class="note">{"".join(marks)}</td></tr>'
+        )
+
+    total = int(stats.get("sponsors") or 0)
+    private = int(stats.get("private") or 0)
+    dfe = int(stats.get("dfe") or 0)
+    ambiguous = int(stats.get("ambiguous") or 0)
+    year = stats.get("plan_year") or "?"
+    note = stats.get("completeness") or ""
+    return f"""
+      <p class="note">Plan year {_esc(year)}. <strong>{private:,}</strong> of
+        {total:,} sponsors match no SEC filer by any means &mdash; that
+        population <em>is</em> the source, not a resolution failure. A
+        further {ambiguous:,} have a name that matched while the EIN did not
+        and sit in the review queue rather than being counted either way.
+        {dfe:,} are Direct Filing Entities (trustees, flagged not dropped).
+        {_esc(note)}</p>
+      <p class="note">Headcount is a <strong>range</strong>: a sponsor with
+        several plans counts the same people in each, so the largest single
+        plan is a floor and the sum across plans a ceiling.</p>
+      <div class="filters">{chips}
+        <button class="f" data-f="dfeonly">DFE only</button>
+        <button class="f reset" data-f="pvreset">all</button>
+        <span class="note pv-count"></span></div>
+      <table class="rows" id="private-rows">
+        <thead><tr><th data-s="t">sponsor</th><th>state</th>
+          <th data-s="t">naics</th><th data-s="n" class="num">plans</th>
+          <th data-s="n" class="num">participants</th>
+          <th>flags</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>"""
+
+
+def review_html(rows: list[dict[str, Any]], counts: dict[str, int]) -> str:
+    """The entity review queue: name matched, EIN did not.
+
+    **22,755 rows, not 800,000.** The original plan was to fuzzy match every
+    sponsor name into a permanent queue. Measured: EIN is on 100% of filings,
+    so a sponsor that is also an SEC filer resolves exactly and needs no
+    review, and the 813,654 that match nothing are private companies with
+    nothing to resolve against. What is left is the genuinely ambiguous
+    residue -- a name that matched while the EIN disagreed.
+
+    Ordered by how much the claim is worth. An exact name matching exactly one
+    filer is a plausible subsidiary or rename; a normalized name matching
+    eleven filers is noise. Sorting by candidate count puts the noise last
+    instead of deleting it, and the ``candidates`` column shows why.
+
+    There is deliberately no "confirm all above N% similarity" control.
+    Normalized-name precision is 44.2% against EIN ground truth, so a bulk
+    confirm would be wrong about half the time, invisibly.
+    """
+    if not rows:
+        return ('<p class="empty">Review queue is empty. Run '
+                "<code>mr form5500</code>.</p>")
+
+    pending = counts.get("pending", 0)
+    confirmed = counts.get("confirmed", 0)
+    rejected = counts.get("rejected", 0)
+
+    body = []
+    for r in rows:
+        cand = int(r.get("candidates") or 1)
+        basis = r.get("match_basis") or ""
+        strength = "exact" if basis == "exact_name" else "normalized"
+        weak = ' class="mk rev"' if cand > 1 or basis == "normalized_name" else ""
+        body.append(
+            f'<tr class="rv" data-basis="{_esc(basis)}" '
+            f'data-cand="{cand}">'
+            f'<td class="tk">{_esc((r.get("sponsor_name") or "")[:34])}</td>'
+            f'<td class="note">{_esc(r.get("ein") or "")}</td>'
+            f'<td>{_esc((r.get("matched_name") or "")[:34])}</td>'
+            f'<td class="note">{_esc(r.get("matched_cik") or "")}</td>'
+            f'<td class="note"><span{weak}>{_esc(strength)}</span></td>'
+            f'<td class="num">{cand}</td>'
+            f'<td class="note">{_esc(r.get("naics") or "")} '
+            f'{_esc(r.get("state") or "")}</td></tr>'
+        )
+
+    return f"""
+      <p class="note"><strong>{pending:,} pending</strong>, {confirmed:,}
+        confirmed, {rejected:,} rejected. These are sponsors whose
+        <em>name</em> matched an SEC filer while their <em>EIN</em> did not
+        &mdash; each is a subsidiary, a rename, or a coincidence.</p>
+      <p class="note">There is no bulk-confirm control on purpose.
+        Normalized-name matching scores <strong>44.2% precision</strong>
+        against EIN ground truth, so confirming by similarity would be wrong
+        about half the time and the errors would be invisible. Rows matching
+        more than one filer are marked and sorted last: 11 SEC filers share
+        the normalized name <code>energy</code>.</p>
+      <div class="filters">
+        <button class="f" data-f="basis" data-v="exact_name">exact only</button>
+        <button class="f" data-f="single">one candidate only</button>
+        <button class="f reset" data-f="rvreset">all</button>
+        <span class="note rv-count"></span></div>
+      <table class="rows" id="review-rows">
+        <thead><tr><th data-s="t">sponsor (Form 5500)</th><th>ein</th>
+          <th data-s="t">matched filer (SEC)</th><th>cik</th>
+          <th>basis</th><th data-s="n" class="num">candidates</th>
+          <th>naics / state</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>"""
+
+
+#: Filtering for both Weekend 4 panels. Same inline-script rule as the rest.
+PRIVATE_SCRIPT: Final[str] = """
+(function () {
+  function wire(tableId, countSel, rowClass, filters) {
+    var table = document.getElementById(tableId);
+    if (!table) { return; }
+    var state = {};
+    function apply() {
+      var shown = 0, total = 0;
+      table.querySelectorAll('tbody tr.' + rowClass).forEach(function (r) {
+        total++;
+        var ok = filters.every(function (f) { return f(r, state); });
+        r.hidden = !ok;
+        if (ok) { shown++; }
+      });
+      var c = document.querySelector(countSel);
+      if (c) { c.textContent = shown.toLocaleString() + ' of ' +
+                               total.toLocaleString(); }
+    }
+    return { apply: apply, state: state };
+  }
+
+  var pv = wire('private-rows', '.pv-count', 'pv', [
+    function (r, s) { return !s.naics || r.dataset.naics === s.naics; },
+    function (r, s) { return !s.dfeOnly || r.dataset.dfe === '1'; }
+  ]);
+  if (pv) {
+    document.querySelectorAll('button.f[data-f="naics"]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        pv.state.naics = (pv.state.naics === b.dataset.v) ? null : b.dataset.v;
+        document.querySelectorAll('button.f[data-f="naics"]').forEach(
+          function (o) { o.classList.toggle('sel', o.dataset.v === pv.state.naics); });
+        pv.apply();
+      });
+    });
+    var d = document.querySelector('button.f[data-f="dfeonly"]');
+    if (d) d.addEventListener('click', function () {
+      pv.state.dfeOnly = !pv.state.dfeOnly;
+      d.classList.toggle('sel', pv.state.dfeOnly);
+      pv.apply();
+    });
+    var pr = document.querySelector('button.f[data-f="pvreset"]');
+    if (pr) pr.addEventListener('click', function () {
+      pv.state.naics = null; pv.state.dfeOnly = false;
+      document.querySelectorAll('button.f').forEach(function (o) {
+        o.classList.remove('sel'); });
+      pv.apply();
+    });
+    pv.apply();
+  }
+
+  var rv = wire('review-rows', '.rv-count', 'rv', [
+    function (r, s) { return !s.basis || r.dataset.basis === s.basis; },
+    function (r, s) { return !s.single || r.dataset.cand === '1'; }
+  ]);
+  if (rv) {
+    var be = document.querySelector('button.f[data-f="basis"]');
+    if (be) be.addEventListener('click', function () {
+      rv.state.basis = rv.state.basis ? null : be.dataset.v;
+      be.classList.toggle('sel', !!rv.state.basis);
+      rv.apply();
+    });
+    var sg = document.querySelector('button.f[data-f="single"]');
+    if (sg) sg.addEventListener('click', function () {
+      rv.state.single = !rv.state.single;
+      sg.classList.toggle('sel', rv.state.single);
+      rv.apply();
+    });
+    var rr = document.querySelector('button.f[data-f="rvreset"]');
+    if (rr) rr.addEventListener('click', function () {
+      rv.state.basis = null; rv.state.single = false;
+      if (be) be.classList.remove('sel');
+      if (sg) sg.classList.remove('sel');
+      rv.apply();
+    });
+    rv.apply();
+  }
+})();
+"""

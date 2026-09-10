@@ -126,6 +126,34 @@ mocking. A test in `tests/` walks every module in `sources/` and fails the
 build if one doesn't call it — that is the enforcement a base class would
 give, without the hierarchy.
 
+**Join on the identifier the source guarantees, never on the string humans
+typed.** CIK over ticker. EIN over sponsor name. Accession over timestamp.
+
+This has been the answer three times, each time after a name-based join had
+already been designed:
+
+- **Tickers get recycled.** 356 active symbols carry two different companies
+  inside a ten-year pull, so a ticker is not an entity across time. Prices
+  key on `(ticker, listing_id)` and `companies` keys on CIK.
+- **Timestamps collide.** Two Form 4s from two insiders at the same company
+  filed the same second are not a duplicate -- they are a *cluster*, the
+  single signal Weekend 3 exists to detect -- and the original
+  `(kind, source, company_id, occurred_at)` key silently rejected the second
+  one. Filing signals key on accession, which EDGAR assigns and never reuses.
+- **Sponsor names are a coin flip.** Form 5500 normalized-name matching has
+  44.2% precision against EIN ground truth: wrong more often than right. EIN
+  is on 100% of 1,023,597 filings. Resolution keys on EIN, and there is no
+  fuzzy matching on the public-match path.
+
+The failure mode is always the same and it is always invisible: a name-based
+join does not error, it silently matches the wrong row, and every number
+downstream stays plausible. A matcher that is wrong more than half the time
+is worse than no matcher at all.
+
+Names are for *display* and for *review*, never for joining. Where only a
+name exists, the answer is a review queue with a human-confirmable record --
+not a similarity threshold.
+
 **Jobs are idempotent.** Re-running yesterday's load produces the same result,
 never duplicates. Upsert on natural keys.
 

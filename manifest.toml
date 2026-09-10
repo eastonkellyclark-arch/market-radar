@@ -77,6 +77,22 @@ current = { location = "https://www.sec.gov/cgi-bin/browse-edgar", backend = "ve
 daily_index = { location = "https://www.sec.gov/Archives/edgar/daily-index", backend = "vendor_api" }
 archives = { location = "https://www.sec.gov/Archives", backend = "vendor_api" }
 
+[dol_efast]
+# DOL EFAST2 Form 5500 bulk datasets. Public domain, no key, refreshed monthly
+# (Last-Modified was 2026-08-31 when this was added).
+#
+# TWO files per plan year, not one. `main` is the Form 5500 proper -- plans
+# with 100+ participants, 225,591 filings for 2024. `short` is the 5500-SF,
+# plans under 100 participants, 798,006 filings. The short form is three and a
+# half times the main one and is where small private employers are, so a
+# loader that reads only `main` has a quarter of the data and the wrong
+# quarter.
+#
+# {year} is the plan year. Filings lag it: 2026 does not exist and 2025 is a
+# third the size of 2024 because it is still being filed.
+main = { location = "https://askebsa.dol.gov/FOIA%20Files/{year}/Latest/F_5500_{year}_Latest.zip", backend = "vendor_api" }
+short = { location = "https://askebsa.dol.gov/FOIA%20Files/{year}/Latest/F_5500_SF_{year}_Latest.zip", backend = "vendor_api" }
+
 [sec_files]
 # CIK <-> ticker map for every SEC filer with a listed security. One small
 # file, no key, but SEC requires a descriptive User-Agent with a real contact
@@ -98,3 +114,22 @@ all = { location = "https://github.com/eastonkellyclark-arch/market-radar/releas
 # republish, so this dataset has no public mirror and sources/fred.py has no
 # publish path at all. Decided 2026-09-08 — see CLAUDE.md.
 all = { location = "macro_series", backend = "supabase" }
+
+[form5500_sponsors]
+# One row per (plan year, sponsor EIN), both forms merged. Public domain, so a
+# GitHub Release is correct: DOL data is ours to republish, unlike anything
+# Tiingo touched.
+#
+# Keyed on EIN, which is present on 100% of 1,023,597 filings. Sponsor names
+# are carried for display and review only -- normalized-name matching scores
+# 44.2% precision against EIN ground truth, so it is never a join key. See
+# the identifier rule in CLAUDE.md.
+2022 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2022.parquet", backend = "github_release" }
+2023 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2023.parquet", backend = "github_release" }
+2024 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2024.parquet", backend = "github_release" }
+2025 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2025.parquet", backend = "github_release" }
+
+[entity_review]
+# The review queue: sponsors whose *name* matched an SEC filer while their
+# EIN did not. Working state with writes, so Postgres rather than Parquet.
+all = { location = "entity_review", backend = "supabase" }
