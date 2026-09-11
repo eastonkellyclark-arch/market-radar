@@ -382,6 +382,7 @@ def test_every_panel_body_renderer_handles_no_data() -> None:
         (panels.private_html, ([], {})),
         (panels.mature_html, ([], {})),
         (panels.review_html, ([], {})),
+        (panels.xbrl_html, ([],)),
     ):
         out = fn(*args)
         assert 'class="empty"' in out, f"{fn.__name__} renders nothing for []"

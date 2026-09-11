@@ -16,7 +16,7 @@ import sys
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from marketradar import __version__
 
@@ -653,6 +653,68 @@ def _mature_rows(limit: int = 200, series=None, built=None):
     }
 
 
+def _xbrl_coverage(con: Any, out_dir: Path) -> dict[str, Any]:
+    """Per-concept coverage, read back out of the newest stored partition.
+
+    Recomputed from the rows rather than stored beside them, and that is only
+    possible because **every filing gets a row carrying a status** -- the
+    coverage report is a group-by over the partition, not a separate artifact
+    that could disagree with it. A stored summary is a second copy of a number,
+    and the two drift.
+
+    The funnel cannot be recovered this way: it counts what was *excluded*, and
+    excluded rows are not in the file. So the panel renders it when a load
+    produced one in the same session and omits it otherwise, rather than
+    inventing stages from what survived.
+    """
+    files = sorted(out_dir.glob("xbrl_fundamentals_*.parquet"))
+    if not files:
+        return {}
+    newest = files[-1]
+    quarter = newest.stem.rsplit("_", 1)[-1]
+    from marketradar.sources.xbrl import tag_map
+
+    population = int(con.execute(
+        "select count(distinct adsh) from read_parquet(?)",
+        [newest.as_posix()],
+    ).fetchone()[0])
+    rows = con.execute(
+        "select concept, status, count(*) from read_parquet(?) group by 1, 2",
+        [newest.as_posix()],
+    ).fetchall()
+    tags = con.execute(
+        "select concept, unmapped_tag, count(*) n from read_parquet(?) "
+        "where status = ? and unmapped_tag is not null group by 1, 2 "
+        "order by 1, n desc, 2",
+        [newest.as_posix(), tag_map.UNMAPPED],
+    ).fetchall()
+
+    by_concept: dict[str, dict[str, int]] = {}
+    for concept, status, count in rows:
+        by_concept.setdefault(concept, {})[status] = int(count)
+    queues: dict[str, list[tuple[str, int]]] = {}
+    for concept, tag, n in tags:
+        queues.setdefault(concept, []).append((tag, int(n)))
+
+    coverage = []
+    for concept, statuses in by_concept.items():
+        resolved = statuses.get(tag_map.STATED, 0)
+        rate = resolved / population if population else 0.0
+        declared = tag_map.CONCEPTS.get(concept)
+        coverage.append({
+            "concept": concept,
+            "population": population,
+            "resolved": resolved,
+            "rate": rate,
+            "drift": None if declared is None
+                     else rate - declared.coverage_2024q1,
+            "by_status": {s: statuses.get(s, 0) for s in tag_map.STATUSES},
+            "by_tag": {},
+            "unmapped_tags": queues.get(concept, []),
+        })
+    return {"quarter": quarter, "coverage": coverage}
+
+
 def _cmd_xbrl(args: argparse.Namespace) -> int:
     """Normalize quarters of SEC fundamentals, printing the coverage report.
 
@@ -748,6 +810,13 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         series, built = _series_con()
     except Exception as exc:
         ctx.notes.append(f"Participant series unavailable: {str(exc)[:140]}")
+    # U10. A panel that cannot be drawn says so in the shell rather than
+    # taking the page down, the same as every other body here.
+    try:
+        ctx.xbrl = _xbrl_coverage(con, Path(".cache/xbrl/out"))
+    except Exception as exc:
+        ctx.notes.append(f"XBRL coverage unavailable: {str(exc)[:140]}")
+
     private, private_stats = _private_rows(series=series)
     try:
         mature, mature_stats = _mature_rows(series=series, built=built)

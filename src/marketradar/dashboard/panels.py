@@ -1335,3 +1335,167 @@ PRIVATE_SCRIPT: Final[str] = """
   }
 });
 """
+
+
+def _funnel_html(funnel: dict[str, Any]) -> str:
+    """A funnel's stages, with the reason printed beside each count.
+
+    The first renderer for ``screens.funnel`` on the page, and it is here
+    rather than in a screens panel because the normalizer is where the counts
+    first had somewhere to go. Two things are marked rather than merely listed,
+    matching what the type itself checks: a stage that removed over 90% of what
+    reached it, and a stage that emptied the population.
+    """
+    stages = funnel.get("stages") or []
+    if not stages:
+        return ""
+    rows = []
+    for i, stage in enumerate(stages):
+        share = float(stage.get("share") or 0)
+        removed = int(stage.get("removed") or 0)
+        cut = '<span class="note">-</span>' if not i else (
+            f"-{removed:,} <span class=\"note\">({share * 100:.1f}%)</span>"
+        )
+        mark = ('<span class="collapsed">removed nearly everything &mdash; '
+                "check it</span>" if stage.get("collapsed") else "")
+        rows.append(
+            "<tr>"
+            f'<td class="tk">{_esc(str(stage.get("name", "")))}</td>'
+            f'<td class="num">{int(stage.get("remaining") or 0):,}</td>'
+            f"<td class=\"num\">{cut}</td>"
+            f'<td class="note">{_esc(str(stage.get("why") or ""))} {mark}</td>'
+            "</tr>"
+        )
+    emptied = funnel.get("emptied")
+    warn = ""
+    if emptied:
+        warn = (f'<p class="why"><span class="why-k">empty</span> '
+                f"&#39;{_esc(str(emptied))}&#39; removed every remaining row. "
+                "The list is not short, it is gone.</p>")
+    return f"""
+      <h5>population by stage</h5>
+      <p class="note">A short list is either selective or broken, and the
+        surviving count at each stage is what tells you which.</p>
+      <table class="rows">
+        <thead><tr><th>stage</th><th class="num">remaining</th>
+          <th class="num">removed</th><th>why it exists</th></tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+      {warn}"""
+
+
+# --- U10: XBRL fundamentals coverage ------------------------------------
+
+#: Shown against every concept, because a concept's number is not readable
+#: without it. A concept at 51% and one at 99% are both just a number in a
+#: column otherwise -- the funnel rule, applied one layer further in.
+_XBRL_STATUS_WHY: Final[dict[str, str]] = {
+    "stated": "a mapped tag, consolidated, at the filing's own period end",
+    "absent": "the filer presents no line for it -- pre-revenue, or a nil "
+              "tag. Nothing to fix",
+    "unmapped": "a line exists under a tag the map does not carry. The only "
+                "status that is a work queue",
+    "not_usd": "reported in another currency. Out of scope for a USD table, "
+               "not a gap",
+    "segment_only": "present only disaggregated; no consolidated total",
+    "period_mismatch": "the tag is reported, but not for this period",
+}
+
+
+def xbrl_html(
+    coverage: list[dict[str, Any]],
+    funnel: dict[str, Any] | None = None,
+    *,
+    quarter: str = "",
+) -> str:
+    """Per-concept coverage, the statuses behind it, and the tags to add.
+
+    **This panel ships with the tag map rather than after it**, which is the
+    one thing about it worth arguing. The map is maintained by hand and
+    baseline tag churn between sampled years ran 11-20%, so its coverage rots
+    quietly; a screen of which tags resolved and which fell through is the
+    fastest way to find what the map needs next, and it is useless if it
+    arrives a month after the map does.
+
+    Every concept carries its own number and they are never averaged. Six
+    concepts individually clear 98% and all six on one filer is 64%, so a
+    single "coverage" figure would describe the intersection and hide which
+    concept did the excluding.
+
+    ``drift`` is the number that catches rot: how far this quarter sits from
+    the figure the map records for itself. Negative and growing means a tag
+    has moved.
+    """
+    if not coverage:
+        return ('<p class="empty">No quarter normalized. Run '
+                "<code>mr xbrl --quarter 2024q1</code>.</p>")
+
+    rows = []
+    for cov in sorted(coverage, key=lambda c: -float(c.get("rate") or 0)):
+        rate = float(cov.get("rate") or 0)
+        drift = cov.get("drift")
+        # Shown with its direction and never as a bare magnitude: a concept
+        # five points *below* what the map claims is the thing to act on, and
+        # five points above is not.
+        drift_cell = '<span class="note">-</span>'
+        if drift is not None:
+            cls = " class=\"rot\"" if float(drift) <= -0.01 else ""
+            drift_cell = f'<span{cls}>{float(drift) * 100:+.1f}pp</span>'
+        statuses = cov.get("by_status") or {}
+        chips = "".join(
+            f'<span class="xs" data-status="{_esc(name)}" '
+            f'title="{_esc(_XBRL_STATUS_WHY.get(name, name))}">'
+            f'{_esc(name)} {int(count):,}</span>'
+            for name, count in statuses.items()
+            if name != "stated" and int(count or 0)
+        )
+        queue = cov.get("unmapped_tags") or []
+        queue_cell = '<span class="note">-</span>'
+        if queue:
+            queue_cell = ", ".join(
+                f'<code>{_esc(str(tag))}</code> <span class="note">'
+                f"({int(n):,})</span>" for tag, n in queue[:4]
+            )
+            if len(queue) > 4:
+                queue_cell += f' <span class="note">+{len(queue) - 4} more</span>'
+        rows.append(
+            f"<tr>"
+            f'<td class="tk">{_esc(str(cov.get("concept", "")))}</td>'
+            f'<td class="num">{int(cov.get("resolved") or 0):,}</td>'
+            f'<td class="num">{rate * 100:.1f}%{_bar(rate)}</td>'
+            f'<td class="num">{drift_cell}</td>'
+            f"<td>{chips}</td>"
+            f"<td>{queue_cell}</td></tr>"
+        )
+
+    stages = ""
+    if funnel:
+        stages = _funnel_html(funnel)
+    head = f" &mdash; {_esc(quarter)}" if quarter else ""
+    return f"""
+      <p class="note">One row per (accession, concept), so asking for revenue
+        costs the coverage of revenue and nothing else. <strong>Each concept
+        carries its own number and they are never averaged</strong>: these six
+        individually clear 98%, and all six on the same filer is 64%, so a
+        single figure would report the intersection and hide which concept did
+        the excluding. Operating companies only, post-606 only &mdash; banks,
+        insurers, brokers and REITs are a different table and are counted out
+        in the funnel rather than silently absent.</p>
+      <table class="rows">
+        <thead><tr><th>concept{head}</th><th class="num">resolved</th>
+          <th class="num">rate</th>
+          <th class="num" title="how far this quarter sits from the coverage
+            the tag map records for itself. The map is hand-maintained and tag
+            churn ran 11-20% between sampled years, so it rots quietly.">
+            drift</th>
+          <th>did not resolve</th><th>tags to add</th></tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+      <p class="note"><strong>Five ways not to resolve, and only one is
+        work.</strong> <code>unmapped</code> names a tag to add.
+        <code>absent</code> means the filer reports no such line &mdash;
+        pre-revenue, or a nil tag, and there is nothing to find.
+        <code>not_usd</code> and <code>segment_only</code> are out of scope,
+        and <code>period_mismatch</code> is about the filing rather than the
+        map. Summing them into "missing" would describe none of them.</p>
+      {stages}"""

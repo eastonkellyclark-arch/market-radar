@@ -538,7 +538,7 @@ the build goes red naming both.
 | Private | Private companies | `private` | live | W4 |
 | Private | Mature targets | `mature` | live | W4 |
 | Private | Entity review queue | `review` | live | W4 |
-| Analysis | XBRL fundamentals | `xbrl` | not built | measured and scoped; no loader yet |
+| Analysis | XBRL fundamentals | `xbrl` | live | six concepts with their own coverage figures, the five statuses behind each miss, and the tags to add. U10, shipped with `tag_map.py` rather than after it |
 | Analysis | Deal multiples | `multiples` | not built | beyond |
 | Analysis | Historical outcomes | `outcomes` | live | W3-T3. The survivorship caveat renders beside the number, not in a docstring |
 | Analysis | DCF / 3-statement | `dcf` | not built | beyond |
@@ -1281,7 +1281,7 @@ why the other four were dropped and what it would take to add them back.
    2026-09-10** — see "v1 as built" below.
 4. ~~SIC branches for banks, insurers and REITs~~ — **out of v1.** They are
    a separate table if they are ever built at all; see the v1 scope below.
-5. `U10` fundamentals panel, shipping with step 3.
+5. `U10` fundamentals panel, shipping with step 3. **Done 2026-09-10.**
 
 **Exit:** every core concept resolves for a stated share of filers, the
 unresolved are listed by SIC with the tags they used instead, and no

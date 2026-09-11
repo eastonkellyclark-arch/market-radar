@@ -12,7 +12,7 @@ data is not on this machine, not that the map agrees with it.
 from __future__ import annotations
 
 import csv
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -31,6 +31,8 @@ PRE_COLS = ("adsh", "report", "line", "stmt", "inpth", "tag")
 FY_END = "20231231"
 PRIOR_END = "20221231"
 FILED = "20240215"
+
+NOW = datetime(2026, 9, 10, 21, 0, tzinfo=timezone.utc)
 
 
 def sub(adsh: str, name: str, sic: str, form: str = "10-K",
@@ -596,3 +598,109 @@ def test_the_map_reproduces_its_own_measurement() -> None:
             f"{tag_map.CONCEPTS[cov.concept].coverage_2024q1:.1%} in the map "
             f"({cov.drift:+.1%})"
         )
+
+
+# --- U10: the panel, which ships with the map --------------------------
+
+
+def test_the_panel_waits_until_a_quarter_is_normalized() -> None:
+    from marketradar.dashboard import shell
+
+    state, detail = shell._probe_xbrl(
+        shell.Context(generated_at=NOW, postgres=True))
+    assert state == shell.WAITING
+    assert "mr xbrl" in detail, "a waiting panel names the command that fixes it"
+
+
+def test_the_panel_headline_reports_the_weakest_concept() -> None:
+    """Not the average and not the best.
+
+    Six concepts individually clear 98% and all six on one filer is 64%, so an
+    average describes a table nobody reads. The number worth a headline is the
+    concept a consumer is most likely to be disappointed by.
+    """
+    from conftest import XBRL_COVERAGE
+    from marketradar.dashboard import shell
+
+    state, detail = shell._probe_xbrl(
+        shell.Context(generated_at=NOW, postgres=True, xbrl=XBRL_COVERAGE))
+    assert state == shell.LIVE
+    assert "revenue" in detail, detail      # 87.9%, the weaker of the two
+    assert "assets" not in detail, detail   # 99.5%
+    assert "2024q1" in detail
+
+
+def test_the_panel_shows_the_work_queue_and_marks_drift() -> None:
+    """The panel exists to find what the map needs next, so the two things it
+    must never bury are the tag to add and a coverage figure that has fallen
+    below what the map claims for itself."""
+    from conftest import XBRL_COVERAGE
+    from marketradar.dashboard import panels
+
+    out = panels.xbrl_html(
+        XBRL_COVERAGE["coverage"], XBRL_COVERAGE["funnel"], quarter="2024q1")
+    assert "ConsultingFees" in out, "the unmapped tag is the deliverable"
+    assert "unmapped" in out
+    # Every status appears with a count, so four reasons that need no work
+    # cannot be read as the same thing as the one that does.
+    for status in ("absent", "segment_only", "period_mismatch"):
+        assert status in out, status
+    assert "banks and REITs" in out, "the funnel's stage reasons render too"
+
+
+def test_a_concept_below_its_recorded_coverage_is_marked() -> None:
+    from marketradar.dashboard import panels
+
+    rotted = [{"concept": "revenue", "population": 100, "resolved": 50,
+               "rate": 0.50, "drift": -0.38, "by_status": {"stated": 50},
+               "unmapped_tags": [("SomeNewTag", 12)]}]
+    assert 'class="rot"' in panels.xbrl_html(rotted)
+    healthy = [dict(rotted[0], drift=0.001)]
+    assert 'class="rot"' not in panels.xbrl_html(healthy)
+
+
+def test_the_dashboard_derives_coverage_from_the_rows_it_stored(
+    con, quarter, tmp_path, monkeypatch
+) -> None:
+    """The panel's numbers are a group-by over the partition, never a stored
+    summary beside it.
+
+    That is only possible because every filing gets a row carrying a status. A
+    second copy of a number is a thing that can disagree with the first, and
+    this is the number that says whether the map still works.
+    """
+    from marketradar import manifest
+    from marketradar.cli import _xbrl_coverage
+
+    out = tmp_path / "out"
+    override = tmp_path / "manifest.toml"
+    override.write_text(
+        "[xbrl_fundamentals]\n"
+        f'2024q1 = {{ location = "{out.as_posix()}", '
+        'backend = "github_release" }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(manifest.OVERRIDE_ENV, str(override))
+    manifest.clear_cache()
+    try:
+        loaded = resolve.load("2024q1", out, con=con, tables=quarter,
+                              min_rows=10)
+    finally:
+        manifest.clear_cache()
+
+    derived = _xbrl_coverage(duckdb.connect(), out)
+    assert derived["quarter"] == "2024q1"
+    from_load = {c.concept: c.resolved for c in loaded.coverage}
+    from_file = {c["concept"]: c["resolved"] for c in derived["coverage"]}
+    assert from_file == from_load
+    rev = next(c for c in derived["coverage"] if c["concept"] == "revenue")
+    assert rev["population"] == loaded.filings
+    assert ("ConsultingFees", 1) in rev["unmapped_tags"]
+
+
+def test_no_stored_partition_is_an_empty_dict_not_a_crash(tmp_path) -> None:
+    """`mr dashboard` runs before the first normalization and must still draw
+    the page; the panel says what to run."""
+    from marketradar.cli import _xbrl_coverage
+
+    assert _xbrl_coverage(duckdb.connect(), tmp_path) == {}

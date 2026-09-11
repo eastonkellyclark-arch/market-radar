@@ -149,6 +149,11 @@ class Context:
     outcomes: list[dict[str, Any]] = field(default_factory=list)
     review: list[dict[str, Any]] = field(default_factory=list)
     review_counts: dict[str, int] = field(default_factory=dict)
+    #: Per-concept XBRL coverage and the funnel that produced it. Built by
+    #: `mr dashboard` from a normalized quarter rather than read from Postgres:
+    #: the coverage report is computed with the rows and is not stored apart
+    #: from them.
+    xbrl: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -433,6 +438,25 @@ def _probe_outcomes(ctx: Context) -> tuple[str, str]:
                   "at +1/+5/+30 sessions")
 
 
+def _probe_xbrl(ctx: Context) -> tuple[str, str]:
+    """Live once a quarter is normalized, and it reports the *weakest* concept.
+
+    Not the average, and not the best. Six concepts individually clear 98% and
+    all six on one filer is 64%, so an average describes a table nobody reads;
+    the number that matters for a panel headline is the concept a consumer is
+    most likely to be disappointed by.
+    """
+    coverage = (ctx.xbrl or {}).get("coverage") or []
+    if not coverage:
+        return WAITING, "no quarter normalized -- run `mr xbrl --quarter 2024q1`"
+    worst = min(coverage, key=lambda c: float(c.get("rate") or 0.0))
+    quarter = (ctx.xbrl or {}).get("quarter") or "?"
+    return LIVE, (
+        f"{len(coverage)} concepts over {quarter}; weakest is "
+        f"{worst.get('concept')} at {float(worst.get('rate') or 0) * 100:.1f}%"
+    )
+
+
 def _probe_deals(ctx: Context) -> tuple[str, str]:
     if not ctx.deals:
         return WAITING, "no deal candidates stored -- run `mr deals`"
@@ -520,9 +544,10 @@ PANELS: Final[tuple[Panel, ...]] = (
           probe=_probe_review),
 
     Panel("xbrl", "XBRL fundamentals", "Analysis",
-          "Normalised financials, plus which tags resolved and which fell "
-          "through -- the fastest way to find the next branch tag_map needs.",
-          weekend="Beyond"),
+          "Six concepts, post-606, operating companies only. Which tags "
+          "resolved, which fell through, and which of five reasons each miss "
+          "had -- only one of them is work.",
+          probe=_probe_xbrl),
     Panel("multiples", "Deal multiples", "Analysis",
           "Comparable transactions, filtered before ranked.",
           weekend="Beyond"),
@@ -815,6 +840,11 @@ def render(
     bodies["deals"] = body_html.deals_html(ctx.deals)
     bodies["outcomes"] = body_html.outcomes_html(ctx.outcomes)
     bodies["review"] = body_html.review_html(ctx.review, ctx.review_counts)
+    bodies["xbrl"] = body_html.xbrl_html(
+        (ctx.xbrl or {}).get("coverage") or [],
+        (ctx.xbrl or {}).get("funnel"),
+        quarter=(ctx.xbrl or {}).get("quarter") or "",
+    )
     bodies["private"] = body_html.private_html(private or [], private_stats or {})
     bodies["mature"] = body_html.mature_html(mature or [], mature_stats or {})
 
@@ -955,6 +985,17 @@ h3 {{ font-size:14px; margin:0; font-weight:600; }}
    because nothing is there, and its glyph and label carry the difference. */
 .panel[data-state="not built"],
 .panel[data-state="declined"] {{ opacity:.62; border-style:dashed; }}
+/* Status chips on the XBRL panel. Deliberately not colour-coded by
+   severity: four of the five are not problems, and colouring them as
+   warnings would say they were. */
+.xs {{
+  display:inline-block; margin:0 4px 3px 0; padding:1px 6px; border-radius:9px;
+  border:1px solid var(--rule); font-size:11px; color:var(--muted);
+  white-space:nowrap;
+}}
+.xs[data-status="unmapped"] {{ border-color:#fab219; color:var(--ink); }}
+.rot {{ color:#c2410c; font-weight:600; }}
+.collapsed {{ color:#c2410c; }}
 .notes {{ margin:18px 0 0; padding-left:18px; color:var(--muted); font-size:12px; }}
 footer {{ margin-top:40px; color:var(--muted); font-size:11.5px;
           border-top:1px solid var(--rule); padding-top:12px; }}

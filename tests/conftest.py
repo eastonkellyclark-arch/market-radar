@@ -160,6 +160,39 @@ MATURE_STATS: dict[str, object] = {
 }
 
 
+#: One normalized quarter, in the shape the panel reads. Two concepts rather
+#: than six -- enough for the weakest-concept headline the probe reports and for
+#: the one status that is a work queue, and the loader's own tests cover the
+#: resolution itself.
+XBRL_COVERAGE: dict[str, object] = {
+    "quarter": "2024q1",
+    "coverage": [
+        {"concept": "revenue", "population": 2804, "resolved": 2465,
+         "rate": 0.879, "drift": 0.002,
+         "by_status": {"stated": 2465, "absent": 292, "unmapped": 17,
+                       "not_usd": 0, "segment_only": 20, "period_mismatch": 10},
+         "by_tag": {"Revenues": 768},
+         "unmapped_tags": [("ConsultingFees", 2)]},
+        {"concept": "assets", "population": 2804, "resolved": 2791,
+         "rate": 0.995, "drift": 0.0,
+         "by_status": {"stated": 2791, "absent": 6, "unmapped": 0,
+                       "not_usd": 2, "segment_only": 4, "period_mismatch": 1},
+         "by_tag": {"Assets": 2791}, "unmapped_tags": []},
+    ],
+    "funnel": {
+        "screen": "xbrl_fundamentals/2024q1",
+        "stages": [
+            {"name": "submissions", "remaining": 6028, "why": "every filing",
+             "removed": 0, "share": 0.0, "collapsed": False},
+            {"name": "operating company", "remaining": 2804,
+             "why": "banks and REITs are a different table",
+             "removed": 1043, "share": 0.271, "collapsed": False},
+        ],
+        "emptied": None,
+    },
+}
+
+
 def loaded_context(**overrides):
     """A dashboard Context with every source present and nothing empty.
 
@@ -225,6 +258,7 @@ def loaded_context(**overrides):
              "match_basis": "normalized name", "status": "pending"},
         ],
         review_counts={"pending": 1, "confirmed": 0, "rejected": 0},
+        xbrl=XBRL_COVERAGE,
     )
     base.update(overrides)
     ctx = shell.Context(**base)
