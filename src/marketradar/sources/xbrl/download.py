@@ -107,14 +107,20 @@ def fetch(
     *,
     cache: Path | None = None,
     client: httpx.Client | None = None,
+    tables: tuple[str, ...] = TABLES,
 ) -> Quarter:
     """Download one quarter if it is not already cached, then extract it.
 
     Idempotent by design rather than by luck: a present zip with a plausible
-    size is not downloaded again, and extraction is skipped when the three
-    tables are already on disk. Re-running the loader over a decade of quarters
-    costs nothing the second time, which is what makes a backfill resumable
-    after the inevitable interruption.
+    size is not downloaded again, and extraction is skipped when the tables are
+    already on disk. Re-running the loader over a decade of quarters costs
+    nothing the second time, which is what makes a backfill resumable after the
+    inevitable interruption.
+
+    ``tables`` exists because the three are wildly different sizes. ``sub.txt``
+    is 1.8 MB and answers who filed; ``num.txt`` is 490 MB and answers what they
+    reported. The filer universe needs only the first, so unpacking all three
+    for it would cost 15 GB across the range to read 54 MB.
     """
     if not QUARTER.match(quarter):
         raise XbrlFetchError(f"{quarter!r} is not a quarter like '2024q1'")
@@ -129,20 +135,20 @@ def fetch(
         _download(quarter, zip_path, client=client)
         downloaded = True
 
-    tables = {name: work / f"{quarter}_{name}.txt" for name in TABLES}
-    missing = [name for name, path in tables.items()
+    paths = {name: work / f"{quarter}_{name}.txt" for name in tables}
+    missing = [name for name, path in paths.items()
                if not path.exists() or path.stat().st_size == 0]
     if missing:
         _extract(zip_path, quarter, work, missing)
 
-    for name, path in tables.items():
+    for name, path in paths.items():
         if not path.exists() or path.stat().st_size == 0:
             raise XbrlFetchError(
                 f"{quarter}: {name}.txt is missing or empty after extraction. "
                 f"Delete {zip_path} and re-run -- a truncated download is the "
                 "usual cause."
             )
-    return Quarter(quarter=quarter, zip_path=zip_path, tables=tables,
+    return Quarter(quarter=quarter, zip_path=zip_path, tables=paths,
                    downloaded=downloaded)
 
 
@@ -207,8 +213,14 @@ def _extract(zip_path: Path, quarter: str, work: Path, names: list[str]) -> None
         ) from exc
 
 
-def prune(quarter: str, *, cache: Path | None = None) -> int:
-    """Delete a quarter's extracted tables, keeping the zip. Returns bytes freed.
+def prune(
+    quarter: str,
+    *,
+    cache: Path | None = None,
+    keep: tuple[str, ...] = ("sub",),
+    drop_zip: bool = False,
+) -> int:
+    """Delete a quarter's bulk extracts. Returns bytes freed.
 
     A 30-quarter backfill extracts about 18 GB of tab-separated text, and
     ``num.txt`` alone is ~490 MB a quarter. None of it is needed once the
@@ -216,18 +228,32 @@ def prune(quarter: str, *, cache: Path | None = None) -> int:
     scratch and get cleaned up between quarters; peak footprint becomes one
     quarter rather than all of them.
 
-    **The zip stays**, deliberately. Re-resolving is a normal operation here --
-    the tag map is hand-maintained and every addition to it is a reason to run
-    the range again -- and 3 GB of cached zips is the price of that not being a
-    3 GB re-download from SEC each time.
+    ``sub.txt`` is **kept by default** and the other two are not, because the
+    sizes are not comparable: 1.8 MB against 580 MB a quarter. Keeping every
+    quarter's submissions table costs 54 MB across the range and is what the
+    point-in-time filer universe reads, so it is cheaper to keep than to
+    re-extract and far cheaper than re-downloading.
+
+    ``drop_zip`` is off by default but is the right setting once a quarter has
+    loaded: the zip is a ~110 MB convenience that saves a re-download if the tag
+    map changes, and the tag map changing is a ~20 minute re-fetch rather than a
+    problem. 4.3 GB of zips against 8 MB of partitions is a bad trade on a disk
+    with 53 GB free. See docs/build-spec.md.
     """
     root = cache or DEFAULT_CACHE
     freed = 0
     for name in TABLES:
+        if name in keep:
+            continue
         path = root / "work" / f"{quarter}_{name}.txt"
         if path.exists():
             freed += path.stat().st_size
             path.unlink()
+    if drop_zip:
+        zip_path = root / f"{quarter}.zip"
+        if zip_path.exists():
+            freed += zip_path.stat().st_size
+            zip_path.unlink()
     if freed:
-        log.info("%s: pruned %.0f MB of extracted tables", quarter, freed / 1e6)
+        log.info("%s: pruned %.0f MB", quarter, freed / 1e6)
     return freed

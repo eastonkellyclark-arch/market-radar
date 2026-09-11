@@ -1383,6 +1383,85 @@ work queue of 445 filings whose top three suggested fixes were revenue tags:
 sorted, plausible, and meaningless. What a filer puts at the top of its income
 statement is evidence about revenue and about nothing else.
 
+#### The point-in-time universe is two things, and only one was a purchase
+
+Recorded 2026-09-10, because the two halves wear one name and the project has
+been treating them as one problem.
+
+| | status | what it is |
+|---|---|---|
+| point-in-time **price** universe | **still a purchase** | which symbols had prices on a given date, and the bars for them |
+| point-in-time **filer** universe | **free, as of the XBRL load** | which CIKs filed on a given date, under which name, with which SIC |
+
+The filer half is `sources/xbrl/filers.py`: a query over the `sub` tables
+already on disk, 1.8 MB a quarter. **11,323 CIKs over 2019–2026**, of which
+7,499 are still filing, 3,744 have stopped, and 80 are inside the lag window and
+so are `pending` rather than either. Against the current-only `companies` table,
+built from SEC's `company_tickers.json`:
+
+| | in the universe | known to `companies` | |
+|---|---|---|---|
+| still filing | 7,499 | 6,371 | 85.0% |
+| **stopped filing** | **3,744** | **102** | **2.7%** |
+| pending | 80 | 9 | 11.2% |
+
+A thirty-one-fold gap, and it is shaped exactly like an acquisition: a company
+that stopped filing is what a target becomes.
+
+**Be precise about what this fixes, because the two halves look alike.**
+
+*It fixes identification.* Given a deal we can now say who the target was — by
+CIK, with a name, an SIC and a filing window — whether or not the company still
+exists. Any population selected through `companies` inherits a 97% hole in the
+stopped-filing half; selected through the filer universe, it does not. The
+practical payoff is a *targeted* sweep: finding the filings of companies that no
+longer exist by walking eleven years of daily indexes is ~50,000 requests, and
+asking EDGAR about 3,744 known CIKs is 3,744.
+
+*It does not fix survivorship.* A delisted company still has no prices. Nothing
+here produces a bar for a symbol Tiingo never carried, so:
+
+- **Deal multiples get more rows.** A multiple is a stated price over a reported
+  figure and needs no price history at all, so every target the universe turns up
+  is computable.
+- **Forward returns stay biased, by exactly as much as before.** They are keyed
+  on price history, the delisted targets still have none, and the caveat rendered
+  beside every excess figure stands unchanged. Knowing who a company *was* does
+  not tell you what its shares did after a deal we have no bars for.
+
+Two different questions, one of which moved. The rule in CLAUDE.md is refined
+rather than retracted for that reason.
+
+#### The zips do not need keeping, and the submissions tables do
+
+Asked and answered 2026-09-10. After a 30-quarter load the cache held 4.3 GB of
+zips for partitions totalling 8 MB, on a disk with 53 GB free.
+
+What each table is for, per quarter:
+
+| | size | needed for |
+|---|---|---|
+| `sub.txt` | 1.8 MB | the filer universe, the population counts |
+| `pre.txt` | 90 MB | the income-statement top line, during resolution only |
+| `num.txt` | 490 MB | the values, during resolution only |
+| `tag.txt` | 18 MB | nothing here — labels the map records by hand |
+
+So the steady state is: **keep `sub.txt`, drop the rest, drop the zip.** 54 MB
+across the range instead of 4.3 GB, and the filer universe stays rebuildable
+from disk with no network at all.
+
+The zip buys one thing: a re-resolve without re-downloading, which matters
+because the tag map is hand-maintained and every tag added to it is a reason to
+run the range again — that happened twice on the day it was built. But a
+re-download is ~30 requests and about twenty minutes against SEC's 10/sec, with
+no daily quota in the way. **That is a convenience worth 20 minutes, not 4.3 GB.**
+
+`prune` therefore keeps `sub` by default and takes `drop_zip`, and
+`mr xbrl --drop-zips` is the setting to use once a range has loaded clean. One
+exception is deliberate: the reference quarter's zip is worth keeping, because
+`test_the_map_reproduces_its_own_measurement` re-measures every coverage figure
+the map records against it, and that test skipping is worse than 124 MB.
+
 #### The post-606 range, loaded 2026-09-10
 
 30 quarters, 2019q1 through 2026q2, **33,400 operating 10-K filings**. Resumable

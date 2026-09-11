@@ -193,9 +193,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="re-resolve quarters whose partition already "
                              "exists (default: skip them)")
     p_xbrl.add_argument("--keep-extracts", action="store_true",
-                        help="keep the unpacked sub/num/pre text after a "
-                             "quarter loads. ~600 MB each; the default prunes "
-                             "them and keeps the zip")
+                        help="keep the unpacked num/pre text after a quarter "
+                             "loads. ~580 MB each; the default drops them and "
+                             "keeps sub.txt, which is 1.8 MB and is what the "
+                             "filer universe reads")
+    p_xbrl.add_argument("--drop-zips", action="store_true",
+                        help="delete a quarter's zip once it has loaded. The zip "
+                             "only saves a re-download when the tag map changes "
+                             "(~30 requests, ~20 minutes); 30 of them is 4.3 GB")
     p_xbrl.add_argument("--matrix", action="store_true",
                         help="print coverage per concept per quarter over "
                              "every partition already written, and stop")
@@ -280,6 +285,21 @@ def build_parser() -> argparse.ArgumentParser:
                          help="extract and report, store nothing")
     p_deals.add_argument("--review", action="store_true",
                          help="print only candidates whose classifiers disagreed")
+    p_deals.add_argument(
+        "--targets", choices=("stopped", "all"), default=None,
+        help="sweep by CIK from the point-in-time filer universe instead of by "
+             "day. 'stopped' is the filers whose 10-K history has ended -- the "
+             "population a day sweep has least of, and the one an acquisition "
+             "study needs",
+    )
+    p_deals.add_argument("--since", type=_iso_date, metavar="YYYY-MM-DD",
+                         help="with --targets, ignore filings before this date "
+                              "(default 2019-01-01, where the XBRL range starts)")
+    p_deals.add_argument("--chunk", type=int, default=100, metavar="N",
+                         help="with --targets, store after every N filers so an "
+                              "interrupted sweep keeps what it found")
+    p_deals.add_argument("--limit", type=int, default=None, metavar="N",
+                         help="with --targets, stop after N filers")
 
     p_f4 = sub.add_parser(
         "form4", help="read Form 4s and report open-market purchase clusters"
@@ -798,7 +818,8 @@ def _cmd_xbrl(args: argparse.Namespace) -> int:
         done.append(quarter)
         con.close()
         if not args.keep_extracts:
-            xbrl_download.prune(quarter, cache=cache)
+            xbrl_download.prune(quarter, cache=cache,
+                                drop_zip=args.drop_zips)
 
     # The series, not a single number. The map's figures are a 2024q1 reference
     # and coverage genuinely moves between years -- liabilities runs 74.4% in
@@ -1315,6 +1336,99 @@ def _cmd_outcomes(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _filer_universe(con: Any) -> Any:
+    """The point-in-time filer universe, rebuilt from the loaded quarters.
+
+    Rebuilt rather than read back, because it is a query over ``sub.txt`` files
+    already on disk -- 1.8 MB a quarter -- and a stored copy would be a second
+    version of the answer.
+    """
+    from marketradar import manifest
+    from marketradar.sources.xbrl import filers
+
+    quarters = sorted(ref.partition for ref in manifest.datasets()
+                      if ref.dataset == "xbrl_fundamentals")
+    if not quarters:
+        raise RuntimeError("no xbrl partitions are declared in the manifest")
+    return filers.build(con, quarters)
+
+
+def _cmd_deals_by_cik(args: argparse.Namespace) -> int:
+    """Sweep deal filings for the filers the day sweep has least of.
+
+    **Chunked and resumable**, per the sweep rule. 3,744 stopped filers is a
+    one-request-per-company pass plus a header and a body for each deal-item
+    8-K, which will be interrupted; the completed CIKs go to a checkpoint after
+    every chunk and a re-invocation skips them.
+
+    This fixes *identification*, not survivorship. It finds the deals of
+    companies that no longer exist, so a multiple -- a stated price over a
+    reported figure -- becomes computable for them. It conjures no prices, so a
+    forward-return study keyed on price history is exactly as biased as before.
+    """
+    from datetime import date as _date
+
+    from marketradar import storage
+    from marketradar.checkpoint import Checkpoint
+    from marketradar.signals import deals
+    from marketradar.sources.xbrl import filers
+
+    con = storage.connect()
+    universe = _filer_universe(con)
+    for line in universe.lines():
+        print(line)
+
+    if args.targets == "stopped":
+        ciks = filers.stopped_ciks(con)
+        print(f"\nsweeping {len(ciks):,} filers whose 10-K history has ended")
+    else:
+        ciks = [r[0] for r in con.execute(
+            "select cik from sec_filers order by cik").fetchall()]
+        print(f"\nsweeping all {len(ciks):,} filers in the universe")
+
+    since = args.since or _date(2019, 1, 1)
+    # Chunked on index rather than on CIK, because that is what Checkpoint
+    # keys on -- and it refuses to resume a checkpoint whose chunk count
+    # changed, which is the guard against resuming against a different work
+    # list. The CIK order is deterministic (last_period, cik) so the chunks
+    # are the same on every run over the same loaded quarters.
+    chunks = [ciks[i:i + args.chunk] for i in range(0, len(ciks), args.chunk)]
+    book = Checkpoint.load_or_create(
+        f"deals_ciks_{args.targets}", run_id=args.targets,
+        total_chunks=len(chunks),
+    )
+    pending = book.pending()
+    if args.limit:
+        pending = pending[:max(1, args.limit // args.chunk)]
+    print(f"  {book.done_count:,}/{len(chunks):,} chunks of {args.chunk} "
+          f"already swept, {len(pending):,} to go")
+    if not pending:
+        print("nothing to do")
+        return EXIT_OK
+
+    total_found = 0
+    for index in pending:
+        batch = chunks[index]
+        found = deals.fetch_for_ciks(
+            batch, read_exhibits=not args.no_exhibits, since=since)
+        total_found += len(found)
+        inserted = 0
+        after = 0
+        if found and not args.no_load:
+            # Historical: these filings are years old by construction, so the
+            # wall-clock contract would reject every batch.
+            stats = deals.load(found, historical=True)
+            inserted, after = stats["inserted"], stats["after"]
+        print(f"  chunk {index + 1:>3}/{len(chunks)}  {len(batch):>3} filers  "
+              f"{len(found):>4} candidates  {inserted:>4} new"
+              + (f"  {after:,} in table" if after else ""))
+        book.mark_done(index, filers=len(batch), candidates=len(found),
+                       inserted=inserted)
+    print(f"\n{total_found:,} candidates from {len(pending) * args.chunk:,} "
+          "filers swept this run")
+    return EXIT_OK
+
+
 def _cmd_deals(args: argparse.Namespace) -> int:
     """Extract deal candidates from 8-K Items 1.01 and 2.01.
 
@@ -1327,6 +1441,9 @@ def _cmd_deals(args: argparse.Namespace) -> int:
 
     from marketradar.clock import market_today
     from marketradar.signals import deals
+
+    if getattr(args, "targets", None):
+        return _cmd_deals_by_cik(args)
 
     end = args.date or market_today()
     start = end - timedelta(days=args.days - 1)

@@ -930,12 +930,12 @@ def test_the_matrix_renders_without_any_partitions(tmp_path) -> None:
         "no partitions loaded; nothing to compare"]
 
 
-def test_pruning_frees_the_extracts_and_keeps_the_zip(tmp_path) -> None:
-    """18 GB of unpacked text for a 30-quarter range, against 8 MB of output.
+def test_pruning_keeps_the_submissions_table_and_drops_the_bulk(tmp_path) -> None:
+    """``sub.txt`` is 1.8 MB and the other two are 580 MB between them.
 
-    The zip stays on purpose: re-resolving is a normal operation here, because
-    every tag added to the map is a reason to run the range again, and the zip
-    is what keeps that from being a 3 GB re-download.
+    Keeping every quarter's submissions table costs 54 MB across the range and is
+    what the point-in-time filer universe reads, so it is cheaper to keep than to
+    re-extract. ``num`` and ``pre`` are only needed during resolution.
     """
     cache = tmp_path / "cache"
     work = cache / "work"
@@ -946,10 +946,35 @@ def test_pruning_frees_the_extracts_and_keeps_the_zip(tmp_path) -> None:
     freed = fetch_mod.prune("2024q1", cache=cache)
 
     assert freed > 0
-    assert not list(work.glob("2024q1_*.txt")), "extracts survived the prune"
-    assert zip_path.exists(), "the zip was deleted; a re-resolve would re-download"
+    assert (work / "2024q1_sub.txt").exists(), (
+        "sub.txt went, so the filer universe now needs a re-extract"
+    )
+    for gone in ("num", "pre"):
+        assert not (work / f"2024q1_{gone}.txt").exists(), f"{gone} survived"
+    assert zip_path.exists(), "the zip went without being asked to"
     # Idempotent: pruning twice is not an error.
     assert fetch_mod.prune("2024q1", cache=cache) == 0
+
+
+def test_dropping_the_zip_is_asked_for_and_not_assumed(tmp_path) -> None:
+    """4.3 GB of zips for 8 MB of partitions is a bad trade on a full disk, and
+    the zip buys one thing: a re-resolve without a re-download, which is ~30
+    requests and twenty minutes. Worth a flag, not worth a default -- the
+    reference quarter's zip is wanted, because a test re-measures the map's own
+    coverage figures against it.
+    """
+    cache = tmp_path / "cache"
+    write_quarter(cache / "work", "2024q1")
+    zip_path = cache / "2024q1.zip"
+    zip_path.write_bytes(b"x" * 2048)
+
+    freed = fetch_mod.prune("2024q1", cache=cache, drop_zip=True)
+
+    assert not zip_path.exists()
+    assert freed >= 2048
+    assert (cache / "work" / "2024q1_sub.txt").exists(), (
+        "dropping the zip must not also drop the one table worth keeping"
+    )
 
 
 def test_a_quarter_already_loaded_is_skipped_unless_restart(

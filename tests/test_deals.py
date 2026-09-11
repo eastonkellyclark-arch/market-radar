@@ -420,3 +420,81 @@ def test_load_deduplicates_on_accession() -> None:
     inserts = [s for s in captured if s.startswith("insert into deals")]
     assert len(inserts) == 1
     assert inserts[0].count("'0000006845-26-000087'") == 1
+
+
+# --- division_sale: a type, not a caveat --------------------------------
+
+
+def _filing(**kw):
+    """A minimal 8-K header for classifier tests."""
+    from datetime import date as _d
+
+    from marketradar.signals.deals import Filing
+
+    base = dict(
+        accession="0000000000-24-000001", cik="1234567", company="TEST CO",
+        form="8-K", filed=_d(2024, 6, 1), items=("2.01",),
+        doc_types=("8-K", "EX-2.1"), doc_names=("a.htm", "ex21.htm"),
+        sic="3711",
+    )
+    base.update(kw)
+    return Filing(**base)
+
+
+DIVISION_PROSE = (
+    "On June 1, 2024 the Company entered into an asset purchase agreement to "
+    "sell its Industrial Coatings segment to Buyer Holdings, Inc. for "
+    "$250 million in cash."
+)
+WHOLE_PROSE = (
+    "The Company entered into an Agreement and Plan of Merger with Parent, "
+    "pursuant to which each issued and outstanding share of Company common "
+    "stock shall be converted into the right to receive $95.00 in cash."
+)
+
+
+def test_a_business_unit_sale_is_its_own_deal_type() -> None:
+    """Dividing a division's price by its parent's revenue is a category error
+    -- part of a company over all of it -- so it cannot be left as a caveat that
+    each consumer remembers. 84% of the priced population with a pre-deal annual
+    report kept filing afterwards, which is the measurement behind this.
+    """
+    from marketradar.signals import deals
+
+    assert deals.deal_type(_filing(), DIVISION_PROSE, "m_and_a") == "division_sale"
+
+
+def test_whole_company_language_beats_a_mention_of_a_segment() -> None:
+    """A merger that converts every share is not a carve-out however many
+    segments the prose happens to name, and merger prose names them often."""
+    from marketradar.signals import deals
+
+    mixed = WHOLE_PROSE + " The Company operates a single reportable segment."
+    assert deals._DIVISION.search(mixed), "the fixture does not exercise the clash"
+    assert deals.deal_type(_filing(), mixed, "m_and_a") == "operating"
+
+
+def test_a_whole_company_merger_stays_operating() -> None:
+    from marketradar.signals import deals
+
+    assert deals.deal_type(_filing(), WHOLE_PROSE, "m_and_a") == "operating"
+
+
+def test_a_spac_outranks_a_division_reading() -> None:
+    """SIC 6770 comes off the filing header -- the filer's own registration
+    rather than our reading of its prose -- so it is decided first."""
+    from marketradar.signals import deals
+
+    spac = _filing(sic=deals.SIC_BLANK_CHECK)
+    assert deals.deal_type(spac, DIVISION_PROSE, "m_and_a") == "spac"
+
+
+def test_substantially_all_of_the_assets_alone_is_not_a_division() -> None:
+    """That phrase is how a whole small company is sold as well, so the regex
+    requires a *named* unit. A false division_sale silently removes a real
+    takeout from every multiple, which is the expensive direction."""
+    from marketradar.signals import deals
+
+    prose = ("The Company agreed to sell substantially all of the assets of "
+             "the Company to Buyer Inc. for $40 million.")
+    assert deals.deal_type(_filing(), prose, "m_and_a") == "operating"

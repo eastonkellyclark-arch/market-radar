@@ -146,6 +146,34 @@ all = { location = "macro_series", backend = "supabase" }
 2024 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2024.parquet", backend = "github_release" }
 2025 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2025.parquet", backend = "github_release" }
 
+[sec_filers]
+# Point-in-time filer universe: one row per CIK with the window it filed across,
+# the name it last filed under, its SIC, and whether it is still filing. Built
+# from the `sub` tables of every loaded quarter, so it is a query over data
+# already on disk rather than a fetch.
+#
+# **This is the half of "a point-in-time universe" that is not a purchase.** A
+# point-in-time *price* universe still is one -- a delisted company has no bars
+# and knowing who it was does not create them. A point-in-time *filer* universe
+# is this file: 6,431 CIKs over 2019-2026 including the 2,160 that stopped
+# filing before 2024, of which `companies` holds 107.
+#
+# It fixes *identification* and not *survivorship*. See CLAUDE.md.
+#
+# SEC data, public domain, so a GitHub Release is correct.
+all = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/sec_filers.parquet", backend = "github_release" }
+
+[sec_submissions]
+# EDGAR's per-company filing history as JSON: every form a CIK ever filed, with
+# date, items and accession. Not storage -- an endpoint, recorded here so the
+# signal modules hold no literal URL.
+#
+# One request per CIK, which is what makes a *targeted* deal sweep affordable:
+# finding the filings of companies that no longer exist by walking eleven years
+# of daily indexes is ~50,000 requests, and asking about 2,160 known CIKs is
+# 2,160. SEC requires the usual descriptive User-Agent.
+company = { location = "https://data.sec.gov/submissions/CIK{cik}.json", backend = "vendor_api" }
+
 [xbrl_fundamentals]
 # One row per (accession, concept) -- **long, not wide**, and that is a
 # decision rather than a convenience. Individually these concepts clear 98%;

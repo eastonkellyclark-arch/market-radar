@@ -58,7 +58,7 @@ from typing import Any, Final, Iterable, Iterator
 import httpx
 
 from marketradar import manifest
-from marketradar.freshness import assert_fresh
+from marketradar.freshness import StaleDataError, assert_fresh, utc_today
 from marketradar.signals.edgar_rss import (
     EdgarError,
     Pacer,
@@ -497,6 +497,47 @@ _SHELL_PARTY = re.compile(
     re.I,
 )
 
+#: A business unit changing hands rather than a company.
+#:
+#: **This is a deal type, not a caveat, and the reason is arithmetic.** Dividing
+#: a division's price by its parent's whole revenue is a category error: the
+#: numerator is part of the company and the denominator is all of it, so the
+#: multiple comes out small. A screen ranking cheap deals first would rank its
+#: own mistakes first, and nothing about the output would look wrong -- a low
+#: multiple is exactly what it was looking for.
+#:
+#: Measured from the other side: of 2,112 filings with a stated value and a
+#: pre-deal annual report, 1,778 -- 84% -- filed another 10-K afterwards, so the
+#: thing sold was not the filer. That measurement is the *confirmation* and it
+#: arrives years later; this regex is the classification available at extraction,
+#: from the filer's own description. Both are kept, because they fail
+#: differently: prose is available immediately and can be wrong, the filing
+#: record is slow and cannot.
+#:
+#: Deliberately requires a named unit. "Substantially all of the assets" on its
+#: own is how a whole small company is sold as well, so it is not enough.
+_DIVISION = re.compile(
+    r"\b(?:segment|division|business unit|product line|operating unit)\b|"
+    r"\bits\s+(?:wholly[- ]owned\s+)?subsidiar(?:y|ies)\b|"
+    r"\bcarve[- ]out\b|"
+    r"\bsubstantially all of the assets of (?:its|the)\s+\w+\s+"
+    r"(?:business|segment|division|operations)\b",
+    re.I,
+)
+
+#: A whole company changing hands. Beats :data:`_DIVISION` when both fire,
+#: because a merger agreement that converts every share is not a carve-out
+#: however many segments the prose happens to mention.
+_WHOLE_COMPANY = re.compile(
+    r"\beach (?:issued and outstanding )?share[^.]{0,120}"
+    r"(?:converted into|cancelled and converted)\b|"
+    r"\ball of the (?:issued and )?outstanding (?:shares|capital stock|equity)"
+    r"\s+of the Company\b|"
+    r"\bmerged? with and into\b[^.]{0,80}\bthe Company\b|"
+    r"\bwill (?:become|be) a wholly[- ]owned subsidiary of\b",
+    re.I,
+)
+
 _SPAC_TEXT = re.compile(
     r"business combination agreement|\btrust account\b|\bblank check\b|"
     r"\bde-SPAC\b|\bsponsor\b.{0,40}\bfounder shares\b",
@@ -618,12 +659,19 @@ def parties(prose: str, company: str) -> tuple[str, str | None, str | None, str 
 
 
 def deal_type(filing: Filing, prose: str, bucket: str | None) -> str:
-    """``operating`` | ``spac`` | ``securitization`` | ``unclassified``.
+    """``operating`` | ``division_sale`` | ``spac`` | ``securitization`` |
+    ``unclassified``.
 
     SPACs are separated because a quarter of the M&A set is a de-SPAC, and a
     de-SPAC has no operating acquirer, no target financials, and no
     computable multiple. Left in the same population it would drag any
     forward-return study toward the behaviour of trust-account shells.
+
+    ``division_sale`` is separated for a sharper version of the same reason: a
+    business unit's price over its parent's revenue is not a small multiple, it
+    is a category error -- part of a company divided by all of it. See
+    :data:`_DIVISION`. It is a *type* rather than a flag because every consumer
+    has to exclude it, and a flag is the thing that gets forgotten.
 
     SIC 6770 ("blank checks") is checked first: it comes off the filing
     header, so it is the filer's own registration rather than our reading.
@@ -635,6 +683,10 @@ def deal_type(filing: Filing, prose: str, bucket: str | None) -> str:
     if bucket == "securitization":
         return "securitization"
     if bucket == "m_and_a" or filing.exhibit_signal:
+        # Whole-company language wins: a merger that converts every share is
+        # not a carve-out however many segments the prose mentions.
+        if _DIVISION.search(prose) and not _WHOLE_COMPANY.search(prose):
+            return "division_sale"
         return "operating"
     return "unclassified"
 
@@ -872,7 +924,8 @@ def fetch(
 # --- persistence --------------------------------------------------------
 
 
-def load(deals: Iterable[Deal], con: Any = None, *, min_rows: int = 1) -> dict[str, int]:
+def load(deals: Iterable[Deal], con: Any = None, *, min_rows: int = 1,
+         historical: bool = False) -> dict[str, int]:
     """Upsert deals, keyed on accession.
 
     Candidates are stored whether or not the two classifiers agreed -- the
@@ -957,13 +1010,203 @@ def load(deals: Iterable[Deal], con: Any = None, *, min_rows: int = 1) -> dict[s
         ) + ") as t(accession, date)"
     ) if rows else con.sql("select '' as accession, current_date as date where false")
 
-    assert_fresh(
-        "deals",
-        stored,
-        min_rows=min_rows,
-        date_column="date",
-        max_staleness_days=10,
-        expect_cols=("accession", "date"),
-    )
+    # A daily sweep must be fresh; a historical one cannot be.
+    #
+    # Same split as tiingo's closed-year contract, and for the same reason: a
+    # backfill of 2019-2023 filings has a newest date years in the past and
+    # that is not a defect, but dropping the assertion entirely would let a
+    # backfill that matched nothing exit green. So only the wall-clock test
+    # goes, and the span is asserted instead -- a historical batch whose
+    # filings are all dated today is a sign the date parsing broke, which the
+    # live contract would never notice.
+    if historical:
+        observed = assert_fresh(
+            "deals",
+            stored,
+            min_rows=min_rows,
+            date_column=None,
+            expect_cols=("accession", "date"),
+        )
+        row = stored.query("s", "select min(date) AS lo, max(date) AS hi FROM s")
+        lo, hi = row.fetchone()
+        if lo is None or hi is None:
+            raise StaleDataError(
+                f"deals: {observed.row_count:,} historical rows but no filing "
+                "dates, so the batch's span cannot be established."
+            )
+        if hi > utc_today():
+            raise StaleDataError(
+                f"deals: newest historical filing is {hi.isoformat()}, which is "
+                f"after {utc_today().isoformat()}. Check the date parsing."
+            )
+    else:
+        assert_fresh(
+            "deals",
+            stored,
+            min_rows=min_rows,
+            date_column="date",
+            max_staleness_days=10,
+            expect_cols=("accession", "date"),
+        )
     return {"candidates": len(rows), "before": before, "after": after,
             "inserted": after - before}
+
+
+# --- targeted by CIK, for the filers a day sweep has least of -------------
+
+#: Form types worth asking a CIK's filing history for.
+#:
+#: The same 8-K pair the daily sweep reads. The other five watched form types in
+#: CLAUDE.md -- S-4, DEFM14A, SC 13D, SC TO-T, SC 13E-3 -- are **not** read here
+#: either, and that is a known gap rather than an oversight: they need their own
+#: extractors, because a merger proxy is not an 8-K and parsing it as one would
+#: produce a row that is present, plausible and wrong. Named so the gap is on the
+#: record where someone looking for it will find it.
+CIK_FORMS: Final[tuple[str, ...]] = FORM_TYPES
+
+
+def filings_for_cik(
+    cik: str,
+    *,
+    client: httpx.Client | None = None,
+    pacer: Pacer | None = None,
+    since: date | None = None,
+) -> Iterator[Filing]:
+    """Every deal-item 8-K a CIK ever filed, newest first.
+
+    The same shape as :func:`daily_filings` and deliberately the same code after
+    the first request: one ``-index-headers.html`` per candidate, parsed by
+    :func:`parse_header`, so a filing found this way is indistinguishable from
+    one found by walking a daily index. Two populations that had to agree would
+    otherwise drift.
+
+    **Why by CIK at all.** A company that stopped filing in 2021 is thinly
+    represented in a day sweep -- it existed for a third of the years the sweep
+    covers -- and it is exactly the population an acquisition study needs. Asking
+    EDGAR for one company's history is a single request; finding the same filings
+    by walking eleven years of daily indexes is about fifty thousand. The CIK
+    list comes from the point-in-time filer universe, which is the thing that
+    knows these companies existed at all.
+    """
+    archives = manifest.get("edgar", "archives").location
+    url = manifest.get("sec_submissions", "company").location.format(
+        cik=str(cik).lstrip("0").zfill(10)
+    )
+    headers = {"User-Agent": user_agent(), "Accept-Encoding": "gzip, deflate"}
+    con, owns = _client(client)
+    pacer = pacer or Pacer()
+    try:
+        pacer.wait()
+        resp = con.get(url, headers=headers)
+        if resp.status_code == 404:
+            log.info("no submissions record for CIK %s", cik)
+            return
+        resp.raise_for_status()
+        payload = resp.json()
+        recent = (payload.get("filings") or {}).get("recent") or {}
+        company = payload.get("name") or ""
+        rows = list(zip(
+            recent.get("accessionNumber") or (),
+            recent.get("form") or (),
+            recent.get("items") or (),
+            recent.get("filingDate") or (),
+        ))
+        for accession, form, items, filed_text in rows:
+            if form not in CIK_FORMS:
+                continue
+            # The JSON's `items` is a comma-joined string. Filtered here so a
+            # company's thousand filings cost one request rather than a
+            # thousand index-header fetches.
+            if not any(i in DEAL_ITEMS
+                       for i in str(items or "").replace(" ", "").split(",")):
+                continue
+            try:
+                filed = date.fromisoformat(filed_text)
+            except (TypeError, ValueError):
+                log.warning("%s: unparseable filing date %r", accession,
+                            filed_text)
+                continue
+            if since is not None and filed < since:
+                continue
+            bare = accession.replace("-", "")
+            base = f"{archives}/edgar/data/{str(cik).lstrip('0')}/{bare}/"
+            pacer.wait()
+            try:
+                page = con.get(base + accession + "-index-headers.html",
+                               headers=headers)
+                page.raise_for_status()
+            except httpx.HTTPError as exc:
+                log.warning("skipping %s: %s", accession, exc)
+                continue
+            filing = parse_header(
+                page.text, accession=accession, cik=str(cik).lstrip("0"),
+                company=company, form=form, filed=filed, base=base,
+            )
+            if filing.is_deal_item:
+                yield filing
+    except httpx.HTTPError as exc:
+        raise EdgarError(
+            f"could not read filing history for CIK {cik}: {exc}") from exc
+    finally:
+        if owns:
+            con.close()
+
+
+def fetch_for_ciks(
+    ciks: Iterable[str],
+    *,
+    client: httpx.Client | None = None,
+    pacer: Pacer | None = None,
+    read_exhibits: bool = True,
+    since: date | None = None,
+    on_progress: Any = None,
+) -> list[Deal]:
+    """Deal candidates for a list of CIKs, by asking EDGAR about each one.
+
+    ``on_progress(index, cik, found)`` is called after each CIK so a long sweep
+    can be checkpointed by the caller -- this function holds no state of its own
+    and can be resumed by passing the remainder of the list.
+    """
+    headers = {"User-Agent": user_agent(), "Accept-Encoding": "gzip, deflate"}
+    con, owns = _client(client)
+    pacer = pacer or Pacer()
+    out: list[Deal] = []
+    try:
+        for index, cik in enumerate(ciks):
+            found_here = 0
+            for filing in filings_for_cik(cik, client=con, pacer=pacer,
+                                          since=since):
+                if not filing.primary:
+                    log.warning("%s has no primary document", filing.accession)
+                    continue
+                pacer.wait()
+                try:
+                    body = con.get(filing.base + filing.primary, headers=headers)
+                    body.raise_for_status()
+                except httpx.HTTPError as exc:
+                    log.warning("skipping %s: %s", filing.accession, exc)
+                    continue
+                deal = extract(filing, body.text)
+                if (read_exhibits and deal.is_candidate
+                        and deal.value_usd is None):
+                    texts = []
+                    for prefix in PRICE_EXHIBITS:
+                        for name in filing.documents(prefix)[:1]:
+                            pacer.wait()
+                            try:
+                                ex = con.get(filing.base + name, headers=headers)
+                                ex.raise_for_status()
+                                texts.append(visible(ex.text))
+                            except httpx.HTTPError as exc:
+                                log.warning("exhibit %s: %s", name, exc)
+                    if texts:
+                        deal = extract(filing, body.text, exhibit_texts=texts)
+                if deal.is_candidate:
+                    out.append(deal)
+                    found_here += 1
+            if on_progress is not None:
+                on_progress(index, cik, found_here)
+    finally:
+        if owns:
+            con.close()
+    return out

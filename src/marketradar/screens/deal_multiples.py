@@ -31,7 +31,16 @@ unbiased. It is the deal population.
 Measured 2026-09-10 over all 30 loaded quarters, and this is the finding the
 screen is arranged around: of 2,112 filings with a stated value and a pre-deal
 annual report, **1,778 -- 84% -- filed another 10-K afterwards.** They sold a
-division, not themselves. Dividing a
+division, not themselves.
+
+That finding is now a ``deal_type`` -- ``division_sale`` -- rather than a caveat
+kept here, because every consumer of the deals table has to exclude it and a
+caveat is the thing that gets forgotten. The prose classifier runs at extraction
+from the filer's own description of what it sold; the filing-record check below
+stays as the confirmation, because the two fail differently: prose is available
+immediately and can be wrong, the record is slow and cannot.
+
+Dividing a
 division's price by the whole parent's revenue produces a number that is
 present, plausible, and far too small, and nothing about it looks wrong: the
 multiple is just low, and low multiples are what a screen for cheap deals is
@@ -75,9 +84,20 @@ SCREEN: Final[str] = "deal_multiples"
 #: the survivorship problem above rather than a property of the roles.
 ACQUIRER_ROLE: Final[str] = "acquirer"
 
-#: De-SPACs have no operating acquirer, no target financials and no computable
-#: multiple; securitizations are not acquisitions at all. Both are excluded by
-#: the classification the deals loader already made, not re-derived here.
+#: The one deal type a multiple can be computed for.
+#:
+#: Everything else is excluded by the classification the deals loader already
+#: made, rather than re-derived here, and three of the four exclusions are for
+#: different reasons: a de-SPAC has no operating acquirer and no target
+#: financials, a securitization is not an acquisition, and a
+#: ``division_sale`` is a business unit rather than a company -- its price over
+#: its parent's revenue is part of a company divided by all of it.
+#:
+#: That third one used to be a caveat in this docstring and is now a type, which
+#: is the difference between a thing every consumer has to remember and a thing
+#: no consumer can reach. The filing-record confirmation below stays regardless:
+#: the prose classifier is available immediately and can be wrong, the record is
+#: slow and cannot, and they are kept as two checks rather than one.
 OPERATING_TYPE: Final[str] = "operating"
 
 #: Confirmed: the target filed no annual report after the deal, and enough
@@ -211,7 +231,8 @@ def screen(
         ("value stated", count(priced),
          "no price, no multiple; the 8-K states one or it does not"),
         ("operating deal", count(operating),
-         "de-SPACs have no target financials and securitizations are not deals"),
+         "de-SPACs have no target financials, securitizations are not deals, "
+         "and a division_sale is a business unit rather than a company"),
     ]
 
     coverage_to = con.execute(

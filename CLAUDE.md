@@ -360,6 +360,21 @@ against `not_parsed`, and as `lapsed` against `declining` in the Form 5500
 series. Collapsing them makes the coverage number wrong in both directions.
 History mostly starts ~2009. Full numbers in docs/build-spec.md.
 
+**A division sale is a deal type, not a caveat.** Dividing a business unit's
+price by its parent's whole revenue is a category error — part of a company over
+all of it — and it fails in the direction that hides: the multiple comes out
+small, and a screen ranking cheap deals first ranks its own mistakes first.
+Measured 2026-09-10: of 2,112 priced filings with a pre-deal annual report,
+**1,778 (84%) filed another 10-K afterwards**, so the thing sold was not the
+filer.
+
+`deal_type` therefore carries `division_sale` alongside `spac` and
+`securitization`, classified at extraction from the filer's own description. The
+filing-record check stays as a second, slower confirmation — a company acquired
+whole stops filing — because the two fail differently: prose is available
+immediately and can be wrong, the record is late and cannot. A type is reachable
+by every consumer; a caveat is the thing that gets forgotten.
+
 **M&A detection is by SEC form type, not news.** 8-K Items 1.01/2.01, S-4,
 DEFM14A, SC 13D, SC TO-T, SC 13E-3. Filings are legally required, timestamped,
 and unambiguous. News is the noisy secondary signal.
@@ -445,21 +460,29 @@ to symbols we hold no prices for. It needs a point-in-time universe, which is
 a data purchase, not a query.
 
 **Refined 2026-09-10: "a point-in-time universe" is two things, and only one of
-them is still a purchase.** A point-in-time *price* universe is, and that half
-stands. A point-in-time *filer* universe is not, and arrived free with the XBRL
-load: the `sub` tables hold 6,431 CIKs over 2019–2026 with name, SIC and period,
-**including the 2,160 that stopped filing** — of which `companies` holds 107.
-That fixes entity coverage and population selection for anything keyed on CIK;
-it does not conjure prices for a delisted symbol, which is why the paragraph
-above is refined rather than retracted.
+them is still a purchase.**
 
-The distinction has already cost something. The `deals` table was selected
-through a current-only universe, so filers that stopped filing appear in it at
-1.7% against 50.7% for filers still going — and an acquisition target is by
-definition a company that stopped filing. Deal multiples is blocked on that, not
-on the target financials the build order blamed. **Any population selected
-through `companies` inherits the hole**; select through the XBRL filer universe
-instead wherever the question is historical. Until then: state the bias whenever a study
+A point-in-time *price* universe is, and that half stands unchanged. A
+point-in-time *filer* universe is not: `sources/xbrl/filers.py` builds one as a
+query over the `sub` tables already on disk — **11,323 CIKs over 2019–2026, of
+which 3,744 have stopped filing and `companies` knows 102 of them (2.7%, against
+85.0% of the filers still going).**
+
+Say which of the two problems it fixes, because they look alike:
+
+- **Identification — fixed.** We can say who a company *was*, by CIK, with a
+  name, an SIC and a filing window, whether or not it still exists. **Any
+  population selected through `companies` inherits a 97% hole in the
+  stopped-filing half**, which is shaped exactly like an acquisition. Select
+  through the filer universe whenever the question is historical. It also makes a
+  targeted sweep affordable: 3,744 requests against ~50,000 to find the same
+  filings by walking daily indexes.
+- **Survivorship — not fixed, and not fixable from here.** A delisted company
+  still has no prices. Deal multiples gain rows because a multiple is a stated
+  price over a reported figure and needs no bars; **forward returns stay biased
+  by exactly as much as before**, and the caveat rendered beside every excess
+  figure stands. Knowing who a company was says nothing about what its shares did
+  in a window we hold no prices for. Until then: state the bias whenever a study
 reports an outcome, and never describe such a result as "returns after a
 deal" when it is "returns after a deal, among companies that survived it".
 
