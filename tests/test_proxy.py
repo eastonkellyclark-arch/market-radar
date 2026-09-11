@@ -33,10 +33,9 @@ CASH_DEAL = (
     # A decoy: the same operative language in the tax discussion, with no
     # figures near it. This is the shape that makes position rules fail, so the
     # fixture has to contain one or the selection rule is untested.
-    + "Material U.S. Federal Income Tax Consequences. The exchange in which "
-      "each issued and outstanding share of Company common stock will be "
-      "converted into the right to receive cash is expected to be a taxable "
-      "transaction for U.S. holders."
+    + "No fractional shares will be issued. Each holder who would otherwise be "
+      "entitled to receive a fraction of a share will instead be entitled to "
+      "receive cash of $0.01 per share in lieu of such fraction."
     + "filler. " * 200
     + "The Merger Consideration At the effective time, each issued and "
       "outstanding share of Company common stock will be converted into the "
@@ -143,12 +142,12 @@ def test_the_window_with_the_numbers_wins_not_the_first_or_the_last() -> None:
 def test_a_heading_only_in_prose_is_no_section() -> None:
     """``no_section`` is a more useful answer than a prompt aimed at the wrong
     paragraph, and its remedy is a locator rather than a prompt."""
-    assert proxy.section_window(NO_SECTIONS, "premiums_paid") is None
+    assert proxy.section_window(NO_SECTIONS, "premium_statement") is None
 
 
 def test_the_window_is_capped_so_the_document_is_never_sent() -> None:
-    huge = "Premiums Paid Analysis " + FIGURES + ("x" * 500_000)
-    section = proxy.section_window(huge, "premiums_paid")
+    huge = "a premium of 23.4% was paid " + FIGURES + ("x" * 500_000)
+    section = proxy.section_window(huge, "premium_statement")
     assert section is not None
     assert section.chars <= proxy.SECTION_CHARS
     assert section.chars < len(huge) / 10
@@ -161,9 +160,9 @@ def test_the_section_records_why_it_was_chosen() -> None:
     assert section.candidates >= 2, "the fixture has no decoy to choose against"
     assert section.figures > 0
     assert section.heading
-    # The decoy comes first in the document and carries no figures, so a
-    # position rule would have taken it.
-    decoy = CASH_DEAL.index("Material U.S. Federal Income Tax")
+    # The decoy comes first and carries one figure against the real clause's
+    # eleven, so a position rule would have taken it and density does not.
+    decoy = CASH_DEAL.index("No fractional shares will be issued")
     assert section.start > decoy
 
 
@@ -200,8 +199,7 @@ def test_a_stated_figure_carries_its_provenance() -> None:
     """An LLM number with no provenance is unauditable. Section, offsets, quote,
     provider, model and prompt version, on every row."""
     model = FakeModel({"present": True, "value": 52.0,
-                       "quote": "converted into the right to receive $52.00 in "
-                                "cash"})
+                       "quote": "right to receive $52.00 in cash"})
     figure = proxy.extract_field("acc-2", CASH_DEAL, "consideration_per_share",
                                  client=model, providers=ONLY_GROQ)
     assert figure.reason == proxy.STATED
@@ -234,8 +232,7 @@ def test_a_quote_reflowed_by_the_model_still_verifies() -> None:
     """Models reflow whitespace when they copy. Rejecting a figure over a double
     space would make the check useless while looking strict."""
     model = FakeModel({"present": True, "value": 52.0,
-                       "quote": "converted   into the\n right to receive "
-                                "$52.00 in cash"})
+                       "quote": "right  to\n receive   $52.00 in cash"})
     figure = proxy.extract_field("acc-4", CASH_DEAL, "consideration_per_share",
                                  client=model, providers=ONLY_GROQ)
     assert figure.reason == proxy.STATED
@@ -296,7 +293,7 @@ def test_the_prompt_gets_the_section_and_not_the_document() -> None:
                         providers=ONLY_GROQ)
     sent = model.prompts[0]
     assert len(sent) < len(CASH_DEAL) + 2_000
-    assert "Premiums Paid Analysis" in sent
+    assert "premium" in sent.lower()
     assert "TABLE OF CONTENTS" not in sent
 
 

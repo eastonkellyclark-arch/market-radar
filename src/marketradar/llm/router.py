@@ -72,13 +72,24 @@ class Provider:
 #: Ollama and answered correctly, which is the design working and is also how the
 #: stale name went unnoticed for a minute. A 404 from a hosted provider means
 #: re-query the endpoint rather than guess again; these lists turn over.
+#: **The token bucket is per model, not per account**, measured 2026-09-11: with
+#: ``gpt-oss-120b`` drained to 350 of 8,000 tokens and 57 seconds from resetting,
+#: ``gpt-oss-20b`` had 7,923 and ``qwen3.8-27b`` 7,982 on the same key. So three
+#: Groq entries are three budgets and roughly triple the throughput, and the
+#: fall-through that exists for outages does rate limits for free.
+#:
+#: They are named per model rather than per account for the same reason: pacing,
+#: striking off and the recorded provenance are all per bucket, and calling them
+#: all "groq" would have them share a budget they do not share.
+GROQ_URL: Final[str] = "https://api.groq.com/openai/v1/chat/completions"
+
 PROVIDERS: Final[tuple[Provider, ...]] = (
-    Provider(
-        name="groq",
-        key_env="MR_GROQ_API_KEY",
-        url="https://api.groq.com/openai/v1/chat/completions",
-        model="openai/gpt-oss-120b",
-    ),
+    Provider(name="groq-120b", key_env="MR_GROQ_API_KEY", url=GROQ_URL,
+             model="openai/gpt-oss-120b"),
+    Provider(name="groq-20b", key_env="MR_GROQ_API_KEY", url=GROQ_URL,
+             model="openai/gpt-oss-20b"),
+    Provider(name="groq-qwen27b", key_env="MR_GROQ_API_KEY", url=GROQ_URL,
+             model="qwen/qwen3.8-27b"),
     Provider(
         name="cerebras",
         key_env="MR_CEREBRAS_API_KEY",
@@ -89,7 +100,7 @@ PROVIDERS: Final[tuple[Provider, ...]] = (
         name="ollama",
         key_env="",
         url="{base}/api/chat",
-        model="qwen2.5:3b-instruct",
+        model="qwen3:4b",
         dialect="ollama",
         json_mode=True,
     ),
@@ -128,13 +139,12 @@ PERMANENT_FAILURES: Final[frozenset[int]] = frozenset({401, 402, 403})
 #: cached "never try this again" on disk would outlive the reason for it.
 _struck_off: set[str] = set()
 
-#: Floor between calls to one provider, used until it tells us better.
-#:
-#: A free tier meters tokens per minute, so an unpaced loop spends its budget in
-#: the first few seconds and then 429s for the rest of the minute -- which reads
-#: as a broken provider rather than as a queue, and sends every later extraction
-#: to a weaker model.
-MIN_INTERVAL: Final[dict[str, float]] = {"groq": 1.0, "cerebras": 1.0}
+#: Floor between calls to one provider. Empty by default and that is deliberate:
+#: every provider here reports its own remaining budget, so a hand-picked gap is
+#: either too small (it 429s anyway) or too large (it wastes the quota). The
+#: header-driven wait in :func:`_pace` is the real mechanism and this is only an
+#: override for a provider that reports nothing.
+MIN_INTERVAL: Final[dict[str, float]] = {}
 
 #: Wait for the token bucket to refill when fewer than this fraction of it is
 #: left. Below about a fifth there is not room for another extraction-sized

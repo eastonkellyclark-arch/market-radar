@@ -110,17 +110,47 @@ SECTION_PATTERNS: Final[dict[str, tuple[str, ...]]] = {
     # document -- the tax discussion, the merger agreement annex, the fairness
     # opinion letter -- and every occurrence is prose. A defined term is not a
     # heading. What is reliable is the operative language that states the number.
+    # Anchored on the clause that *carries the amount*, not on a heading, for the
+    # same reason the premium is: measured across 15 real takeout proxies, a
+    # heading-anchored window held the true per-share figure 6 times in 9, while
+    # the phrasing that carries it varies far more than the heading does --
+    # "Per Share Price, which is (i) $19.00", "per share merger consideration of
+    # $1.29 in cash", "entitled to receive $6.50 in cash ... for each Common
+    # Share". Each of those is a different sentence and the same fact.
+    #
+    # The loose heading alternatives stay as fallbacks, last, for a filing that
+    # states the consideration somewhere a money pattern does not reach.
     "merger_consideration": (
+        r"(?:right\s+to\s+receive|entitled\s+to\s+receive|consideration\s+of|"
+        r"Per\s+Share\s+Price[^.]{0,30}?is)[^.]{0,90}?"
+        r"(?:\$\s?[\d,]+(?:\.\d+)?|[\d.]{4,7}\s+(?:of\s+a\s+)?share)",
         r"each\s+(?:issued\s+and\s+outstanding\s+)?share[^.]{0,160}?"
         r"(?:converted\s+into|entitled\s+to\s+receive)",
         r"What\s+(?:will\s+I|I\s+will)\s+receive\s+in\s+the\s+[Mm]erger",
         r"Consideration\s+to\s+be\s+Received",
         r"(?:The\s+)?Merger\s+Consideration\b",
     ),
-    "premiums_paid": (
-        r"Premiums?\s+Paid\s+Analys[ei]s",
-        r"Premiums?\s+Paid\s+in\s+Selected\s+Transactions",
-        r"Historical\s+Premiums?\s+Paid",
+    # **Not** "Premiums Paid Analysis", which was the first guess and is the
+    # wrong section. Measured across 13 real takeout proxies: the deal's own
+    # premium appeared in that window **zero times**, at every window size from
+    # 3k to 14k characters. The fairness opinion's Premiums Paid Analysis is a
+    # table of premiums paid in *other* transactions -- which is what the model
+    # said the first time it was asked ("only range quartiles from other
+    # transactions are provided") and was right about while the locator was not.
+    #
+    # The deal's own premium lives in the letter to shareholders and in Reasons
+    # for the Merger, under no standard heading at all. So this field anchors on
+    # the fact-bearing sentence instead of on a heading, which is still
+    # deterministic and is the only thing that finds it.
+    #
+    # The model's job is then the part a regex cannot do: several premiums are
+    # quoted against different reference prices -- 208.5%, 231% and 84.9% in one
+    # filing -- and choosing the headline one and saying what it is measured
+    # against is judgement, not pattern matching.
+    "premium_statement": (
+        r"premium\s+of\s+(?:approximately\s+)?[\d.]+\s?%",
+        r"[\d.]+\s?%\s+premium\b",
+        r"represent(?:s|ed|ing)\s+a\s+premium",
     ),
     "fairness_opinion": (
         r"Opinion\s+of\s+[A-Z][^\n]{0,70}?(?:Financial\s+Advisor|"
@@ -280,14 +310,20 @@ FIELDS: Final[dict[str, dict[str, str]]] = {
         ),
     },
     "premium_pct": {
-        "section": "premiums_paid",
+        "section": "premium_statement",
         "question": (
             "the premium the merger consideration represents over the "
-            "company's share price before announcement, as a percentage"
+            "company's own share price before announcement, as a percentage. "
+            "Several premiums may be quoted against different reference prices "
+            "-- a closing price, a 20-day or 90-day volume weighted average -- "
+            "and more than one may be a premium paid in some *other* "
+            "transaction. Report the one measured against this company's own "
+            "pre-announcement price, and prefer the last closing price before "
+            "announcement where more than one qualifies"
         ),
         "unit": "percent",
         "absent_when": (
-            "the section discusses premiums paid in other transactions without "
+            "the text discusses premiums paid in other transactions without "
             "stating this deal's own premium, in which case report absent"
         ),
     },
