@@ -43,17 +43,27 @@ text and cited correctly, and answered a different question.
                       premium of 22" -- a percentile from a comparables table.
 
 A citation proves the number was read rather than invented. It says nothing about
-*what the number is of*. So v2 must make the model return the thing the figure is
-attached to -- whose shares, which currency, which reference price -- and either
-check that or store it, because a wrong entity is invisible today and a
-misattributed takeout price is exactly the error this module was built to fix.
+*what the number is of*. So **every figure now returns what it is attached to** --
+whose shares, which currency, which reference price -- and that is checked against
+the filer's own identity before the figure is stored, as :data:`MISATTRIBUTED`.
+See :func:`check_attribution`.
+
+**Consideration is a structure, not a scalar.** It was two scalar fields, a cash
+price and an exchange ratio, and that shape is wrong for 4 of the 15 takeouts
+measured: Enviri's $14.50-$16.50 collar has no single price, CoreCard's
+0.2783-0.3142 ratio collar likewise, Veeco and Norfolk Southern pay cash *and*
+shares so neither half is the consideration, and FONAR pays $19.00 to two classes
+and $6.34 to a third. A collar recorded as its upper bound is a wrong number that
+looks right, so the reading is one row per (share class, component) and the scalar
+is **derived** -- :func:`scalar_consideration` -- returning None with the shape
+that explains why wherever one does not genuinely exist.
 
 **Reason codes, same discipline as deals.** ``not_stated`` and ``not_parsed``
 stay distinct, because a stock-for-stock merger genuinely has no cash price per
 share and recording that as a parse failure would send someone looking for a
 number that was never written down. See :data:`REASONS`.
 
-v1 extracts **two fields only**: the consideration and the premium. They are the
+v1 reads **two things only**: the consideration and the premium. They are the
 two that fix known errors -- Dean Foods' $48M liquidation sale read as a takeout,
 Anixter's $400M against a $4.5B deal, and the takeout premium CLAUDE.md records
 as unmeasurable from a survivor-only price history. Comps, management projections
@@ -75,7 +85,13 @@ log = logging.getLogger(__name__)
 #: Bumped by hand on any prompt change. Stored with every figure: a number read
 #: under v1 and one read under v2 are different measurements, and a table that
 #: mixes them without saying so is not comparable with itself.
-PROMPT_VERSION: Final[str] = "proxy-v1"
+#:
+#: ``proxy-v2`` asks for the consideration as a structure and requires an
+#: attribution on every figure. A v1 number and a v2 number are not the same
+#: measurement -- v1 could not record a collar and could not reject a merger sub's
+#: ratio -- so they are stored side by side under different versions rather than
+#: one overwriting the other.
+PROMPT_VERSION: Final[str] = "proxy-v2"
 
 # --- reason codes -------------------------------------------------------
 
@@ -116,8 +132,22 @@ UNCITED: Final[str] = "uncited"
 #: other identification problem here. See :func:`is_takeout_proxy`.
 NOT_A_TAKEOUT: Final[str] = "not_a_takeout"
 
+#: The figure is in the text, correctly quoted, and is *of something else*. A
+#: merger sub's share conversion, a comparables-table percentile, a different
+#: deal's C$2.00.
+#:
+#: **The dominant failure, and the one the citation check is blind to.** Measured
+#: over 20 proxies on 2026-09-11: every wrong number was genuinely present and
+#: cited correctly. Kept distinct from ``uncited`` because they say opposite
+#: things about the provider -- an uncited figure means the model invented text,
+#: a misattributed one means it read the document correctly and answered the
+#: wrong question, and the remedy is a prompt in one case and a locator in the
+#: other. See :func:`check_attribution`.
+MISATTRIBUTED: Final[str] = "misattributed"
+
 REASONS: Final[tuple[str, ...]] = (
     STATED, NOT_STATED, NOT_PARSED, NO_SECTION, UNCITED, NOT_A_TAKEOUT,
+    MISATTRIBUTED,
 )
 
 # --- locating -----------------------------------------------------------
@@ -295,41 +325,28 @@ _SYSTEM: Final[str] = (
     "being wrong is far worse than being absent."
 )
 
-#: The two fields v1 reads, and what "absent" means for each.
+#: The name of the consideration reading, which is not a :data:`FIELDS` entry.
+#:
+#: It was two -- ``consideration_per_share`` and ``exchange_ratio``, one scalar
+#: each -- and that shape is wrong for 4 of the 15 takeouts measured: a collar has
+#: no single price, a mixed deal's cash is not its consideration, and a two-class
+#: deal has two. It is now one structured reading, :func:`extract_consideration`,
+#: producing one row per (share class, component). Asking in one call is also the
+#: correct question: "cash or shares" is one fact about a deal, and asking
+#: separately is what made Veeco's cash read ``not_stated`` while its ratio was
+#: extracted from the same sentence.
+CONSIDERATION: Final[str] = "consideration"
+
+#: What v1 reads. Consideration is structured; the premium is a scalar.
+V1_FIELDS: Final[tuple[str, ...]] = (CONSIDERATION, "premium_pct")
+
+#: The scalar fields, and what "absent" means for each.
 #:
 #: The ``absent_when`` note is in the prompt on purpose. Without it a model asked
-#: for a cash price per share in a stock-for-stock merger will produce one, and
-#: the citation check would pass because some dollar figure is always nearby.
+#: for a premium in a document that only tabulates other deals' premiums will
+#: produce one, and the citation check would pass because some percentage is
+#: always nearby.
 FIELDS: Final[dict[str, dict[str, str]]] = {
-    "consideration_per_share": {
-        "section": "merger_consideration",
-        "question": (
-            "the cash amount a holder of one share of the company's common "
-            "stock will receive in the merger"
-        ),
-        "unit": "usd_per_share",
-        "absent_when": (
-            "the consideration is shares of the acquirer rather than cash "
-            "(a stock-for-stock merger), in which case report absent"
-        ),
-    },
-    # The other half of "consideration", and not a third field sneaking in: a
-    # stock-for-stock merger's consideration *is* an exchange ratio, so without
-    # this every stock deal reads `not_stated` and the table learns nothing about
-    # half the market. The first document tested was exactly that case --
-    # 0.6303 acquirer shares per target share, no cash at all.
-    "exchange_ratio": {
-        "section": "merger_consideration",
-        "question": (
-            "the number of acquirer shares a holder of one share of the "
-            "company's common stock will receive in the merger"
-        ),
-        "unit": "acquirer_shares_per_share",
-        "absent_when": (
-            "the consideration is cash rather than shares of the acquirer, in "
-            "which case report absent"
-        ),
-    },
     "premium_pct": {
         "section": "premium_statement",
         "question": (
@@ -347,8 +364,146 @@ FIELDS: Final[dict[str, dict[str, str]]] = {
             "the text discusses premiums paid in other transactions without "
             "stating this deal's own premium, in which case report absent"
         ),
+        # The premium's attribution has two parts and both were wrong in the
+        # hand-check. Comerica's 7% was a 25th-percentile premium from a
+        # comparables table -- right number, wrong deal -- and several filings
+        # quote three premiums against three reference prices, where naming the
+        # reference is the difference between a comparable figure and a number.
+        "attributed_to": (
+            "the name of the company whose shareholders receive this premium, "
+            "exactly as the text names it. If the percentage is a premium paid "
+            "in some other transaction, or a quartile, median or percentile of "
+            "premiums paid in other transactions, report absent instead"
+        ),
+        "reference": (
+            "what the premium is measured against -- 'closing price on <date>', "
+            "'20-trading-day VWAP', '90-day VWAP', 'unaffected price'"
+        ),
     },
 }
+
+
+CASH: Final[str] = "cash"
+ACQUIRER_SHARES: Final[str] = "acquirer_shares"
+
+#: Shapes a deal's consideration can take, and the reason a scalar is absent.
+SCALAR: Final[str] = "scalar"
+COLLAR: Final[str] = "collar"
+MIXED: Final[str] = "mixed"
+SHARES_ONLY: Final[str] = "shares_only"
+PER_CLASS: Final[str] = "per_class"
+NOT_READ: Final[str] = "not_read"
+
+SHAPES: Final[tuple[str, ...]] = (
+    SCALAR, COLLAR, MIXED, SHARES_ONLY, PER_CLASS, NOT_READ,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Amount:
+    """A number that may be a range, with what it is denominated in.
+
+    ``low == high`` is a point value and ``low < high`` a collar. There is no
+    third case, and no way to write a collar that reads as a point value -- which
+    was the defect: the model returned 0.3142 for CoreCard, one end of a
+    0.2783-0.3142 ratio collar, and stored as a scalar that is a wrong number
+    that looks right.
+    """
+
+    low: float
+    high: float
+    #: ``USD``, ``CAD``; None for a share ratio, which has no currency. Recorded
+    #: because a proxy can state a price in a currency that is not the reporting
+    #: one -- Royal Gold's document carries "C$2.00 in cash per common share"
+    #: belonging to a different deal inside it.
+    currency: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.high < self.low:
+            raise ValueError(f"range is the wrong way round: {self.low}..{self.high}")
+
+    @property
+    def is_range(self) -> bool:
+        return self.high > self.low
+
+    @property
+    def scalar(self) -> float | None:
+        """The single number, or None for a collar. Never a midpoint.
+
+        A midpoint would be an invented figure that no document states, which is
+        the same mistake as inferring a split ratio from a price jump.
+        """
+        return None if self.is_range else self.low
+
+    def __str__(self) -> str:
+        unit = f" {self.currency}" if self.currency else ""
+        if self.is_range:
+            return f"{self.low:g}-{self.high:g}{unit}"
+        return f"{self.low:g}{unit}"
+
+
+@dataclass(frozen=True, slots=True)
+class Consideration:
+    """What one share of one class receives: cash, acquirer shares, or both."""
+
+    share_class: str = "common"
+    cash: Amount | None = None
+    shares: Amount | None = None
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.cash is not None and self.shares is not None
+
+    @property
+    def is_collar(self) -> bool:
+        return any(a.is_range for a in (self.cash, self.shares) if a)
+
+    def __str__(self) -> str:
+        legs = []
+        if self.shares:
+            legs.append(f"{self.shares} acquirer shares")
+        if self.cash:
+            legs.append(str(self.cash))
+        return f"{self.share_class}: " + (" + ".join(legs) or "nothing stated")
+
+
+def shape_of(considerations: list[Consideration]) -> str:
+    """Which of :data:`SHAPES` a filing's consideration is.
+
+    The order matters: a filing can be several of these at once and the *reason a
+    scalar is absent* should name the most fundamental one, because that is what a
+    reader has to do something about.
+    """
+    usable = [c for c in considerations if c.cash or c.shares]
+    if not usable:
+        return NOT_READ
+    if len({c.share_class for c in usable}) > 1:
+        return PER_CLASS
+    only = usable[0]
+    if only.is_mixed:
+        return MIXED
+    if only.shares is not None:
+        return SHARES_ONLY
+    if only.is_collar:
+        return COLLAR
+    return SCALAR
+
+
+def scalar_consideration(
+    considerations: list[Consideration],
+) -> tuple[float | None, str]:
+    """``(usd per share, shape)``. A number only when one genuinely exists.
+
+    Returns None for a collar, a mix, a share-only deal and a multi-class deal --
+    four of the fifteen takeouts in the hand-check -- with the shape saying which,
+    so three different absences are not three identical NULLs.
+    """
+    shape = shape_of(considerations)
+    if shape != SCALAR:
+        return None, shape
+    cash = considerations[0].cash
+    assert cash is not None  # shape_of guarantees it
+    return cash.scalar, shape
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,9 +526,39 @@ class Figure:
     prompt_version: str = PROMPT_VERSION
     note: str | None = None
 
+    # --- consideration rows carry a range rather than a scalar ------------
+    #: ``low``/``high`` are the authoritative pair; ``value`` is the scalar and is
+    #: set only when they are equal. A collar therefore has a range and **no**
+    #: value, which is what stops it reading as a point price.
+    low: float | None = None
+    high: float | None = None
+    currency: str | None = None
+    share_class: str | None = None
+    #: ``cash`` | ``acquirer_shares`` for a consideration row; None for premium.
+    component: str | None = None
+
+    # --- attribution: what the figure is *of* ----------------------------
+    #: The entity or reference the model says the figure belongs to. The citation
+    #: check proves a number was read; this is what says it answers the question
+    #: asked. See :func:`check_attribution`.
+    attributed_to: str | None = None
+    attribution_ok: bool | None = None
+    #: What a premium is measured against: a closing price, a 20-day VWAP, an
+    #: unaffected price. Stored rather than checked -- there is nothing to check it
+    #: against -- and it is what makes two premiums comparable instead of two
+    #: numbers. One filing quotes 208.5%, 231% and 84.9% for the same deal.
+    reference: str | None = None
+
     @property
     def usable(self) -> bool:
-        return self.reason == STATED and self.value is not None
+        return self.reason == STATED and (self.value is not None
+                                          or self.low is not None)
+
+    @property
+    def amount(self) -> Amount | None:
+        if self.low is None or self.high is None:
+            return None
+        return Amount(low=self.low, high=self.high, currency=self.currency)
 
 
 def _user_prompt(field: str, spec: dict[str, str], section: Section) -> str:
@@ -384,12 +569,100 @@ def _user_prompt(field: str, spec: dict[str, str], section: Section) -> str:
         "Reply with exactly this JSON shape:\n"
         '{"present": true|false, "value": <number or null>, '
         '"quote": "<verbatim substring or null>", '
+        f'"attributed_to": "<{spec["attributed_to"]}>", '
+        f'"reference": "<{spec["reference"]}>", '
         '"why_absent": "<short reason or null>"}\n\n'
+        "`attributed_to` and `reference` matter as much as the number. A quote "
+        "proves you read the figure; they are what say it answers the question "
+        "asked rather than a neighbouring one.\n\n"
         "The value must be a plain number with no currency symbol, no commas "
         "and no percent sign. For a percentage report 23.4 rather than 0.234.\n\n"
         "--- TEXT ---\n"
         f"{section.text}"
     )
+
+
+#: Words that carry no identity, so they cannot be the thing that matches two
+#: company names to each other. "Merger Sub" against "Farmer Brothers Co" must not
+#: agree on "co".
+_NAME_NOISE: Final[frozenset[str]] = frozenset({
+    "inc", "corp", "corporation", "company", "co", "llc", "lp", "plc", "ltd",
+    "limited", "holdings", "holding", "group", "the", "and", "of", "new",
+    "sub", "merger", "parent", "acquisition", "technologies", "international",
+    "common", "stock", "shares", "shareholders", "stockholders", "class",
+})
+
+#: Phrases that say outright that a figure belongs to something other than this
+#: company's own shareholders. Checked before name matching, because a name can
+#: overlap by accident and these cannot.
+_NOT_THE_FILER: Final[re.Pattern[str]] = re.compile(
+    r"\bmerger\s*sub\b|\bsub\s*\d\b|\bsurviving\s+(?:corporation|company)\b|"
+    r"\bparent\b|\bacquir(?:er|or)\b|\bbuyer\b|"
+    r"\b(?:\d+(?:th|st|nd|rd)\s+)?percentile\b|\bselected\s+transactions?\b|"
+    r"\bmedian\b|\bother\s+transactions?\b",
+    re.IGNORECASE,
+)
+
+
+def _identity_words(name: str) -> list[str]:
+    """Identifying words, in the order written. Order carries the test."""
+    out, seen = [], set()
+    for word in re.findall(r"[a-z]+", (name or "").lower()):
+        if len(word) > 2 and word not in _NAME_NOISE and word not in seen:
+            seen.add(word)
+            out.append(word)
+    return out
+
+
+def check_attribution(
+    attributed_to: str | None, filer: str | None
+) -> tuple[bool, str | None]:
+    """Does the figure belong to *this* company's shareholders?
+
+    **The check the citation cannot do.** Measured over 20 proxies: every wrong
+    figure was genuinely in the text and cited correctly, and answered a different
+    question -- a merger sub's share conversion, a different deal's C$2.00, a
+    comparables-table percentile. A quote proves the number was read; this is what
+    says it is the number that was asked for.
+
+    Two tests, cheapest first. A phrase that names something other than the
+    company's own holders fails outright -- "merger sub", "parent", "75th
+    percentile" -- because those cannot be right by accident.
+
+    Otherwise the two names must agree on a **head word**: the first identifying
+    word of either name must appear in the other, with corporate-form noise
+    stripped so "Merger Sub, Inc." and "Farmer Brothers Co" cannot agree on "co".
+    Head word rather than any shared word, because any-shared-word is too weak by
+    exactly the case that motivated this: Royal Gold's proxy carries Sandstorm
+    Gold's consideration, and the two names share "gold". A sector word is not an
+    identity. "Farmer Bros. Co." against "Farmer Brothers Co" still agrees, on
+    "farmer", which is what an abbreviation leaves intact.
+
+    Name comparison is used here as a **rejection** and never as a join, which is
+    what makes it acceptable under the identifier rule: a false mismatch throws
+    away a good figure and is visible as a ``misattributed`` row carrying the
+    reason, while a false match only leaves today's behaviour unchanged. The costs
+    are not symmetric and the cheap direction is the safe one. The filer name
+    itself comes from ``companies`` keyed on CIK -- the identifier does the
+    identifying, and the string is only what the rejection is measured against.
+    """
+    if not attributed_to:
+        return False, "no attribution returned, so the figure cannot be placed"
+    if _NOT_THE_FILER.search(attributed_to):
+        return False, (f"attributed to {attributed_to!r}, which names something "
+                       "other than this company's own shareholders")
+    if not filer:
+        # Nothing to compare against. Recorded as unchecked rather than passed:
+        # the row carries attribution_ok=None and a consumer can see it was not
+        # verified, which is different from having been verified.
+        return True, None
+    mine, theirs = _identity_words(filer), _identity_words(attributed_to)
+    if not mine or not theirs:
+        return True, None
+    if mine[0] not in theirs and theirs[0] not in mine:
+        return False, (f"attributed to {attributed_to!r}, which does not name the "
+                       f"filer {filer!r}")
+    return True, None
 
 
 def _normalise_quote(text: str) -> str:
@@ -409,14 +682,16 @@ def extract_field(
     *,
     client: Any = None,
     providers: tuple[router.Provider, ...] = router.PROVIDERS,
+    filer: str | None = None,
 ) -> Figure:
     """One field from one document, with provenance and a verified citation."""
     spec = FIELDS.get(field)
     if spec is None:
         raise ValueError(
-            f"{field!r} is not in v1. Two fields are read -- "
-            f"{sorted(FIELDS)} -- and comps, projections and DCF ranges come "
-            "after those two are shown to work."
+            f"{field!r} is not a scalar v1 field. v1 reads {list(V1_FIELDS)}; "
+            f"the scalar ones are {sorted(FIELDS)} and the consideration is "
+            "structured -- see extract_consideration. Comps, projections and DCF "
+            "ranges come after these two are shown to work."
         )
     section = section_window(text, spec["section"])
     if section is None:
@@ -453,6 +728,9 @@ def extract_field(
         )
 
     value, quote = said.get("value"), said.get("quote")
+    attributed = str(said.get("attributed_to") or "")[:120] or None
+    reference = str(said.get("reference") or "")[:160] or None
+    provenance = dict(provenance, attributed_to=attributed, reference=reference)
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -469,8 +747,13 @@ def extract_field(
         return Figure(reason=UNCITED, unit=spec["unit"], quote=quote[:400],
                       note="the quote is not in the section it was given",
                       **provenance)
+    ok, why = check_attribution(attributed, filer)
+    if not ok:
+        # Cited and still wrong, which is the case the citation check cannot see.
+        return Figure(reason=MISATTRIBUTED, unit=spec["unit"], quote=quote[:400],
+                      attribution_ok=False, note=why, **provenance)
     return Figure(reason=STATED, value=number, unit=spec["unit"],
-                  quote=quote[:400], **provenance)
+                  quote=quote[:400], attribution_ok=ok, **provenance)
 
 
 #: The operative language of a merger agreement: what happens to a share of the
@@ -479,12 +762,42 @@ def extract_field(
 #:
 #: Deterministic and deliberately so -- this gate decides the population, and a
 #: population decided by an LLM is a population nobody can reproduce.
+#: A share class qualifier between "each" and "share". Canada writes "each
+#: issued and outstanding **Common** Share"; a dual-class US filing writes "each
+#: share of Class A Common Stock". An enumerated list rather than ``\w+`` because
+#: the gate decides the population and a loose qualifier would admit "each of the
+#: following" -- the same reason the locator patterns are specific.
+_CLASS: Final[str] = (
+    r"(?:(?:common|ordinary|subordinate(?:\s+voting)?|multiple\s+voting|"
+    r"limited\s+voting|class\s+[a-z]|series\s+[a-z\d]+|variable\s+voting)\s+)"
+    r"{0,3}"
+)
+
 TAKEOUT_RE: Final[re.Pattern[str]] = re.compile(
-    r"each\s+(?:issued\s+and\s+outstanding\s+)?share[^.]{0,200}?"
+    # US: each share ... converted into / entitled to receive.
+    rf"each\s+(?:issued\s+and\s+outstanding\s+)?{_CLASS}share[^.]{{0,200}}?"
     r"(?:converted\s+into|entitled\s+to\s+receive)"
     r"|will\s+be\s+entitled\s+to\s+receive[^.]{0,120}?for\s+each\s+share"
     r"|you\s+will\s+(?:be\s+entitled\s+to\s+)?receive[^.]{0,120}?"
-    r"for\s+each\s+share",
+    r"for\s+each\s+share"
+    # Canada, a plan of arrangement under the CBCA or a provincial act. The
+    # operative verb is not "converted into": a share is **transferred to** the
+    # purchaser for the consideration, and the holder is named rather than the
+    # share. SunOpta was the measured miss -- a real $6.50 cash takeout by KKR
+    # that the US-only pattern gated out, which is the expensive direction of
+    # error because a gated document says nothing and costs nothing.
+    #
+    # Anchored on the transfer-for-consideration clause and not on "plan of
+    # arrangement" alone, which would be the wrong test: Coeur Mining's proxy and
+    # Royal Gold's both describe a plan of arrangement in which the *other*
+    # company's shares are acquired, and both are filings where this company is
+    # the buyer.
+    rf"|each\s+(?:issued\s+and\s+outstanding\s+)?{_CLASS}share\s+"
+    r"(?:[^.]{0,120}?)?will\s+be\s+transferred\s+to\s+[^.]{0,60}?"
+    r"(?:for|in\s+exchange\s+for)\s+(?:the\s+)?consideration"
+    rf"|each\s+holder\s+of\s+{_CLASS}shares?\s+will\s+"
+    r"(?:be\s+entitled\s+to\s+)?receive"
+    rf"|receive[^.]{{0,120}}?in\s+respect\s+of\s+each\s+{_CLASS}share",
     re.IGNORECASE,
 )
 
@@ -499,6 +812,165 @@ def is_takeout_proxy(text: str) -> bool:
     return bool(TAKEOUT_RE.search(text))
 
 
+#: The consideration prompt asks for the whole structure in one call.
+#:
+#: One call rather than two -- a cash field and a ratio field -- because they are
+#: not independent questions: a deal pays cash, or shares, or both, and asking
+#: separately is what produced "not_stated" for Veeco's cash and a wrong ratio for
+#: the same filing. It also halves the tokens, which on an 8,000-per-minute free
+#: tier is the difference between a re-run and a queue.
+CONSIDERATION_PROMPT: Final[str] = (
+    "Find what a holder of one share of the company's stock receives in this "
+    "transaction.\n"
+    "\n"
+    "Report every share class separately if they receive different amounts.\n"
+    "For each class report the cash and the acquirer shares it receives. A deal "
+    "may pay one, the other, or both.\n"
+    "If an amount is a range -- a collar, 'not less than X and not more than Y' "
+    "-- report low and high as the two ends. If it is a single figure report the "
+    "same number as low and high. **Never report the midpoint of a range as if "
+    "it were the price.**\n"
+    "\n"
+    "Reply with exactly this JSON shape:\n"
+    '{"present": true|false, "classes": [{"share_class": "<name, or \'common\'>",'
+    ' "cash": {"low": <number>, "high": <number>, "currency": "USD"} | null,'
+    ' "shares": {"low": <number>, "high": <number>} | null,'
+    ' "quote": "<verbatim substring>",'
+    ' "attributed_to": "<the name of the company whose shareholders receive'
+    ' this, exactly as the text names it>"}],'
+    ' "why_absent": "<short reason or null>"}\n'
+    "\n"
+    "`attributed_to` matters as much as the number. A proxy contains share "
+    "conversions belonging to a merger subsidiary, to the acquirer, and "
+    "sometimes to an entirely separate transaction described in the same "
+    "document. Name the company whose public shareholders receive the amount you "
+    "report, and if the amount belongs to a merger sub or to another deal, "
+    "report present=false instead.\n"
+    "\n"
+    "Numbers must be plain: no currency symbol, no commas, no percent sign.\n"
+    "\n"
+    "--- TEXT ---\n"
+)
+
+
+def _amount(raw: Any, *, currency: str | None) -> Amount | None:
+    """An ``Amount`` from the model's ``{"low":..,"high":..}``, or None."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        low = float(raw["low"])
+        high = float(raw.get("high", raw["low"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if high < low:
+        low, high = high, low
+    given = raw.get("currency") or currency
+    return Amount(low=low, high=high,
+                  currency=str(given).upper() if given else None)
+
+
+def extract_consideration(
+    accession: str,
+    text: str,
+    *,
+    client: Any = None,
+    providers: tuple[router.Provider, ...] = router.PROVIDERS,
+    filer: str | None = None,
+) -> list[Figure]:
+    """Consideration as rows: one per (share class, component).
+
+    A point value is one row with ``low == high``, a collar one row with
+    ``low < high``, a mix two rows for the same class, and two classes two sets of
+    rows. No arrangement of these can be misread as a single price, which is the
+    whole reason the scalar is derived by :func:`scalar_consideration` rather than
+    stored.
+    """
+    section = section_window(text, "merger_consideration")
+    base = dict(accession=accession, field="consideration")
+    if section is None:
+        return [Figure(reason=NO_SECTION, note="no consideration clause located",
+                       **base)]
+    try:
+        answer = router.ask(_SYSTEM, CONSIDERATION_PROMPT + section.text,
+                            prompt_version=PROMPT_VERSION, client=client,
+                            providers=providers)
+    except router.LlmError as exc:
+        return [Figure(reason=NOT_PARSED, note=f"no provider: {exc}"[:200],
+                       **base)]
+
+    prov = dict(
+        base, section=section.name, section_heading=section.heading,
+        section_start=section.start, section_end=section.end,
+        provider=answer.provider, model=answer.model,
+    )
+    said = answer.data
+    if not said.get("present"):
+        return [Figure(reason=NOT_STATED,
+                       note=str(said.get("why_absent") or "")[:200] or None,
+                       **prov)]
+
+    rows: list[Figure] = []
+    classes = said.get("classes")
+    if not isinstance(classes, list) or not classes:
+        return [Figure(reason=NOT_PARSED,
+                       note="present=true with no classes", **prov)]
+    for entry in classes:
+        if not isinstance(entry, dict):
+            continue
+        share_class = str(entry.get("share_class") or "common")[:60]
+        quote = entry.get("quote")
+        attributed = str(entry.get("attributed_to") or "")[:120] or None
+        cited = bool(quote) and isinstance(quote, str) and (
+            _normalise_quote(quote) in _normalise_quote(section.text))
+        ok, why = check_attribution(attributed, filer)
+        for component, amount in ((CASH, _amount(entry.get("cash"),
+                                                 currency="USD")),
+                                  (ACQUIRER_SHARES, _amount(entry.get("shares"),
+                                                            currency=None))):
+            if amount is None:
+                continue
+            if component == ACQUIRER_SHARES:
+                amount = Amount(low=amount.low, high=amount.high, currency=None)
+            common = dict(prov, share_class=share_class, component=component,
+                          quote=(quote or "")[:400] or None,
+                          attributed_to=attributed, attribution_ok=ok,
+                          currency=amount.currency,
+                          unit=("usd_per_share" if component == CASH
+                                else "acquirer_shares_per_share"))
+            if not cited:
+                rows.append(Figure(reason=UNCITED, note=(
+                    "the quote is not in the section it was given"
+                    if quote else "a figure with no quote cannot be checked"),
+                    **common))
+                continue
+            if not ok:
+                rows.append(Figure(reason=MISATTRIBUTED, note=why, **common))
+                continue
+            rows.append(Figure(reason=STATED, low=amount.low, high=amount.high,
+                               value=amount.scalar, **common))
+    if not rows:
+        return [Figure(reason=NOT_PARSED,
+                       note="classes carried no usable amount", **prov)]
+    return rows
+
+
+def considerations_from(rows: list[Figure]) -> list[Consideration]:
+    """The structure, rebuilt from the stored rows."""
+    by_class: dict[str, dict[str, Amount]] = {}
+    for row in rows:
+        if row.reason != STATED or row.component is None:
+            continue
+        amount = row.amount
+        if amount is None:
+            continue
+        by_class.setdefault(row.share_class or "common", {})[row.component] = amount
+    return [
+        Consideration(share_class=name, cash=legs.get(CASH),
+                      shares=legs.get(ACQUIRER_SHARES))
+        for name, legs in sorted(by_class.items())
+    ]
+
+
 def read(
     accession: str,
     text: str,
@@ -506,26 +978,42 @@ def read(
     fields: tuple[str, ...] | None = None,
     client: Any = None,
     providers: tuple[router.Provider, ...] = router.PROVIDERS,
+    filer: str | None = None,
 ) -> list[Figure]:
-    """Every v1 field from one proxy. One row per field, always.
+    """Every v1 field from one proxy. At least one row per field, always.
 
     The population gate runs first and costs nothing: a document that is not
     about this company being acquired gets one row per field saying so, and no
     prompt is sent. Sending one would produce a correct ``not_stated`` that reads
     like a coverage problem.
+
+    ``filer`` is the company the accession belongs to, and passing it is what turns
+    the attribution check on. It comes from ``companies`` keyed on CIK -- an
+    identifier, not a name the model returned -- and is used only to *reject* a
+    figure attributed elsewhere. Omitted, figures come back with
+    ``attribution_ok`` unset, which is "not checked" rather than "checked and
+    fine".
     """
-    wanted = fields or tuple(FIELDS)
+    wanted = fields or V1_FIELDS
     if not is_takeout_proxy(text):
         return [
             Figure(accession=accession, field=name, reason=NOT_A_TAKEOUT,
-                   unit=FIELDS[name]["unit"],
+                   unit=(None if name == CONSIDERATION
+                         else FIELDS[name]["unit"]),
                    note=("the document carries no share-conversion language, so "
                          "it is a merger proxy in which this company is not the "
                          "company being bought"))
             for name in wanted
         ]
-    return [extract_field(accession, text, f, client=client,
-                          providers=providers) for f in wanted]
+    out: list[Figure] = []
+    for name in wanted:
+        if name == CONSIDERATION:
+            out.extend(extract_consideration(accession, text, client=client,
+                                             providers=providers, filer=filer))
+        else:
+            out.append(extract_field(accession, text, name, client=client,
+                                     providers=providers, filer=filer))
+    return out
 
 
 #: The filing's own directory listing, which names every document in it.
@@ -600,7 +1088,7 @@ class ReadReport:
     def lines(self) -> list[str]:
         out = [f"proxy read: {self.documents} documents, "
                f"{len(self.figures)} figures"]
-        for name in FIELDS:
+        for name in V1_FIELDS:
             counts = self.by_reason(name)
             total = sum(counts.values())
             if not total:
@@ -616,4 +1104,8 @@ class ReadReport:
         if uncited:
             out.append(f"  {uncited} figure(s) rejected for an unverifiable "
                        "quote -- the citation check earning its keep")
+        wrong_of = self.by_reason().get(MISATTRIBUTED, 0)
+        if wrong_of:
+            out.append(f"  {wrong_of} figure(s) rejected as of something else -- "
+                       "present in the text, correctly quoted, wrong question")
         return out

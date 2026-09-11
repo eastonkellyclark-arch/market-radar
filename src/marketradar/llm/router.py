@@ -123,6 +123,18 @@ MAX_BACKOFF: Final[float] = 20.0
 #: Waited when a 429 carries no Retry-After.
 DEFAULT_BACKOFF: Final[float] = 3.0
 
+#: Above this, a 429 is a *day* cap rather than a minute bucket and the provider
+#: is set aside for the rest of the run -- see :data:`_deferred`.
+#:
+#: Three outcomes rather than two, and the middle one is the reason this constant
+#: exists separately from :data:`MAX_BACKOFF`. Under 20s, wait it out. Over two
+#: minutes, stop asking. In between -- a drained minute bucket asking for 42
+#: seconds, measured on ``gpt-oss-20b`` -- fall through to the next provider for
+#: *this* call and leave the provider in the ladder, because it will be fine by
+#: the next one. Deferring on 42 seconds would throw away the good model for a
+#: whole run over one busy minute.
+DEFER_AFTER: Final[float] = 120.0
+
 
 #: Status codes that mean "this provider will not work today": a bad key, an
 #: unpaid account, a blocked region. Unlike a 429 or a 5xx they will not clear on
@@ -138,6 +150,28 @@ PERMANENT_FAILURES: Final[frozenset[int]] = frozenset({401, 402, 403})
 #: persisted: an unpaid account gets paid, a blocked region gets unblocked, and a
 #: cached "never try this again" on disk would outlive the reason for it.
 _struck_off: set[str] = set()
+
+#: ``{provider: monotonic deadline}`` -- out of budget until then, and skipped in
+#: the ladder without spending a request to rediscover it.
+#:
+#: **Measured 2026-09-11 and it is a different limit from the one the headers
+#: report.** Groq's free tier caps tokens per *day* as well as per minute, at
+#: 200,000 per model, and the two are not visible in the same place: with the day
+#: bucket exhausted the per-minute headers read a perfectly healthy
+#: ``remaining-tokens: 8000`` while every call came back 429. Only ``retry-after``
+#: and the error body carry the real answer -- "tokens per day (TPD): Limit
+#: 200000, Used 199700 ... try again in 12m2.304s".
+#:
+#: So a 429 asking for longer than :data:`MAX_BACKOFF` is not a queue, it is a
+#: closed door, and the right response is to stop knocking. Same lesson as the
+#: Cerebras 402, one notch less permanent: a provider that will not work *yet*
+#: should cost one refusal per run, not one per call.
+#:
+#: At ~2,200 tokens a prompt the ceiling is about 45 proxies per model per day,
+#: which is a throughput fact worth knowing before planning a 500-document
+#: extraction -- the three Groq models are three day buckets as well as three
+#: minute buckets.
+_deferred: dict[str, float] = {}
 
 #: Floor between calls to one provider. Empty by default and that is deliberate:
 #: every provider here reports its own remaining budget, so a hand-picked gap is
@@ -215,6 +249,26 @@ def _pace(provider: str) -> None:
 def struck_off() -> frozenset[str]:
     """Providers this process has given up on, and why they are worth knowing."""
     return frozenset(_struck_off)
+
+
+def deferred() -> dict[str, float]:
+    """``{provider: seconds still to wait}`` for providers out of day budget.
+
+    Reported rather than hidden: a run that produced half its figures from the
+    fallback model did so for a reason, and "the good model's daily cap was spent
+    at document 23" is the reason a consumer needs in order to read the numbers.
+    """
+    now = time.monotonic()
+    return {name: round(at - now, 1) for name, at in sorted(_deferred.items())
+            if at > now}
+
+
+def _defer(provider: str, seconds: float) -> None:
+    _deferred[provider] = max(_deferred.get(provider, 0.0),
+                              time.monotonic() + seconds)
+    log.warning("%s is out of budget for %.0fs (a daily cap, not a minute "
+                "bucket); skipping it until then rather than asking again",
+                provider, seconds)
 
 
 def _retry_after(resp: httpx.Response) -> float:
@@ -305,15 +359,18 @@ def ask(
     ``temperature`` defaults to zero: this tier does extraction, where two runs
     over the same document disagreeing is a defect rather than variety.
     """
+    waiting = deferred()
     usable = [p for p in providers
-              if p.available() and p.name not in _struck_off]
+              if p.available() and p.name not in _struck_off
+              and p.name not in waiting]
     if not usable:
         struck = f" (struck off this run: {sorted(_struck_off)})" \
             if _struck_off else ""
+        out = f" (out of day budget: {waiting})" if waiting else ""
         raise LlmError(
             "no LLM provider is configured. Set MR_GROQ_API_KEY, "
             "MR_CEREBRAS_API_KEY, or run Ollama and set MR_OLLAMA_HOST."
-            + struck
+            + struck + out
         )
     close = client is None
     client = client or httpx.Client(timeout=REQUEST_TIMEOUT)
@@ -358,7 +415,27 @@ def ask(
                             # enough to clear it.
                             reset, _ = _budget.get(provider.name, (0.0, 1.0))
                             wait = max(_retry_after(resp), reset + 0.5)
-                            if attempt < TRANSPORT_RETRIES and wait <= MAX_BACKOFF:
+                            if wait > DEFER_AFTER:
+                                # Not a queue -- a day cap. The headers do not
+                                # carry it, so the only place it is visible is
+                                # this refusal, and asking again costs a request
+                                # to learn what we were just told.
+                                _defer(provider.name, wait)
+                                failures.append(
+                                    f"{provider.name}: HTTP 429, out of budget "
+                                    f"for {wait:.0f}s (deferred)")
+                                break
+                            if wait > MAX_BACKOFF:
+                                # Longer than it is worth sitting on, shorter
+                                # than a day cap. Go to the next provider for
+                                # this call rather than retrying without waiting
+                                # -- which is what this did, and it turned one
+                                # rate limit into three.
+                                failures.append(
+                                    f"{provider.name}: HTTP 429, asked for "
+                                    f"{wait:.0f}s")
+                                break
+                            if attempt < TRANSPORT_RETRIES:
                                 log.info("%s rate-limited; waiting %.1fs",
                                          provider.name, wait)
                                 time.sleep(wait)

@@ -237,6 +237,33 @@ narrative analysis. Never call the good model inside a loop over the market.
 **Provider failure degrades, never crashes.** The router falls through to the
 next provider. Six free tiers means six things that can change without notice.
 
+**The fallback ladder is not a quality ladder, and a weaker model fails as a
+plausible absence.** Measured 2026-09-11 on the proxy reader's structured
+consideration prompt, four documents with answers read by hand: `gpt-oss-120b`
+4/4, `qwen3.8-27b` 1/4, `gpt-oss-20b` 1/4, local `qwen3:4b` 0/4 — and the 4B
+returned 0.3575 for a deal paying 0.265 shares plus $10.15, a number in neither
+leg, which passed both the citation check and the attribution check.
+
+The dangerous part is *how* the weak models failed: `gpt-oss-20b` answered
+`not_stated` for a window whose own heading reads "right to receive an amount in
+cash … equal to $7.75". `not_parsed` is honest, but `not_stated` from a model that
+simply could not find the figure is indistinguishable from a stock deal genuinely
+having no cash price. The reason codes cannot tell them apart.
+
+So: falling through is right for an *outage* and wrong for a task the next model
+down cannot do. A job whose answer depends on capability must pin its model, and
+**every row stores the provider and model that produced it** — which is what makes
+a mixed run readable afterwards instead of merely plausible.
+
+**Free-tier limits are per day as well as per minute, and the headers only show
+one of them.** Groq caps tokens per day at 200,000 *per model*, and with that
+bucket spent `x-ratelimit-remaining-tokens` still read a healthy `8000` while every
+call came back 429 — the real answer was in `retry-after: 723` and the error body.
+At ~2,200 tokens a prompt that is about 45 proxies per model per day, which makes a
+500-document extraction eleven days of free tier rather than an afternoon. Check
+the refusal, not just the headers, and treat a 429 asking for twelve minutes as a
+closed door to stop knocking on rather than a queue to wait in.
+
 ---
 
 ## Conventions
@@ -513,6 +540,54 @@ The general shape, because it will recur: **"we cannot measure X" and "X is not
 disclosed anywhere" are different claims**, and this codebase had been treating
 the first as the second. Before recording something as unmeasurable, ask whether
 somebody is required to publish it.
+
+**A disclosed price is not a scalar, and a collar recorded as its upper bound is
+a wrong number that looks right.** Measured 2026-09-11 across 15 real takeout
+proxies: 4 of them cannot be written as one number per share. Enviri pays "not
+less than $14.50 and not more than $16.50" — a collar. CoreCard pays a *ratio*
+collar, 0.2783 to 0.3142. Veeco pays 0.265 acquirer shares **and** $10.15, so
+neither half is the consideration. FONAR pays $19.00 to two classes and $6.34 to
+a third.
+
+So `proxy_consideration` keys on `(accession, share class, component)`: a point
+value has `low = high`, a collar `low < high`, a mix is two rows for one class,
+two classes are two sets of rows. **The scalar is derived and never stored**, and
+it returns NULL with a `shape` saying which absence it is — `collar`, `mixed`,
+`shares_only`, `per_class`, `not_read` — because five different facts must not be
+five identical NULLs. Same distinction as `absent` against `unmapped`, and
+`lapsed` against `declining`. A midpoint is worse than either end: it is an
+invented figure no document states, the same mistake as inferring a split ratio
+from a price jump.
+
+**An LLM figure needs its attribution checked, not just its quote.** Every figure
+returns the verbatim text it came from and is rejected if that text is not in the
+window sent. That catches invention and it is not the dominant failure: of the
+wrong figures in the 20-proxy hand-check, **every one was genuinely in the text
+and quoted correctly** — a merger sub's share conversion read as target
+consideration, a different deal's "C$2.00 in cash per common share" inside the
+same document, a 75th-percentile premium from a comparables table read as this
+deal's own.
+
+A quote proves the number was read. It says nothing about what the number is *of*.
+So every figure returns the entity it belongs to, the currency and, for a premium,
+the reference price, and a figure attributed elsewhere is stored as
+`misattributed` rather than as a value. Kept distinct from `uncited` because they
+say opposite things about the provider: one means the model produced text that is
+not in the document, the other means it read the document correctly and answered a
+different question.
+
+This uses a name comparison, which the identifier rule above forbids — so the
+carve-out is explicit: **the name is used to reject, never to join.** The filer's
+identity still comes from CIK; the string is only what a rejection is measured
+against. A false mismatch throws away a good figure and is visible as a
+`misattributed` row carrying its reason, while a false match merely leaves the old
+behaviour in place. The costs are not symmetric and the cheap direction is the
+safe one. Where the costs *are* symmetric — resolving an entity, joining two
+tables — the rule stands unchanged and the answer is still a review queue.
+
+The comparison agrees on a **head word** rather than on any shared word, which is
+not a detail: Royal Gold and Sandstorm Gold share "gold", and a sector word is not
+an identity.
 
 Watch for the second-order version too. A recycled ticker makes a dead
 company look alive — SGEN carries bars through 2026 because a different

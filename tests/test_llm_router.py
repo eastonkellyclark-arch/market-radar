@@ -66,6 +66,7 @@ def clean_router(monkeypatch):
     """Each test starts with no provider struck off and no pacing debt."""
     monkeypatch.setattr(router, "_struck_off", set())
     monkeypatch.setattr(router, "_last_call", {})
+    monkeypatch.setattr(router, "_deferred", {})
     monkeypatch.setattr(router, "MIN_INTERVAL", {})
     monkeypatch.setenv("MR_GROQ_API_KEY", "k")
     monkeypatch.setenv("MR_OLLAMA_HOST", "http://localhost:11434")
@@ -284,3 +285,85 @@ def test_a_full_budget_does_not_wait(monkeypatch) -> None:
 def test_a_wait_longer_than_the_backoff_cap_falls_through_instead() -> None:
     """A provider asking for a minute is telling you to go somewhere else."""
     assert router.MAX_BACKOFF <= 30.0
+
+
+# --- a day cap is not a minute bucket -----------------------------------
+
+
+def test_a_long_rate_limit_defers_the_provider_for_the_rest_of_the_run() -> None:
+    """**Measured 2026-09-11, and the headers cannot see it.** Groq's free tier
+    caps tokens per *day* as well as per minute -- 200,000 per model -- and with
+    the day bucket spent the per-minute headers read a healthy
+    ``remaining-tokens: 8000`` while every call came back 429 with
+    ``retry-after: 723``.
+
+    A 429 asking for twelve minutes is not a queue, it is a closed door. Asking
+    again costs one request to relearn what the provider just said, which is the
+    Cerebras-402 lesson one notch less permanent: the provider is skipped until
+    its deadline rather than struck off forever.
+    """
+    client = FakeClient({
+        "groq.test": [FakeResponse(429, headers={
+            "retry-after": "723",
+            # The healthy minute bucket that hid the real limit.
+            "x-ratelimit-limit-tokens": "8000",
+            "x-ratelimit-remaining-tokens": "8000",
+            "x-ratelimit-reset-tokens": "1ms",
+        })],
+        "11434": [FakeResponse(200, {"message": {"content": '{"n": 99}'}})],
+    })
+    answer = router.ask("s", "u", prompt_version="v1",
+                        providers=(GROQ, LOCAL), client=client)
+    assert answer.provider == "ollama"
+    groq_calls = [u for u, _ in client.calls if "groq.test" in u]
+    assert len(groq_calls) == 1, (
+        f"a provider that said 'not for 12 minutes' was asked "
+        f"{len(groq_calls)} times")
+
+    # And the next call skips it without a request at all.
+    again = router.ask("s", "u", prompt_version="v1",
+                       providers=(GROQ, LOCAL), client=client)
+    assert again.provider == "ollama"
+    assert len([u for u, _ in client.calls if "groq.test" in u]) == 1
+
+    # Deferred, not struck off: it will work again today.
+    assert router.struck_off() == frozenset()
+    assert "groq" in router.deferred()
+    assert router.deferred()["groq"] > 600
+
+
+def test_a_busy_minute_does_not_cost_the_good_model_for_the_whole_run() -> None:
+    """The middle case, and the reason ``DEFER_AFTER`` is its own constant.
+
+    A drained *minute* bucket asks for something like 42 seconds -- measured on
+    ``gpt-oss-20b``. That is too long to sit on and nowhere near a day cap, so the
+    call falls through to the next provider and the provider stays in the ladder
+    for the next one. Deferring on 42 seconds would throw away the only model that
+    can do the job over one busy minute.
+    """
+    client = FakeClient({
+        "groq.test": [FakeResponse(429, headers={"retry-after": "42"}),
+                      FakeResponse(200, openai_reply({"n": 7}))],
+        "11434": [FakeResponse(200, {"message": {"content": '{"n": 99}'}})],
+    })
+    first = router.ask("s", "u", prompt_version="v1",
+                       providers=(GROQ, LOCAL), client=client)
+    assert first.provider == "ollama", "a 42s wait was sat on rather than routed"
+    assert router.deferred() == {}, "a minute bucket was read as a day cap"
+
+    second = router.ask("s", "u", prompt_version="v1",
+                        providers=(GROQ, LOCAL), client=client)
+    assert second.provider == "groq", "the good model was dropped for the run"
+
+
+def test_a_deferred_provider_is_reported_rather_than_hidden() -> None:
+    """A run that produced half its figures from the fallback model did so for a
+    reason, and "the good model's daily cap was spent at document 23" is the
+    reason a consumer needs in order to read the numbers."""
+    router._defer("groq", 300.0)
+    assert "groq" in router.deferred()
+    client = FakeClient({"groq.test": [FakeResponse(200, openai_reply({}))]})
+    with pytest.raises(router.LlmError, match="out of day budget"):
+        router.ask("s", "u", prompt_version="v1", providers=(GROQ,),
+                   client=client)
+    assert client.calls == [], "a deferred provider was still asked"

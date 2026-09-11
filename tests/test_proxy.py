@@ -74,6 +74,23 @@ ISSUANCE_PROXY = (
     + FIGURES
 )
 
+#: A Canadian plan of arrangement, in SunOpta's own phrasing. The verb is not
+#: "converted into" and the subject is the holder rather than the share, which is
+#: why the US-only gate missed a real $6.50 cash takeout.
+ARRANGEMENT = (
+    "The Arrangement Pursuant to the Plan of Arrangement, on the effective date: "
+    "each issued and outstanding Common Share, excluding Common Shares held by "
+    "Dissenting Shareholders, will be transferred to Purchaser for the "
+    "Consideration of $6.50 in cash, less any applicable withholdings."
+    + FIGURES
+    + "filler. " * 200
+    + "Q: What will I receive in the Arrangement? A: If the Arrangement is "
+      "completed, you will be entitled to receive the Consideration in respect "
+      "of each Common Share, which is equal to $6.50 in cash. This represents a "
+      "premium of 44.0% to the 20-trading-day volume weighted average price."
+    + FIGURES
+)
+
 NO_SECTIONS = "Annual Meeting of Stockholders. " + "nothing relevant. " * 300
 
 
@@ -184,7 +201,7 @@ def test_an_issuance_proxy_is_not_a_takeout_and_costs_no_prompt() -> None:
                          providers=ONLY_GROQ)
     assert {f.reason for f in figures} == {proxy.NOT_A_TAKEOUT}
     assert model.prompts == [], "a prompt was sent for a non-takeout document"
-    assert len(figures) == len(proxy.FIELDS), "every field still gets a row"
+    assert len(figures) == len(proxy.V1_FIELDS), "every field still gets a row"
 
 
 def test_a_real_takeout_passes_the_gate() -> None:
@@ -192,18 +209,59 @@ def test_a_real_takeout_passes_the_gate() -> None:
     assert proxy.is_takeout_proxy(STOCK_DEAL)
 
 
+def test_a_canadian_plan_of_arrangement_passes_the_gate() -> None:
+    """SunOpta was the measured miss: a real $6.50 cash takeout by KKR that the
+    US-only pattern gated out. Canada does not write "converted into" -- a share
+    is **transferred to** the purchaser for the consideration, and the holder is
+    named rather than the share.
+
+    A gated document costs nothing and says nothing, which makes a false negative
+    the expensive direction of error.
+    """
+    assert proxy.is_takeout_proxy(ARRANGEMENT)
+
+
+def test_the_gate_is_not_relaxed_to_any_plan_of_arrangement() -> None:
+    """The wrong test, and it would have been the easy one. Coeur Mining's proxy
+    and Royal Gold's both describe a plan of arrangement in which the *other*
+    company's shares are acquired, and both are filings where this company is the
+    buyer -- so "plan of arrangement" appears in a document that must stay gated
+    out. The gate anchors on the transfer-for-consideration clause instead.
+    """
+    buying = ("Proposal 1: to approve the issuance of shares of Company common "
+              "stock to the shareholders of Target Inc. pursuant to the Plan of "
+              "Arrangement under the Business Corporations Act." + FIGURES)
+    assert not proxy.is_takeout_proxy(buying)
+
+
 # --- extraction, and the checking -------------------------------------
+
+
+#: One cash class, correctly attributed. The shape the model is asked for.
+def cash_said(low: float = 52.0, high: float | None = None,
+              quote: str = "right to receive $52.00 in cash",
+              attributed: str | None = "Company, Inc.",
+              share_class: str = "common") -> dict:
+    return {"present": True, "classes": [
+        {"share_class": share_class,
+         "cash": {"low": low, "high": low if high is None else high,
+                  "currency": "USD"},
+         "shares": None, "quote": quote, "attributed_to": attributed}]}
 
 
 def test_a_stated_figure_carries_its_provenance() -> None:
     """An LLM number with no provenance is unauditable. Section, offsets, quote,
     provider, model and prompt version, on every row."""
-    model = FakeModel({"present": True, "value": 52.0,
-                       "quote": "right to receive $52.00 in cash"})
-    figure = proxy.extract_field("acc-2", CASH_DEAL, "consideration_per_share",
-                                 client=model, providers=ONLY_GROQ)
+    model = FakeModel(cash_said())
+    rows = proxy.extract_consideration("acc-2", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert len(rows) == 1
+    figure = rows[0]
     assert figure.reason == proxy.STATED
     assert figure.value == 52.0
+    assert (figure.low, figure.high) == (52.0, 52.0)
+    assert figure.component == proxy.CASH
+    assert figure.currency == "USD"
     assert figure.unit == "usd_per_share"
     assert figure.section == "merger_consideration"
     assert figure.section_start is not None and figure.section_end is not None
@@ -211,6 +269,8 @@ def test_a_stated_figure_carries_its_provenance() -> None:
     assert figure.quote and "$52.00" in figure.quote
     assert figure.provider == "groq" and figure.model == "test-model"
     assert figure.prompt_version == proxy.PROMPT_VERSION
+    assert figure.attributed_to == "Company, Inc."
+    assert figure.attribution_ok is True
     assert figure.usable
 
 
@@ -219,45 +279,268 @@ def test_a_figure_whose_quote_is_not_in_the_text_is_rejected() -> None:
     counted -- the rate is how trust in a provider is earned, and it is the
     reason a small local model is an acceptable fallback at all.
     """
-    model = FakeModel({"present": True, "value": 99.0,
-                       "quote": "the right to receive $99.00 in cash"})
-    figure = proxy.extract_field("acc-3", CASH_DEAL, "consideration_per_share",
-                                 client=model, providers=ONLY_GROQ)
-    assert figure.reason == proxy.UNCITED
-    assert figure.value is None, "an unverifiable number was stored anyway"
-    assert "not in the section" in (figure.note or "")
+    model = FakeModel(cash_said(
+        99.0, quote="the right to receive $99.00 in cash"))
+    rows = proxy.extract_consideration("acc-3", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert [r.reason for r in rows] == [proxy.UNCITED]
+    assert rows[0].value is None, "an unverifiable number was stored anyway"
+    assert rows[0].low is None
+    assert "not in the section" in (rows[0].note or "")
 
 
 def test_a_quote_reflowed_by_the_model_still_verifies() -> None:
     """Models reflow whitespace when they copy. Rejecting a figure over a double
     space would make the check useless while looking strict."""
-    model = FakeModel({"present": True, "value": 52.0,
-                       "quote": "right  to\n receive   $52.00 in cash"})
-    figure = proxy.extract_field("acc-4", CASH_DEAL, "consideration_per_share",
-                                 client=model, providers=ONLY_GROQ)
-    assert figure.reason == proxy.STATED
+    model = FakeModel(cash_said(
+        quote="right  to\n receive   $52.00 in cash"))
+    rows = proxy.extract_consideration("acc-4", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert [r.reason for r in rows] == [proxy.STATED]
 
 
 def test_not_stated_and_not_parsed_stay_distinct() -> None:
     """A stock-for-stock merger genuinely has no cash price per share, and
     recording that as a parse failure sends the next reader hunting for a number
     nobody wrote down."""
-    absent = FakeModel({"present": False, "value": None, "quote": None,
-                        "why_absent": "consideration is shares, not cash"})
-    figure = proxy.extract_field("acc-5", STOCK_DEAL,
-                                 "consideration_per_share",
-                                 client=absent, providers=ONLY_GROQ)
-    assert figure.reason == proxy.NOT_STATED
-    assert figure.value is None
-    assert "shares" in (figure.note or "")
+    absent = FakeModel({"present": False, "classes": [],
+                        "why_absent": "the holder receives nothing in cash"})
+    rows = proxy.extract_consideration("acc-5", STOCK_DEAL, client=absent,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert [r.reason for r in rows] == [proxy.NOT_STATED]
+    assert rows[0].value is None and rows[0].low is None
+    assert "cash" in (rows[0].note or "")
 
-    garbled = FakeModel({"present": True, "value": "about fifty dollars",
-                         "quote": "x"})
-    figure = proxy.extract_field("acc-6", CASH_DEAL,
-                                 "consideration_per_share",
-                                 client=garbled, providers=ONLY_GROQ)
-    assert figure.reason == proxy.NOT_PARSED
-    assert figure.reason != proxy.NOT_STATED
+    garbled = FakeModel({"present": True, "classes": [
+        {"share_class": "common",
+         "cash": {"low": "about fifty dollars", "currency": "USD"},
+         "shares": None, "quote": "x", "attributed_to": "Company"}]})
+    rows = proxy.extract_consideration("acc-6", CASH_DEAL, client=garbled,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert [r.reason for r in rows] == [proxy.NOT_PARSED]
+    assert rows[0].reason != proxy.NOT_STATED
+
+
+# --- consideration is a structure, not a scalar -------------------------
+
+
+def test_a_collar_is_a_range_and_has_no_scalar() -> None:
+    """Enviri: "not to be less than $14.50 per share and not to exceed $16.50".
+
+    **A collar recorded as its upper bound is a wrong number that looks right**,
+    which is why the scalar is derived rather than stored. A midpoint would be
+    worse still -- an invented figure no document states, the same mistake as
+    inferring a split ratio from a price jump.
+    """
+    model = FakeModel(cash_said(14.50, 16.50))
+    rows = proxy.extract_consideration("acc-collar", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert [r.reason for r in rows] == [proxy.STATED]
+    assert (rows[0].low, rows[0].high) == (14.50, 16.50)
+    assert rows[0].value is None, "one end of a collar was stored as the price"
+
+    value, shape = proxy.scalar_consideration(proxy.considerations_from(rows))
+    assert value is None
+    assert shape == proxy.COLLAR
+    # A range still has the two ends, which is what a reader needs.
+    assert rows[0].amount is not None and rows[0].amount.is_range
+
+
+def test_a_mixed_deal_is_two_rows_for_one_class() -> None:
+    """Veeco: 0.265 Axcelis shares **and** $10.15. Neither half is the
+    consideration, and v1's two scalar fields had no way to say so."""
+    model = FakeModel({"present": True, "classes": [
+        {"share_class": "common",
+         "cash": {"low": 10.15, "high": 10.15, "currency": "USD"},
+         "shares": {"low": 0.265, "high": 0.265},
+         "quote": "right to receive $52.00 in cash",
+         "attributed_to": "Company, Inc."}]})
+    rows = proxy.extract_consideration("acc-mix", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert {r.component for r in rows} == {proxy.CASH, proxy.ACQUIRER_SHARES}
+    assert all(r.reason == proxy.STATED for r in rows)
+    # A share ratio has no currency; cash must name one.
+    by = {r.component: r for r in rows}
+    assert by[proxy.CASH].currency == "USD"
+    assert by[proxy.ACQUIRER_SHARES].currency is None
+
+    structs = proxy.considerations_from(rows)
+    assert len(structs) == 1 and structs[0].is_mixed
+    assert proxy.scalar_consideration(structs) == (None, proxy.MIXED)
+
+
+def test_two_share_classes_are_two_prices() -> None:
+    """FONAR: $19.00 for Common and Class B, $6.34 for Class C. One number for
+    that filing is one of the two, which is a wrong answer either way."""
+    model = FakeModel({"present": True, "classes": [
+        {"share_class": "common", "cash": {"low": 19.0, "high": 19.0,
+                                           "currency": "USD"},
+         "shares": None, "quote": "right to receive $52.00 in cash",
+         "attributed_to": "Company, Inc."},
+        {"share_class": "Class C", "cash": {"low": 6.34, "high": 6.34,
+                                            "currency": "USD"},
+         "shares": None, "quote": "a premium of 23.4%",
+         "attributed_to": "Company, Inc."},
+    ]})
+    rows = proxy.extract_consideration("acc-class", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert {r.share_class for r in rows} == {"common", "Class C"}
+    structs = proxy.considerations_from(rows)
+    assert len(structs) == 2
+    assert proxy.scalar_consideration(structs) == (None, proxy.PER_CLASS)
+
+
+def test_a_stock_deal_has_a_ratio_and_no_usd_scalar() -> None:
+    model = FakeModel({"present": True, "classes": [
+        {"share_class": "common", "cash": None,
+         "shares": {"low": 0.6303, "high": 0.6303},
+         "quote": "right to receive 0.6303 shares of Parent common stock",
+         "attributed_to": "Company, Inc."}]})
+    rows = proxy.extract_consideration("acc-stock", STOCK_DEAL, client=model,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert [r.component for r in rows] == [proxy.ACQUIRER_SHARES]
+    assert rows[0].value == 0.6303
+    assert proxy.scalar_consideration(proxy.considerations_from(rows)) == (
+        None, proxy.SHARES_ONLY)
+
+
+def test_the_scalar_exists_only_when_the_deal_has_one() -> None:
+    """Four of the fifteen takeouts measured have no single per-share price. The
+    shape says *which* absence, so three different facts are not three identical
+    NULLs."""
+    usd = lambda lo, hi=None: proxy.Amount(lo, lo if hi is None else hi, "USD")
+    assert proxy.scalar_consideration(
+        [proxy.Consideration(cash=usd(29.0))]) == (29.0, proxy.SCALAR)
+    assert proxy.scalar_consideration([]) == (None, proxy.NOT_READ)
+    assert proxy.scalar_consideration(
+        [proxy.Consideration(cash=usd(14.5, 16.5))]) == (None, proxy.COLLAR)
+
+
+def test_a_range_the_wrong_way_round_is_refused() -> None:
+    """The type refuses an incoherent range rather than storing it, the same way
+    the table's check constraint does."""
+    with pytest.raises(ValueError, match="wrong way round"):
+        proxy.Amount(16.5, 14.5)
+    # The model writing them swapped is a model error, not a data error, so the
+    # reader normalises rather than failing the document.
+    model = FakeModel(cash_said(16.5, 14.5))
+    rows = proxy.extract_consideration("acc-swap", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert (rows[0].low, rows[0].high) == (14.5, 16.5)
+
+
+# --- attribution: what the figure is *of* ------------------------------
+
+
+def test_a_cited_merger_sub_conversion_is_rejected() -> None:
+    """**The error the citation check is blind to, and the dominant one.**
+
+    Measured over 20 real proxies: every wrong figure was genuinely in the text
+    and quoted correctly. Farmer Brothers' all-cash deal came back with an
+    exchange ratio of 1.0, quoting "each share of common stock of **Merger Sub**
+    ... shall automatically be converted" -- boilerplate merger mechanics, read as
+    what target holders receive.
+
+    A quote proves the number was read. The attribution is what says it answers
+    the question asked.
+    """
+    model = FakeModel({"present": True, "classes": [
+        {"share_class": "common", "cash": None,
+         "shares": {"low": 1.0, "high": 1.0},
+         "quote": "right to receive $52.00 in cash",
+         "attributed_to": "Merger Sub, Inc."}]})
+    rows = proxy.extract_consideration("acc-mis", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ,
+                                       filer="Farmer Brothers Co")
+    assert [r.reason for r in rows] == [proxy.MISATTRIBUTED]
+    assert rows[0].low is None and rows[0].value is None
+    assert rows[0].attribution_ok is False
+    # Kept distinct from `uncited`: they say opposite things about the provider,
+    # and the remedy is a prompt in one case and a locator in the other.
+    assert rows[0].reason != proxy.UNCITED
+    assert "Merger Sub" in (rows[0].note or "")
+
+
+def test_another_deal_inside_the_same_document_is_rejected() -> None:
+    """Royal Gold's proxy carries "C$2.00 in cash per common share" -- Sandstorm
+    buying Horizon, in Canadian dollars, in a filing where Royal Gold is the
+    buyer. Present, quotable, and not this company's consideration.
+
+    The two names share "gold", which is why the check agrees on a **head word**
+    rather than on any shared word: a sector word is not an identity.
+    """
+    model = FakeModel({"present": True, "classes": [
+        {"share_class": "common",
+         "cash": {"low": 2.0, "high": 2.0, "currency": "CAD"},
+         "shares": None, "quote": "right to receive $52.00 in cash",
+         "attributed_to": "Sandstorm Gold Ltd."}]})
+    rows = proxy.extract_consideration("acc-other", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ,
+                                       filer="Royal Gold, Inc.")
+    assert [r.reason for r in rows] == [proxy.MISATTRIBUTED]
+    assert "does not name the filer" in (rows[0].note or "")
+
+
+def test_a_figure_with_no_attribution_cannot_be_placed() -> None:
+    model = FakeModel(cash_said(attributed=None))
+    rows = proxy.extract_consideration("acc-none", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ, filer="Company Inc")
+    assert [r.reason for r in rows] == [proxy.MISATTRIBUTED]
+    assert "no attribution" in (rows[0].note or "")
+
+
+def test_an_abbreviated_name_still_matches() -> None:
+    """The cost of a false mismatch is a good figure thrown away, so the check
+    has to survive how filings actually write names."""
+    for attributed, filer in (("Farmer Bros. Co.", "FARMER BROTHERS CO"),
+                              ("Electro-Sensors, Inc.", "ELECTRO SENSORS INC"),
+                              ("the Company", "AstroNova, Inc."),
+                              ("Leggett & Platt, Incorporated",
+                               "LEGGETT & PLATT INC")):
+        ok, why = proxy.check_attribution(attributed, filer)
+        assert ok, f"{attributed!r} vs {filer!r} was rejected: {why}"
+
+
+def test_an_unchecked_attribution_is_not_a_passed_one() -> None:
+    """With no filer name there is nothing to compare against. Recorded as
+    unchecked -- ``attribution_ok`` unset -- because "we did not look" and "we
+    looked and it was fine" are different facts."""
+    model = FakeModel(cash_said())
+    rows = proxy.extract_consideration("acc-unchecked", CASH_DEAL, client=model,
+                                       providers=ONLY_GROQ)
+    assert rows[0].reason == proxy.STATED
+    assert rows[0].attributed_to == "Company, Inc."
+
+
+def test_a_comparables_percentile_is_not_this_deals_premium() -> None:
+    """Comerica came back with 7%, quoting "premium of 7.0% and 75th percentile
+    premium of 22" -- a quartile from a table of other transactions."""
+    model = FakeModel({"present": True, "value": 7.0,
+                       "quote": "a premium of 23.4%",
+                       "attributed_to": "75th percentile of selected "
+                                        "transactions",
+                       "reference": "closing price"})
+    figure = proxy.extract_field("acc-pct", CASH_DEAL, "premium_pct",
+                                 client=model, providers=ONLY_GROQ,
+                                 filer="Comerica Incorporated")
+    assert figure.reason == proxy.MISATTRIBUTED
+    assert figure.value is None
+
+
+def test_a_premium_records_what_it_is_measured_against() -> None:
+    """One filing quotes 208.5%, 231% and 84.9% for the same deal against three
+    reference prices. Without the reference they are three numbers rather than
+    one comparable figure."""
+    model = FakeModel({"present": True, "value": 23.4,
+                       "quote": "a premium of 23.4%",
+                       "attributed_to": "Company, Inc.",
+                       "reference": "closing price on March 2, 2026"})
+    figure = proxy.extract_field("acc-ref", CASH_DEAL, "premium_pct",
+                                 client=model, providers=ONLY_GROQ,
+                                 filer="Company Inc")
+    assert figure.reason == proxy.STATED
+    assert figure.reference == "closing price on March 2, 2026"
+    assert figure.attribution_ok is True
 
 
 def test_a_missing_quote_is_uncited_rather_than_stated() -> None:
@@ -298,13 +581,27 @@ def test_the_prompt_gets_the_section_and_not_the_document() -> None:
 
 
 def test_the_prompt_says_when_absent_is_the_right_answer() -> None:
-    """Without it a model asked for a cash price in a stock deal will produce
-    one, and the citation check would pass because some dollar figure is always
-    nearby."""
+    """Without it a model asked for a premium in a document that only tabulates
+    other deals' premiums will produce one, and the citation check would pass
+    because some percentage is always nearby."""
     model = FakeModel({"present": False, "value": None, "quote": None})
-    proxy.extract_field("acc-10", STOCK_DEAL, "consideration_per_share",
+    proxy.extract_field("acc-10", CASH_DEAL, "premium_pct",
                         client=model, providers=ONLY_GROQ)
-    assert "report absent" in model.prompts[0]
+    assert "Report absent when" in model.prompts[0]
+
+
+def test_the_consideration_is_one_call_not_two() -> None:
+    """Cash and shares are not independent questions: a deal pays one, the other,
+    or both. Asking separately is what made Veeco's cash read ``not_stated``
+    while its ratio was extracted from the same sentence -- and it doubled the
+    tokens, which on an 8,000-per-minute free tier was the binding constraint."""
+    model = FakeModel(cash_said())
+    proxy.extract_consideration("acc-one", CASH_DEAL, client=model,
+                                providers=ONLY_GROQ, filer="Company Inc")
+    assert len(model.prompts) == 1
+    assert "attributed_to" in model.prompts[0]
+    assert "midpoint" in model.prompts[0], (
+        "nothing told the model not to average a collar")
 
 
 # --- scope --------------------------------------------------------------
@@ -312,18 +609,19 @@ def test_the_prompt_says_when_absent_is_the_right_answer() -> None:
 
 def test_v1_reads_consideration_and_premium_only() -> None:
     """Comps, projections and DCF ranges come after these are shown to work."""
-    assert set(proxy.FIELDS) == {
-        "consideration_per_share", "exchange_ratio", "premium_pct"}
-    with pytest.raises(ValueError, match="not in v1"):
+    assert proxy.V1_FIELDS == ("consideration", "premium_pct")
+    assert set(proxy.FIELDS) == {"premium_pct"}, (
+        "the consideration is structured, not a scalar field")
+    with pytest.raises(ValueError, match="not a scalar v1 field"):
         proxy.extract_field("a", CASH_DEAL, "dcf_discount_rate")
 
 
 def test_every_field_always_gets_a_row() -> None:
-    model = FakeModel({"present": False, "value": None, "quote": None})
+    model = FakeModel({"present": False, "classes": [], "value": None,
+                       "quote": None})
     figures = proxy.read("acc-11", CASH_DEAL, client=model,
                          providers=ONLY_GROQ)
-    assert len(figures) == len(proxy.FIELDS)
-    assert {f.field for f in figures} == set(proxy.FIELDS)
+    assert {f.field for f in figures} == set(proxy.V1_FIELDS)
     assert all(f.reason in proxy.REASONS for f in figures)
 
 
@@ -345,35 +643,19 @@ def test_the_report_counts_every_reason() -> None:
     assert "citation check earning its keep" in text
 
 
-def test_a_cited_but_misattributed_number_is_still_accepted_today() -> None:
-    """The known blind spot, pinned so it is not rediscovered as a surprise.
-
-    A citation proves the number was read rather than invented. It says nothing
-    about *what the number is of*. Measured over 20 real proxies: every wrong
-    figure was genuinely in the text and cited correctly -- a merger sub's share
-    conversion read as target consideration, a different deal's C$2.00, a
-    comparables-table percentile read as this deal's premium.
-
-    This test asserts the current behaviour rather than the desired one, which is
-    the honest way to record a gap: when v2 checks attribution, this test should
-    fail and be rewritten, and that failure is the signal the fix landed.
-    """
-    misattributed = (
-        "each share of common stock of Merger Sub issued and outstanding "
-        "immediately prior to the Effective Time shall automatically be "
-        "converted into one share of the surviving corporation."
-    )
-    text = CASH_DEAL + misattributed + FIGURES
-    model = FakeModel({"present": True, "value": 1.0,
-                       "quote": "converted into one share of the surviving "
-                                "corporation"})
-    figure = proxy.extract_field("acc-mis", text, "exchange_ratio",
-                                 client=model, providers=ONLY_GROQ)
-    assert figure.reason == proxy.STATED, (
-        "if this now rejects the figure, attribution checking has landed and "
-        "this test should be rewritten to assert the rejection"
-    )
-    assert figure.value == 1.0
-    # The provenance is what makes the error *findable* even though it is not
-    # caught: the quote says plainly that it is about Merger Sub.
-    assert "surviving corporation" in (figure.quote or "")
+def test_the_report_separates_a_bad_quote_from_a_wrong_question() -> None:
+    """Two rejections that say opposite things about the provider. An uncited
+    figure means the model produced text that is not in the document; a
+    misattributed one means it read the document correctly and answered a
+    different question. Collapsing them would hide which of the two is happening,
+    and the remedies are a prompt and a locator respectively."""
+    report = proxy.ReadReport(documents=2, figures=[
+        proxy.Figure(accession="a", field="premium_pct", reason=proxy.UNCITED),
+        proxy.Figure(accession="b", field="premium_pct",
+                     reason=proxy.MISATTRIBUTED),
+    ])
+    text = "\n".join(report.lines())
+    assert "citation check earning its keep" in text
+    assert "wrong question" in text
+    counts = report.by_reason("premium_pct")
+    assert counts[proxy.UNCITED] == 1 and counts[proxy.MISATTRIBUTED] == 1

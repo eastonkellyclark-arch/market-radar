@@ -1488,6 +1488,177 @@ of fetching. Discovery is free: the submissions JSON and the daily index both
 list every form, so `target_filing` is populated by the sweep that was already
 happening. Reading them is the separate job.
 
+#### The proxy reader, hand-checked on 20 documents — 2026-09-11
+
+Locate by heading deterministically, extract from the located window with the
+cheap LLM tier, never send the whole document. A DEFM14A is about 1.26 million
+characters and the part worth reading is a few thousand.
+
+**The population gate came first and was the largest single win.** `DEFM14A` is a
+definitive proxy *relating to* a merger, which includes the acquirer asking its
+own holders to approve a share issuance. Five of the first six documents read came
+back "no cash price stated", which was true and useless. A regex for the operative
+share-conversion language fixes it at zero cost, and the gate is deterministic on
+purpose — a population decided by an LLM is a population nobody can reproduce.
+
+**The real takeout-proxy rate is 75%, not 100%.** Of 20 consecutive DEFM14A
+filings: 15 takeouts, 3 acquirers seeking issuance approval (Dillard's, Coeur
+Mining, Royal Gold), 2 liquidations (First REIT of New Jersey, Elme Communities).
+So the form type is an **upper bound** on the deal population, and the 27%
+DEFM14A coverage measured on 2026-09-10 is really about 20%.
+
+Gate precision 88%, recall 100% after the Canadian fix below. The two false
+positives are the acquirer proxies whose *target* is being converted — the
+language is in the document and belongs to someone else, which is the same
+misattribution problem one level up.
+
+**Canada does not write "converted into".** SunOpta was the measured false
+negative: a real $6.50 cash takeout by KKR, gated out because a plan of
+arrangement transfers a share **to the purchaser for the consideration** and names
+the holder rather than the share. Adding that clause took recall from 93% to 100%
+and flipped exactly one document; precision was unchanged. What it deliberately
+does *not* do is match "plan of arrangement" on its own — Coeur Mining's and Royal
+Gold's proxies both contain that phrase and are both filings where this company is
+the buyer, so the loose test would have admitted the thing the gate exists to
+exclude.
+
+A gated document costs nothing and says nothing, which makes a false negative the
+expensive direction and a false positive the cheap one.
+
+##### Consideration is a structure. A scalar is wrong for 4 of 15
+
+`consideration_per_share` as a single number cannot hold what deals actually say:
+
+| filing | what one share gets | why a scalar fails |
+|---|---|---|
+| Enviri | "not less than $14.50 and not more than $16.50" | a collar — there is no single price |
+| CoreCard | 0.2783–0.3142 acquirer shares | a *ratio* collar |
+| Veeco | 0.265 Axcelis shares **and** $10.15 cash | a mix — neither half is the consideration |
+| Norfolk Southern | 1 Union Pacific share **and** $88.82 cash | the same shape |
+| FONAR | $19.00 Common and Class B, $6.34 Class C | two prices, one filing |
+
+**A collar recorded as its upper bound is a wrong number that looks right**, and a
+midpoint is worse — an invented figure no document states, the same mistake as
+inferring a split ratio from a price jump. The model returned 0.3142 for CoreCard,
+which is one end of its collar: scored against a scalar it reads as an error and
+stored as a scalar it would read as a fact. Neither is what the filing says.
+
+So `proxy_consideration` holds one row per `(accession, share class, component)`.
+A point value has `low = high`, a collar `low < high`, a mix is two rows for one
+class, two classes are two sets of rows. The scalar is **derived** by a view and
+returns NULL with a `shape` that says which absence it is — `collar`, `mixed`,
+`shares_only`, `per_class`, `not_read` — so five different facts are not five
+identical NULLs. Same discipline as `absent` against `unmapped`, and as `lapsed`
+against `declining`.
+
+Cash and shares are asked for in **one** call rather than two, because they are
+one fact about a deal: asking separately is what made Veeco's cash read
+`not_stated` while its ratio was extracted from the same sentence. It also halves
+the tokens, which turned out to matter more than expected (below).
+
+##### The citation check is blind to the error that matters
+
+Every extracted figure returns the verbatim text it came from, and a quote not
+found in the window sent is rejected as `uncited`. That catches invention — two of
+nineteen in the first pass — and it is the reason a small local model is an
+acceptable fallback at all.
+
+It is not the dominant failure. **Of the wrong figures in the 20-document
+hand-check, every single one was genuinely in the text and quoted correctly:**
+
+| filing | figure | what it was actually of |
+|---|---|---|
+| Farmer Brothers | exchange ratio 1.0 | "each share of common stock of **Merger Sub** … shall be converted" — merger mechanics. The deal is all cash with no ratio at all. |
+| Royal Gold | $2.00 | "C$2.00 in cash per common share" — a *different* deal inside the same document, in Canadian dollars, in a filing where Royal Gold is the buyer |
+| Comerica | premium 7% | "premium of 7.0% and 75th percentile premium of 22" — a quartile from a table of *other* transactions |
+
+A quote proves the number was read. It says nothing about what the number is of.
+So every figure now returns its attribution — whose shares, which currency, which
+reference price — and that is checked before the figure is stored, as
+`misattributed`.
+
+The check is two tests. A phrase naming something other than this company's own
+holders fails outright ("merger sub", "parent", "75th percentile", "selected
+transactions") because those cannot be right by accident. Otherwise the attributed
+name and the filer name must agree on a **head word**, with corporate-form noise
+stripped. Head word rather than any shared word, because any-shared-word is too
+weak by exactly the case that motivated it: Royal Gold and Sandstorm Gold share
+"gold", and a sector word is not an identity. "Farmer Bros. Co." and "Farmer
+Brothers Co" still agree, on "farmer", which is what an abbreviation leaves intact.
+
+**Name comparison is used as a rejection and never as a join**, which is what
+makes it acceptable under the identifier rule. The filer name comes from
+`companies` keyed on CIK — the identifier does the identifying. A false mismatch
+throws away a good figure and is visible as a `misattributed` row carrying its
+reason; a false match leaves today's behaviour unchanged. The costs are not
+symmetric and the cheap direction is the safe one.
+
+`misattributed` is kept distinct from `uncited` because they say opposite things
+about the provider: one means the model produced text that is not in the document,
+the other means it read the document correctly and answered a different question.
+The remedy is a prompt in one case and a locator in the other.
+
+##### The locator was the weakest part, and it said so first
+
+The premium locator was aimed at "Premiums Paid Analysis", which is the **wrong
+section**: across 13 takeout proxies the deal's own premium appeared in that
+window **zero times**, at every window size from 3k to 14k characters. That
+heading introduces a table of premiums paid in *other* transactions. The deal's
+own premium lives in the letter to shareholders and in Reasons for the Merger,
+under no standard heading at all, so the locator anchors on the premium *sentence*
+— still deterministic, and the only thing that finds it. 0/13 in-window became
+11/13.
+
+The model had said this correctly the first time it was asked ("only range
+quartiles from other transactions are provided") and was right while the locator
+was not.
+
+##### The fallback ladder cannot do this task
+
+Probed on four documents with answers read by hand — AstroNova $29.00 cash,
+Electro Sensors $7.75 cash, Veeco 0.265 shares + $10.15, CoreCard a 0.2783–0.3142
+ratio collar:
+
+| model | right | how it fails |
+|---|---|---|
+| `gpt-oss-120b` (Groq) | 4/4 | — |
+| `qwen/qwen3.8-27b` (Groq) | 1/4 | `not_parsed` |
+| `gpt-oss-20b` (Groq) | 1/4 | **`not_stated`** on a window whose own heading reads "right to receive an amount in cash … equal to $7.75" |
+| `qwen3:4b` (local Ollama) | 0/4 | returned **0.3575** for Veeco — a number in neither leg, which passed both the citation and the attribution check |
+
+**A weaker model fails as a plausible absence, not as an error**, and that is the
+dangerous direction: `not_stated` reads as a correct fact about the document.
+`not_parsed` is honest; `not_stated` from a model that simply could not find it is
+indistinguishable from a stock deal genuinely having no cash price.
+
+This is why the provider and model are stored on every row, and it means the
+ladder that exists for outages is not a quality ladder. The first v2 run fell
+through to `gpt-oss-20b` on a 429 for 14 of 20 documents and the numbers measured
+the queue rather than the prompt; the hand-check has to pin the model.
+
+##### The free tier's real ceiling is tokens per *day*
+
+Groq's documented 8,000 tokens/minute is not the binding constraint. There is a
+**200,000 tokens-per-day cap per model**, and the two are not visible in the same
+place: with the day bucket spent, `x-ratelimit-remaining-tokens` read a perfectly
+healthy `8000` while every call came back 429 with `retry-after: 723` and an error
+body reading "tokens per day (TPD): Limit 200000, Used 199700".
+
+At ~2,200 tokens a prompt and two prompts a proxy, that is about **45 proxies per
+model per day**. The three Groq models are three day buckets as well as three
+minute buckets, but only one of them can do the task — so 500 proxies is eleven
+days of free tier, or a paid tier. That is a planning fact, not a pacing problem,
+and it was invisible until the headers were contradicted by the refusals.
+
+The router now distinguishes three outcomes rather than two. Under 20s, wait it
+out. Over two minutes, set the provider aside for the rest of the run — a 429
+asking for twelve minutes is a closed door, and asking again costs one request to
+relearn what it just said (the Cerebras-402 lesson, one notch less permanent). In
+between — a drained *minute* bucket asking for 42 seconds, measured on
+`gpt-oss-20b` — fall through for this call and keep the provider in the ladder,
+because deferring on 42 seconds would throw away the only capable model over one
+busy minute.
+
 #### The re-sweep, and why it goes by CIK
 
 The stored table was written by an earlier classifier: on 2022-01-19 the current
