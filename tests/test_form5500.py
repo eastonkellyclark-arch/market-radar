@@ -432,3 +432,4 @@ def test_the_two_forms_do_not_share_an_entity_vocabulary(con, tmp_path) -> None:
     assert got["UNION TRUST BOARD"] is True
     assert got["SMALL DENTAL PRACTICE"] is False, (
         "the short form's code 1 is single-employer, not multiemployer")
+

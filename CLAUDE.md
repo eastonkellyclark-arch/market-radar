@@ -285,6 +285,16 @@ staging directory is empty of everything but its chunks afterwards — a shared
 path is visible as the file it leaves behind, on any platform, which is the
 only portable form this check has.
 
+Audited 2026-09-10: three functions write a file and read it back, and all
+three are safe by one of two mechanisms — a per-call scratch directory
+(`tiingo.publish`, and `selftest`/`sec_company_tickers` which always did), or a
+filename that interpolates the partition (`form5500.publish`,
+`xbrl.resolve.load`). `tests/test_repo_invariants.py` enforces that: **a path
+written and read back inside one function must be unique per call.** Verified by
+reverting the fix and watching it fire, which is the only way to know. The
+published partitions were checked directly and are clean — all eleven price
+years and all three plan years hold exactly their declared year.
+
 **Volatility screens run in three price bands** — sub-$1, $1–10, $10+ — kept
 separate. One combined list means penny stocks win every day and you never see
 a $40 stock move again. Store tick-count move alongside percent; $0.0002 →

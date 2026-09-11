@@ -212,3 +212,94 @@ def test_gitignore_covers_secrets_and_data() -> None:
     for pattern in (".env", "*.zip", "*.parquet", "__pycache__/", ".venv/"):
         assert pattern in body, f".gitignore is missing {pattern!r}"
     assert "!.env.example" in body, ".env.example must stay committed"
+
+
+#: A ``COPY ... TO '{var}'`` target, so the variable holding the path can be
+#: followed. Textual rather than AST: the target is inside an f-string, and the
+#: placeholder is the part that matters.
+_COPY_TARGET: Final[re.Pattern[str]] = re.compile(
+    r"COPY\s*\(?.*?TO\s*'\{([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE | re.DOTALL
+)
+
+
+def _functions(module: Path) -> list[tuple[str, str]]:
+    """``(qualified name, source text)`` for every function in a module."""
+    text = module.read_text(encoding="utf-8")
+    tree = ast.parse(text, filename=str(module))
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.append((f"{module.name}:{node.name}", ast.get_source_segment(
+                text, node) or ""))
+    return out
+
+
+def test_a_file_written_and_read_back_is_never_a_shared_path() -> None:
+    """The rule that would have caught ``tiingo.publish``.
+
+    It merged each year partition into a fixed ``staging/merged.parquet`` and
+    read the result back from that path, so on a fast POSIX runner every
+    partition after the first published and asserted the *previous* year's
+    rows. 2024 got 2023. It passed on Windows for weeks and failed the first
+    time the suite ran on an Actions runner.
+
+    The defect is not the stale read, which is a platform detail. It is that a
+    path written and then read back inside one function was **shared between
+    calls** -- so whether the read saw this call's bytes depended on timing.
+    Two ways to not share it, and a function doing this has to use one:
+
+    * a per-call scratch directory (``TemporaryDirectory``, ``mkstemp``), which
+      is what ``selftest`` and ``sec_company_tickers`` already did, or
+    * a filename that interpolates the thing the caller varies -- the plan
+      year, the quarter -- so two calls cannot collide. ``form5500.publish``
+      and ``xbrl.resolve.load`` both qualify this way.
+
+    Checked on the function's source text because the path is built inside an
+    f-string and the placeholder is the whole point. A false positive here is a
+    function told to name its scratch file properly, which is cheap; a false
+    negative is a partition holding the wrong year.
+    """
+    offenders: list[str] = []
+    scanned = 0
+    for module in sorted(SRC.rglob("*.py")):
+        for name, body in _functions(module):
+            target = _COPY_TARGET.search(body)
+            if not target:
+                continue
+            var = target.group(1)
+            # Only the write-then-read-back shape. A function that writes and
+            # walks away cannot read anything stale.
+            reads_back = re.search(
+                rf"read_(?:parquet|csv)\(\s*'?\{{?{re.escape(var)}\b", body)
+            if not reads_back:
+                continue
+            scanned += 1
+            per_call = ("TemporaryDirectory" in body or "mkstemp" in body)
+            # `x = ... f"...{something}..."` -- the filename varies per call.
+            #
+            # Line by line, deliberately. The first version ran this over
+            # the whole function with DOTALL, so the assignment matched an
+            # f-string hundreds of lines later and the rule passed on the
+            # very code it was written to catch. Found by reverting
+            # tiingo.publish and watching this test not fail -- which is
+            # the only way to know whether an invariant works.
+            varies = any(
+                re.search(rf"\b{re.escape(var)}\s*=.*?f[\"'][^\"']*\{{", line)
+                for line in body.splitlines()
+            )
+            if not (per_call or varies):
+                offenders.append(f"  {name}: writes and reads back {var!r}")
+
+    assert scanned, (
+        "the invariant is vacuous; no write-then-read-back was found. Either "
+        "the COPY pattern changed or this test stopped matching it."
+    )
+    assert not offenders, (
+        "A path is written and read back inside one function without being "
+        "unique per call:\n"
+        + "\n".join(offenders)
+        + "\n\nWhether the read sees this call's bytes then depends on timing. "
+        "Use a per-call scratch directory, or put the partition in the "
+        "filename. See tiingo.publish, which published 2023's rows into the "
+        "2024 partition this way."
+    )

@@ -704,3 +704,100 @@ def test_no_stored_partition_is_an_empty_dict_not_a_crash(tmp_path) -> None:
     from marketradar.cli import _xbrl_coverage
 
     assert _xbrl_coverage(duckdb.connect(), tmp_path) == {}
+
+
+# --- the shape that bit tiingo.publish ----------------------------------
+
+
+def test_two_quarters_in_one_process_do_not_cross(tmp_path, monkeypatch) -> None:
+    """Each partition holds its own quarter and nothing else.
+
+    This is the direct analogue of
+    ``test_a_partition_never_takes_another_year_s_rows``, and it is here because
+    ``load`` has the shape that bit ``tiingo.publish``: write a file, read it
+    back, assert on what came back. That was safe for weeks and then published
+    2023's rows into the 2024 partition the first time it ran on a fast POSIX
+    runner.
+
+    The difference is that tiingo's scratch path did **not** vary while its
+    partition did, and this one's does -- the file is named for the quarter. So
+    this test is the thing that says the difference still holds, and it can only
+    fail on a platform where the stale read happens at all, which is why CI
+    exists and runs Linux.
+    """
+    from marketradar import manifest
+
+    out = tmp_path / "out"
+    first = write_quarter(tmp_path / "w1", "2023q4")
+    # A second quarter whose only resolved filer is different, so a crossed
+    # read shows up as the wrong company rather than as a count that happens
+    # to match.
+    second_dir = tmp_path / "w2"
+    second = write_quarter(second_dir, "2024q1")
+    _only_clean(second_dir, "2024q1")
+
+    override = tmp_path / "manifest.toml"
+    override.write_text(
+        "[xbrl_fundamentals]\n"
+        f'2023q4 = {{ location = "{out.as_posix()}", backend = "local" }}\n'
+        f'2024q1 = {{ location = "{out.as_posix()}", backend = "local" }}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(manifest.OVERRIDE_ENV, str(override))
+    manifest.clear_cache()
+    shared = duckdb.connect()
+    try:
+        resolve.load("2023q4", out, con=shared, tables=first, min_rows=1)
+        resolve.load("2024q1", out, con=shared, tables=second, min_rows=1)
+    finally:
+        manifest.clear_cache()
+
+    for quarter, expected in (("2023q4", 8), ("2024q1", 1)):
+        path = out / f"xbrl_fundamentals_{quarter}.parquet"
+        got = shared.execute(
+            "select count(distinct adsh), count(distinct src_quarter), "
+            "min(src_quarter) from read_parquet(?)", [path.as_posix()]
+        ).fetchone()
+        assert got[0] == expected, (
+            f"{quarter} holds {got[0]} filings, not {expected} -- the partitions "
+            "crossed"
+        )
+        assert got[1] == 1 and got[2] == quarter, (
+            f"{quarter}'s file carries src_quarter {got[2]!r}"
+        )
+
+
+def _only_clean(work: Path, quarter: str) -> None:
+    """Strip the second fixture down to one filer, so a crossed read is loud."""
+    sub_path = work / f"{quarter}_sub.txt"
+    lines = sub_path.read_text(encoding="utf-8").splitlines()
+    kept = [lines[0]] + [ln for ln in lines[1:] if ln.startswith(CLEAN)]
+    sub_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+
+def test_the_load_leaves_no_scratch_file_behind(con, quarter, tmp_path,
+                                                monkeypatch) -> None:
+    """The portable half of the check above.
+
+    A shared mutable path is visible as the file it leaves lying around, on any
+    platform -- which is how the tiingo version is pinned locally rather than
+    only on a Linux runner.
+    """
+    from marketradar import manifest
+
+    out = tmp_path / "out"
+    override = tmp_path / "manifest.toml"
+    override.write_text(
+        "[xbrl_fundamentals]\n"
+        f'2024q1 = {{ location = "{out.as_posix()}", backend = "local" }}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(manifest.OVERRIDE_ENV, str(override))
+    manifest.clear_cache()
+    try:
+        resolve.load("2024q1", out, con=con, tables=quarter, min_rows=10)
+    finally:
+        manifest.clear_cache()
+    leftovers = sorted(p.name for p in out.iterdir()
+                       if p.name != "xbrl_fundamentals_2024q1.parquet")
+    assert leftovers == [], f"load left {leftovers} beside the partition"
