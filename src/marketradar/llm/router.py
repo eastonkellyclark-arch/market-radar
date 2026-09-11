@@ -97,10 +97,13 @@ PROVIDERS: Final[tuple[Provider, ...]] = (
 
 REQUEST_TIMEOUT: Final[float] = 120.0
 
-#: Retries are for the transport, not for the answer. A 429 or a 5xx is worth
-#: one more try; a model that returned unusable JSON is not going to fix itself,
-#: and the next provider is a better bet than the same one twice.
-TRANSPORT_RETRIES: Final[int] = 1
+#: Retries are for the transport, not for the answer. A model that returned
+#: unusable JSON will not fix itself and the next provider is a better bet; a
+#: rate limit is a queue and waiting it out is the whole point.
+#:
+#: Two rather than one because a drained free tier refuses the first call of a
+#: run, and one retry spends itself discovering that.
+TRANSPORT_RETRIES: Final[int] = 2
 
 #: Longest a 429 is worth waiting out before moving to the next provider. A free
 #: tier that wants sixty seconds is telling you to go somewhere else.
@@ -338,7 +341,13 @@ def ask(
                         # provider for no reason.
                         if resp.status_code == 429:
                             _note_budget(provider.name, resp)
-                            wait = _retry_after(resp)
+                            # The refusal itself says when the bucket refills, and
+                            # that beats a default: a drained free tier answers
+                            # 429 to the *first* call of a run, where there is no
+                            # recorded budget yet and a 3-second guess is not
+                            # enough to clear it.
+                            reset, _ = _budget.get(provider.name, (0.0, 1.0))
+                            wait = max(_retry_after(resp), reset + 0.5)
                             if attempt < TRANSPORT_RETRIES and wait <= MAX_BACKOFF:
                                 log.info("%s rate-limited; waiting %.1fs",
                                          provider.name, wait)
