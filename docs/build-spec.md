@@ -1336,6 +1336,45 @@ work queue of 445 filings whose top three suggested fixes were revenue tags:
 sorted, plausible, and meaningless. What a filer puts at the top of its income
 statement is evidence about revenue and about nothing else.
 
+#### The post-606 range, loaded 2026-09-10
+
+30 quarters, 2019q1 through 2026q2, **33,400 operating 10-K filings**. Resumable
+and pruned as it goes: 30 quarters unpack to ~18 GB of tab-separated text and the
+partitions are 8 MB, so the extracts are deleted after each quarter and the zips
+kept — re-resolving is a normal operation here, because every tag added to the
+map is a reason to run the range again, and the zip is what keeps that from being
+a 3 GB re-download. Peak footprint is one quarter.
+
+**Revenue is stable. It does not degrade going back.** Same-quarter-of-year,
+which is the only comparison that means anything:
+
+| q1 | 2019 | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|
+| revenue | 91.2% | 88.6% | 87.9% | 85.9% | 85.4% | 87.9% | 87.8% | 87.7% |
+| liabilities | 74.4% | 76.8% | 79.8% | 82.3% | 83.2% | 83.2% | 84.3% | 84.6% |
+
+Revenue drifts 3.6 points *down* over eight years and the oldest quarter is the
+highest, so the 87.9% measured on 2024q1 is representative rather than a peak.
+Liabilities is the one that moves — **+10 points** — because filers increasingly
+tag a total liabilities line. Pooled across all 30 quarters: revenue 86.7%, net
+income 99.2%, assets 98.9%, liabilities 82.0%, equity 97.6%, operating cash flow
+98.9%.
+
+**Quarters are not comparable to each other**, and this is the trap in reading
+the series. q1 carries the December fiscal year ends and averages 2,940 filings;
+q2–q4 are everyone else — retailers with January year ends, tech with June — at
+342–631 filings each, and they resolve revenue about three points lower. The
+first version of the span metric compared the oldest loaded quarter to the newest
+whatever they were, read 2019q1 against 2026q2, and reported revenue falling
+8.1pp. It is not falling; that was the calendar. The same mistake as comparing a
+sponsor's 2022 plan set against its 2024 one, one source later.
+
+Two tags were added off the unmapped queue, which is what the queue is for:
+`SalesRevenueNet` and `SalesRevenueGoodsNet` were the two biggest entries in
+2019q1 and took that quarter from 89.1% to 91.2%. They are the *pre-606* tags,
+and they belong in the post-606 map ranked last: the era boundary describes where
+the distribution moved, not a date after which an old tag became invalid.
+
 Also corrected on the way through: `tests/test_repo_invariants.py` globbed
 `sources/*.py` non-recursively, so a source that is a *package* was invisible to
 all three repo rules — no URL check, no freshness check, no ban on

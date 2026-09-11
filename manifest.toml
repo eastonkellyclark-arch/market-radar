@@ -153,17 +153,50 @@ all = { location = "macro_series", backend = "supabase" }
 # income should pay the coverage cost of revenue and net income, not of six it
 # never reads, and a wide table makes that impossible to express.
 #
-# Partitioned by source quarter, which is also the download unit: re-running
-# one quarter is cheap, and no partition ever has to be filtered out of another
-# quarter's rows. The whole eleven years is under a million rows.
+# Partitioned by **source quarter**, which is also the download unit: one zip
+# in, one partition out, so re-running a quarter is cheap and no partition ever
+# has to be filtered out of another quarter's rows. Partitioning by fiscal year
+# instead would be fewer entries and would reintroduce the cross-year merge that
+# published 2023's rows into the 2024 price partition.
 #
-# SEC data is public domain, so a GitHub Release is correct.
-2024q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2024q1.parquet", backend = "github_release" }
-2023q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2023q1.parquet", backend = "github_release" }
-2022q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2022q1.parquet", backend = "github_release" }
-2021q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2021q1.parquet", backend = "github_release" }
-2020q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2020q1.parquet", backend = "github_release" }
+# One line per quarter, the same as prices_eod_raw's eleven years. Four new
+# lines a year, written by hand, because this file is config in git and a
+# dataset moving must be an edit here and nothing else. 2019q1 is the first:
+# v1 is post-606 only and the ASC 606 boundary falls on fiscal years beginning
+# 2017-12-15, so nothing earlier belongs in this table at all.
+#
+# The whole range is about a million rows and ~8 MB. SEC data is public domain,
+# so a GitHub Release is correct.
 2019q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2019q1.parquet", backend = "github_release" }
+2019q2 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2019q2.parquet", backend = "github_release" }
+2019q3 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2019q3.parquet", backend = "github_release" }
+2019q4 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2019q4.parquet", backend = "github_release" }
+2020q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2020q1.parquet", backend = "github_release" }
+2020q2 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2020q2.parquet", backend = "github_release" }
+2020q3 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2020q3.parquet", backend = "github_release" }
+2020q4 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2020q4.parquet", backend = "github_release" }
+2021q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2021q1.parquet", backend = "github_release" }
+2021q2 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2021q2.parquet", backend = "github_release" }
+2021q3 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2021q3.parquet", backend = "github_release" }
+2021q4 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2021q4.parquet", backend = "github_release" }
+2022q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2022q1.parquet", backend = "github_release" }
+2022q2 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2022q2.parquet", backend = "github_release" }
+2022q3 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2022q3.parquet", backend = "github_release" }
+2022q4 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2022q4.parquet", backend = "github_release" }
+2023q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2023q1.parquet", backend = "github_release" }
+2023q2 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2023q2.parquet", backend = "github_release" }
+2023q3 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2023q3.parquet", backend = "github_release" }
+2023q4 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2023q4.parquet", backend = "github_release" }
+2024q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2024q1.parquet", backend = "github_release" }
+2024q2 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2024q2.parquet", backend = "github_release" }
+2024q3 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2024q3.parquet", backend = "github_release" }
+2024q4 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2024q4.parquet", backend = "github_release" }
+2025q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2025q1.parquet", backend = "github_release" }
+2025q2 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2025q2.parquet", backend = "github_release" }
+2025q3 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2025q3.parquet", backend = "github_release" }
+2025q4 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2025q4.parquet", backend = "github_release" }
+2026q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2026q1.parquet", backend = "github_release" }
+2026q2 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2026q2.parquet", backend = "github_release" }
 
 [entity_review]
 # The review queue: sponsors whose *name* matched an SEC filer while their

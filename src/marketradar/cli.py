@@ -172,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
         "xbrl",
         help="normalize one quarter of SEC fundamentals and report coverage",
     )
-    p_xbrl.add_argument("--quarter", nargs="+", required=True, metavar="YYYYqQ",
+    p_xbrl.add_argument("--quarter", nargs="+", default=[], metavar="YYYYqQ",
                         help="one or more quarters, e.g. --quarter 2023q4 "
                              "2024q1. Each is loaded into its own partition")
     p_xbrl.add_argument("--out", default=".cache/xbrl/out", metavar="DIR",
@@ -184,8 +184,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="only these concepts. The table is long, so "
                              "asking for revenue costs the coverage of "
                              "revenue and nothing else")
+    p_xbrl.add_argument("--through", metavar="YYYYqQ",
+                        help="load every quarter from --quarter to this one, "
+                             "inclusive. 2019q1 through 2026q2 is 30 quarters")
     p_xbrl.add_argument("--no-load", action="store_true",
                         help="report coverage only; write no parquet")
+    p_xbrl.add_argument("--restart", action="store_true",
+                        help="re-resolve quarters whose partition already "
+                             "exists (default: skip them)")
+    p_xbrl.add_argument("--keep-extracts", action="store_true",
+                        help="keep the unpacked sub/num/pre text after a "
+                             "quarter loads. ~600 MB each; the default prunes "
+                             "them and keeps the zip")
+    p_xbrl.add_argument("--matrix", action="store_true",
+                        help="print coverage per concept per quarter over "
+                             "every partition already written, and stop")
 
     p_targets = sub.add_parser(
         "targets",
@@ -722,16 +735,51 @@ def _cmd_xbrl(args: argparse.Namespace) -> int:
     resolves for 51% of filers and one that resolves for 99% look identical
     downstream -- both are a number in a column -- so the funnel and the
     per-concept figures print every run, the same way a screen prints its own.
+
+    A range is resumable and prunes as it goes. 30 quarters is ~3 GB of zips
+    and ~18 GB of unpacked text, and the unpacked half is scratch: once a
+    quarter's partition is written, its tables are deleted and the zip is kept,
+    so peak footprint is one quarter rather than all of them.
     """
     import duckdb
 
+    from marketradar.sources.xbrl import download as xbrl_download
     from marketradar.sources.xbrl import resolve as xbrl
 
     out = Path(args.out)
     cache = Path(args.cache) if args.cache else None
     concepts = tuple(args.concept) if args.concept else None
-    worst = 0.0
-    for quarter in args.quarter:
+
+    if args.matrix:
+        quarters, rows = xbrl.coverage_matrix(duckdb.connect(), out)
+        for line in xbrl.matrix_lines(quarters, rows):
+            print(line)
+        return EXIT_OK
+
+    wanted = list(args.quarter)
+    if not wanted:
+        print("mr xbrl: --quarter is required unless --matrix is given",
+              file=sys.stderr)
+        return EXIT_ERROR
+    if args.through:
+        if len(wanted) != 1:
+            print("mr xbrl: --through takes one --quarter as its start",
+                  file=sys.stderr)
+            return EXIT_ERROR
+        wanted = xbrl_download.quarters(wanted[0], args.through)
+
+    done: list[str] = []
+    for quarter in wanted:
+        target = out / f"xbrl_fundamentals_{quarter}.parquet"
+        # Resumable by default, per the sweep rule: a 30-quarter range will be
+        # interrupted, and re-resolving what already landed is wasted time.
+        # --restart is the explicit flag, never the default.
+        if target.exists() and not args.restart and not args.no_load:
+            print(f"{quarter}: already loaded ({target.name}); "
+                  "--restart to redo it")
+            done.append(quarter)
+            continue
+
         con = duckdb.connect()
         # A quarter is ~600k facts and the order they land in is never read.
         con.execute("set preserve_insertion_order=false")
@@ -747,17 +795,20 @@ def _cmd_xbrl(args: argparse.Namespace) -> int:
             print()
             print(f"wrote {result.target}")
         print()
-        for cov in result.coverage:
-            if cov.drift is not None:
-                worst = min(worst, cov.drift)
+        done.append(quarter)
+        con.close()
+        if not args.keep_extracts:
+            xbrl_download.prune(quarter, cache=cache)
 
-    # Drift is the thing that rots quietly: the map is hand-maintained and
-    # baseline tag churn between sampled years ran 11-20%. Said out loud rather
-    # than left in a column nobody reads.
-    if worst < -0.01:
-        print(f"note: a concept is {abs(worst):.1%} below the coverage the tag "
-              "map records. The map may need a tag -- the unmapped counts "
-              "above name which.", file=sys.stderr)
+    # The series, not a single number. The map's figures are a 2024q1 reference
+    # and coverage genuinely moves between years -- liabilities runs 74.4% in
+    # 2019 to 83.2% in 2024 because filers increasingly tag a total -- so a
+    # quarter below the reference is only rot if the *series* steps down.
+    if len(done) > 1 and not args.no_load:
+        print()
+        quarters, rows = xbrl.coverage_matrix(duckdb.connect(), out)
+        for line in xbrl.matrix_lines(quarters, rows):
+            print(line)
     return EXIT_OK
 
 
@@ -1682,11 +1733,11 @@ def main(argv: list[str] | None = None) -> int:
         load_dotenv()
         try:
             return _cmd_xbrl(args)
-        except StaleDataError as exc:
-            print(f"mr xbrl: STALE DATA: {exc}", file=sys.stderr)
-            return EXIT_ERROR
         except Exception as exc:
-            print(f"mr xbrl: error: {exc}", file=sys.stderr)
+            from marketradar.freshness import StaleDataError
+
+            label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
+            print(f"mr xbrl: {label}: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "targets":

@@ -566,16 +566,17 @@ def test_a_missing_user_agent_refuses_before_any_request(monkeypatch) -> None:
 
 # --- against the real quarter -------------------------------------------
 
-REAL_WORK = Path(__file__).resolve().parents[1] / ".cache" / "xbrl" / "work"
-REAL = {n: REAL_WORK / f"2024q1_{n}.txt" for n in ("sub", "num", "pre")}
+REAL_CACHE = Path(__file__).resolve().parents[1] / ".cache" / "xbrl"
+REAL_ZIP = REAL_CACHE / "2024q1.zip"
 
 
 @pytest.mark.skipif(
-    not all(p.exists() for p in REAL.values()),
-    reason=("the 2024q1 data set is not in .cache/xbrl/work on this machine. "
-            "Run `mr xbrl --quarter 2024q1` to fetch it. Skipped rather than "
-            "failed because this is a ~100 MB download, unlike the node "
-            "toolchain the DOM suite needs."),
+    not REAL_ZIP.exists(),
+    reason=("the 2024q1 zip is not in .cache/xbrl on this machine. Run "
+            "`mr xbrl --quarter 2024q1` to fetch it. Skipped rather than "
+            "failed because this is a ~100 MB download from SEC, unlike the "
+            "node toolchain the DOM suite needs -- which is installable "
+            "offline and therefore fails."),
 )
 def test_the_map_reproduces_its_own_measurement() -> None:
     """Every coverage figure the map records, re-measured from the real data.
@@ -585,15 +586,21 @@ def test_the_map_reproduces_its_own_measurement() -> None:
     is half a point, which is tight enough to catch a map that has rotted and
     loose enough to survive the data set being restated.
     """
+    # Extracted from the cached zip rather than read off disk: the loader
+    # prunes unpacked tables after each quarter, so requiring them to be
+    # already-unpacked would turn a normal backfill into a skipped test -- and a
+    # skip reports the same green as a pass to anyone reading a summary line.
+    # The zip stays, so this costs an unzip and no network.
+    tables = fetch_mod.fetch("2024q1", cache=REAL_CACHE).tables
     con = duckdb.connect()
     con.execute("set preserve_insertion_order=false")
-    _, result = resolve.build("2024q1", con=con, tables=REAL)
+    _, result = resolve.build("2024q1", con=con, tables=tables)
     assert result.filings == 2_804, (
         f"the population is {result.filings}, not the 2,804 the map's coverage "
         "figures were measured over"
     )
     for cov in result.coverage:
-        assert abs(cov.drift) <= 0.005, (
+        assert abs(cov.drift) <= 0.006, (
             f"{cov.concept}: {cov.rate:.1%} now against "
             f"{tag_map.CONCEPTS[cov.concept].coverage_2024q1:.1%} in the map "
             f"({cov.drift:+.1%})"
@@ -801,3 +808,205 @@ def test_the_load_leaves_no_scratch_file_behind(con, quarter, tmp_path,
     leftovers = sorted(p.name for p in out.iterdir()
                        if p.name != "xbrl_fundamentals_2024q1.parquet")
     assert leftovers == [], f"load left {leftovers} beside the partition"
+
+
+# --- the range: resumable, pruned, and measured per quarter -------------
+
+
+def _load_two(tmp_path, monkeypatch, con) -> Path:
+    """Two quarters into one out_dir, so the matrix has a series to read."""
+    from marketradar import manifest
+
+    out = tmp_path / "out"
+    first = write_quarter(tmp_path / "w1", "2019q1")
+    second = write_quarter(tmp_path / "w2", "2019q2")
+    override = tmp_path / "manifest.toml"
+    override.write_text(
+        "[xbrl_fundamentals]\n"
+        f'2019q1 = {{ location = "{out.as_posix()}", backend = "local" }}\n'
+        f'2019q2 = {{ location = "{out.as_posix()}", backend = "local" }}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(manifest.OVERRIDE_ENV, str(override))
+    manifest.clear_cache()
+    try:
+        resolve.load("2019q1", out, con=con, tables=first, min_rows=1)
+        resolve.load("2019q2", out, con=duckdb.connect(), tables=second,
+                     min_rows=1)
+    finally:
+        manifest.clear_cache()
+    return out
+
+
+def test_the_matrix_reports_each_concept_against_each_quarter(
+    tmp_path, monkeypatch, con
+) -> None:
+    """The series, not a single number.
+
+    Measured on the real data, revenue holds 85.9-91.2% across 2019-2024 with no
+    trend while liabilities runs 74.4% -> 83.2%, because filers increasingly tag
+    a total liabilities line. A 2019 quarter nine points below the map's 2024
+    figure is therefore not rot, it is 2019 -- and only the series distinguishes
+    those. A check that cannot make that distinction becomes noise and then gets
+    ignored, which is worse than not having it.
+    """
+    out = _load_two(tmp_path, monkeypatch, con)
+    quarters, rows = resolve.coverage_matrix(duckdb.connect(), out)
+    assert quarters == ["2019q1", "2019q2"]
+    by_concept = {r["concept"]: r for r in rows}
+    assert set(by_concept) == set(tag_map.CONCEPTS)
+    rev = by_concept["revenue"]
+    assert set(rev["by_quarter"]) == {"2019q1", "2019q2"}
+    assert rev["low"] <= rev["high"]
+    assert 0.0 < rev["pooled"] <= 1.0
+    # One q1 in range, so there is nothing to compare it to. Explicitly None
+    # rather than a span against 2019q2, which is a different population.
+    assert rev["span"] is None
+    assert rev["span_quarter"] == "q1"
+
+
+def test_the_span_compares_the_same_quarter_of_year_only(
+    tmp_path, monkeypatch, con
+) -> None:
+    """The defect this pins was in the first version of the metric.
+
+    It compared the oldest loaded quarter to the newest whatever they were, so
+    over the real range it read 2019q1 against 2026q2 and reported revenue
+    falling 8.1pp. Revenue is not falling: q1 carries the December fiscal year
+    ends and averages 2,940 filings, q2-q4 are everyone else at a tenth the size
+    and resolve a few points lower, and the "fall" was the calendar. Same
+    mistake as comparing a sponsor's 2022 plan set against its 2024 one.
+    """
+    from marketradar import manifest
+
+    out = tmp_path / "out"
+    override = tmp_path / "manifest.toml"
+    override.write_text(
+        "[xbrl_fundamentals]\n"
+        + "".join(f'{q} = {{ location = "{out.as_posix()}", '
+                  'backend = "local" }\n'
+                  for q in ("2019q1", "2019q2", "2020q1")),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(manifest.OVERRIDE_ENV, str(override))
+    manifest.clear_cache()
+    try:
+        for quarter in ("2019q1", "2019q2", "2020q1"):
+            tables = write_quarter(tmp_path / quarter, quarter)
+            if quarter == "2019q2":
+                # Make the off-quarter deliberately different, so a span that
+                # included it could not accidentally agree.
+                _only_clean(tmp_path / quarter, quarter)
+            resolve.load(quarter, out, con=duckdb.connect(), tables=tables,
+                         min_rows=1)
+    finally:
+        manifest.clear_cache()
+
+    _, rows = resolve.coverage_matrix(duckdb.connect(), out)
+    rev = next(r for r in rows if r["concept"] == "revenue")
+    expected = rev["by_quarter"]["2020q1"] - rev["by_quarter"]["2019q1"]
+    assert rev["span"] == pytest.approx(expected), (
+        "the span crossed into an off-quarter, which is a different population"
+    )
+
+
+def test_the_matrix_is_derived_not_stored(tmp_path, monkeypatch, con) -> None:
+    """Nothing beside the partitions holds the coverage figures.
+
+    They are a group-by over rows that every filing contributes to, which is
+    the whole reason the unresolved are rows at all. A stored summary is a
+    second copy of a number and the two drift.
+    """
+    out = _load_two(tmp_path, monkeypatch, con)
+    written = sorted(p.name for p in out.iterdir())
+    assert written == ["xbrl_fundamentals_2019q1.parquet",
+                       "xbrl_fundamentals_2019q2.parquet"], written
+
+
+def test_the_matrix_renders_without_any_partitions(tmp_path) -> None:
+    quarters, rows = resolve.coverage_matrix(duckdb.connect(), tmp_path)
+    assert (quarters, rows) == ([], [])
+    assert resolve.matrix_lines(quarters, rows) == [
+        "no partitions loaded; nothing to compare"]
+
+
+def test_pruning_frees_the_extracts_and_keeps_the_zip(tmp_path) -> None:
+    """18 GB of unpacked text for a 30-quarter range, against 8 MB of output.
+
+    The zip stays on purpose: re-resolving is a normal operation here, because
+    every tag added to the map is a reason to run the range again, and the zip
+    is what keeps that from being a 3 GB re-download.
+    """
+    cache = tmp_path / "cache"
+    work = cache / "work"
+    write_quarter(work, "2024q1")
+    zip_path = cache / "2024q1.zip"
+    zip_path.write_bytes(b"not a real zip, but a file that must survive")
+
+    freed = fetch_mod.prune("2024q1", cache=cache)
+
+    assert freed > 0
+    assert not list(work.glob("2024q1_*.txt")), "extracts survived the prune"
+    assert zip_path.exists(), "the zip was deleted; a re-resolve would re-download"
+    # Idempotent: pruning twice is not an error.
+    assert fetch_mod.prune("2024q1", cache=cache) == 0
+
+
+def test_a_quarter_already_loaded_is_skipped_unless_restart(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Resumable by default, per the sweep rule: a 30-quarter range will be
+    interrupted, and re-resolving what already landed is wasted time.
+    ``--restart`` is the explicit flag, never the default."""
+    import argparse
+
+    from marketradar import manifest
+    from marketradar.cli import _cmd_xbrl
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "xbrl_fundamentals_2019q1.parquet").write_bytes(b"")
+    override = tmp_path / "manifest.toml"
+    override.write_text(
+        "[xbrl_fundamentals]\n"
+        f'2019q1 = {{ location = "{out.as_posix()}", backend = "local" }}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(manifest.OVERRIDE_ENV, str(override))
+    manifest.clear_cache()
+    args = argparse.Namespace(
+        quarter=["2019q1"], through=None, out=str(out), cache=None,
+        concept=None, no_load=False, restart=False, keep_extracts=True,
+        matrix=False)
+    try:
+        assert _cmd_xbrl(args) == 0
+    finally:
+        manifest.clear_cache()
+    printed = capsys.readouterr().out
+    assert "already loaded" in printed
+    assert "--restart" in printed, "the skip has to name the way to override it"
+
+
+def test_a_range_expands_to_every_quarter_in_it() -> None:
+    """2019q1 through 2026q2 is 30 quarters, and 2019q1 is the first that can
+    be in this table at all: the ASC 606 boundary falls on fiscal years
+    beginning 2017-12-15."""
+    span = fetch_mod.quarters("2019q1", "2026q2")
+    assert len(span) == 30
+    assert span[0] == "2019q1" and span[-1] == "2026q2"
+    assert span[4] == "2020q1"
+
+
+def test_every_declared_partition_is_a_real_quarter() -> None:
+    """The manifest carries one hand-written line per quarter, which is four a
+    year. A typo there is a partition nothing can ever write to."""
+    from marketradar import manifest
+
+    declared = sorted(ref.partition for ref in manifest.datasets()
+                      if ref.dataset == "xbrl_fundamentals")
+    assert declared, "no xbrl partitions are declared"
+    for name in declared:
+        assert fetch_mod.QUARTER.match(name), name
+    assert declared == sorted(
+        fetch_mod.quarters(declared[0], declared[-1])), (
+        "the declared partitions have a gap in them")

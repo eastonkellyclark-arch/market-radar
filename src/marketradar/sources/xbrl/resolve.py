@@ -616,3 +616,117 @@ def load(
     manifest.record_stats(observed, con=con)
     log.info("wrote %s", dest)
     return replace(result, target=dest, observed=observed)
+
+
+def coverage_matrix(
+    con: duckdb.DuckDBPyConnection, out_dir: Path
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Coverage per concept per quarter, read back out of the partitions.
+
+    **The rot detector, and the reason the map's single figure is a reference
+    rather than an expectation.** Measured across 2019q1 to 2024q1, revenue
+    holds 85.9-91.2% with no trend, but liabilities runs 74.4% -> 83.2%: filers
+    increasingly tag a total liabilities line. So a 2019 quarter nine points
+    below the 2024 figure is not a broken map, it is 2019 -- and only the series
+    can tell those apart. A single reference number cannot, which is exactly how
+    a coverage check becomes noise and then gets ignored.
+
+    Derived from the partitions rather than stored beside them, which is only
+    possible because every filing gets a row carrying a status. A stored summary
+    is a second copy of a number, and this is the number that says whether the
+    map still works.
+
+    Returns ``(quarters, rows)`` where each row is
+    ``{concept, population, by_quarter: {quarter: rate}, ...}``.
+    """
+    files = sorted(out_dir.glob(f"{DATASET}_*.parquet"))
+    if not files:
+        return [], []
+    quarters = [f.stem.rsplit("_", 1)[-1] for f in files]
+    paths = [f.as_posix() for f in files]
+    # A relation, then a view: a list of paths cannot be a prepared parameter
+    # in a DDL statement, and interpolating them into SQL would mean escaping
+    # filenames by hand for no gain.
+    con.read_parquet(paths).to_view("all_partitions", replace=True)
+    pops = {
+        row[0]: int(row[1]) for row in con.execute(
+            "select src_quarter, count(distinct adsh) from all_partitions "
+            "group by 1"
+        ).fetchall()
+    }
+    counts = con.execute(
+        "select concept, src_quarter, "
+        f"count(*) filter (where status = '{tag_map.STATED}') as resolved, "
+        "count(distinct adsh) as population "
+        "from all_partitions group by 1, 2"
+    ).fetchall()
+    by_concept: dict[str, dict[str, tuple[int, int]]] = {}
+    for concept, quarter, resolved, population in counts:
+        by_concept.setdefault(concept, {})[quarter] = (int(resolved),
+                                                       int(population))
+    rows: list[dict[str, Any]] = []
+    for concept in tag_map.CONCEPTS:
+        seen = by_concept.get(concept)
+        if not seen:
+            continue
+        rates = {q: (seen[q][0] / seen[q][1] if seen[q][1] else 0.0)
+                 for q in seen}
+        ordered = [rates[q] for q in quarters if q in rates]
+        resolved_total = sum(v[0] for v in seen.values())
+        population_total = sum(v[1] for v in seen.values())
+        # Same quarter-of-year only, and that is not a refinement. The first
+        # version compared the oldest loaded quarter to the newest whatever
+        # they were, so it read 2019q1 against 2026q2 and reported revenue
+        # falling 8.1pp. It is not falling: the quarters hold different
+        # populations, and comparing across them measures the calendar rather
+        # than the map. Same mistake as comparing a sponsor's 2022 plan set to
+        # its 2024 one.
+        q1s = sorted(q for q in seen if q.endswith("q1"))
+        rows.append({
+            "concept": concept,
+            "resolved_total": resolved_total,
+            "population_total": population_total,
+            "pooled": (resolved_total / population_total
+                       if population_total else 0.0),
+            "by_quarter": rates,
+            "low": min(ordered) if ordered else None,
+            "high": max(ordered) if ordered else None,
+            "span_quarter": "q1",
+            "span": (rates[q1s[-1]] - rates[q1s[0]]) if len(q1s) > 1 else None,
+        })
+    return quarters, rows
+
+
+def matrix_lines(quarters: list[str], rows: list[dict[str, Any]]) -> list[str]:
+    """The matrix as text.
+
+    By quarter-of-year down the page rather than thirty columns across it,
+    because the quarters are **not comparable to each other**. q1 carries the
+    December fiscal year ends and averages 2,940 filings; q2-q4 are everyone
+    else, a tenth the size, and resolve revenue a few points lower. Printed as
+    one row they read as a series, and the first version of the span metric
+    duly read 2019q1 against 2026q2 and reported revenue falling 8.1pp. It is
+    not falling.
+    """
+    if not rows:
+        return ["no partitions loaded; nothing to compare"]
+    years = sorted({q[:4] for q in quarters})
+    out = [f"coverage per concept, {len(quarters)} quarters "
+           f"({years[0]}-{years[-1]}). Quarters hold different populations: "
+           "q1 is the December year ends and ~88% of filings."]
+    for row in rows:
+        head = (f"  {row['concept']}  (pooled {row['pooled'] * 100:.1f}%, "
+                f"range {row['low'] * 100:.1f}-{row['high'] * 100:.1f}%")
+        if row["span"] is not None:
+            head += (f", {row['span_quarter']} {row['span'] * 100:+.1f}pp "
+                     f"{years[0]} to {years[-1]}")
+        out.append("")
+        out.append(head + ")")
+        out.append("      " + "".join(f"{y:>8}" for y in years))
+        for qn in ("q1", "q2", "q3", "q4"):
+            line = f"    {qn}"
+            for year in years:
+                rate = row["by_quarter"].get(f"{year}{qn}")
+                line += "       -" if rate is None else f"{rate * 100:>7.1f}%"
+            out.append(line)
+    return out

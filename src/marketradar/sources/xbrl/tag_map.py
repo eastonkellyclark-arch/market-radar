@@ -191,6 +191,14 @@ class Concept:
     #: Share of operating 10-K FY filers in 2024q1 for whom *any* of ``tags``
     #: resolves at the filing's own period end. Carried here so it can be
     #: rendered beside the number wherever it is consumed.
+    #:
+    #: **A reference point, not an expectation for every quarter.** Measured
+    #: across 2019q1/2020q1/2022q1/2024q1, revenue holds 85.9-89.1% with no
+    #: trend, but liabilities runs 74.4% -> 83.2% over the same span: filers
+    #: increasingly tag a total liabilities line. So a 2019 quarter resolving
+    #: liabilities nine points below this number is not rot, it is 2019. The
+    #: rot signal is the per-quarter series, which ``resolve.coverage_matrix``
+    #: builds from the partitions themselves.
     coverage_2024q1: float
     #: Why the map looks the way it does, where that is not obvious.
     note: str = ""
@@ -239,10 +247,23 @@ CONCEPTS: Final[dict[str, Concept]] = {
             "RevenueNotFromContractWithCustomer",
             "RevenueFromCollaborativeArrangementExcludingRevenueFromContractWithCustomer",
             "OperatingLeaseLeaseIncome",
+            # The pre-606 tags, last. Added 2026-09-10 off the unmapped queue,
+            # which is what that queue is for: `SalesRevenueNet` (25 filings)
+            # and `SalesRevenueGoodsNet` (19) were the two biggest entries in
+            # 2019q1, worth 1.7pp of that quarter on their own.
+            #
+            # They belong here even though the era boundary exists because
+            # these tags collapsed: the boundary describes where the
+            # *distribution* moved, not a date after which an old tag became
+            # invalid. A post-606 filer still using `SalesRevenueNet` has that
+            # as its revenue line. Ranked last so a filer reporting both gets
+            # the newer tag, which is the one its peers report.
+            "SalesRevenueNet",
+            "SalesRevenueGoodsNet",
         ),
         qtrs=ANNUAL,
         definition="total revenue for the fiscal year, consolidated",
-        coverage_2024q1=0.877,
+        coverage_2024q1=0.879,
         unmapped_when=REVENUE_LIKE,
         note=(
             "The outlier, and the one that matters. The misses are not one "

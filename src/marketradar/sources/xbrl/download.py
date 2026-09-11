@@ -205,3 +205,29 @@ def _extract(zip_path: Path, quarter: str, work: Path, names: list[str]) -> None
             f"{quarter}: {zip_path} is not a readable zip. Delete it and "
             "re-run; a partial download is the usual cause."
         ) from exc
+
+
+def prune(quarter: str, *, cache: Path | None = None) -> int:
+    """Delete a quarter's extracted tables, keeping the zip. Returns bytes freed.
+
+    A 30-quarter backfill extracts about 18 GB of tab-separated text, and
+    ``num.txt`` alone is ~490 MB a quarter. None of it is needed once the
+    partition parquet is written, which is about 0.3 MB. So the extracts are
+    scratch and get cleaned up between quarters; peak footprint becomes one
+    quarter rather than all of them.
+
+    **The zip stays**, deliberately. Re-resolving is a normal operation here --
+    the tag map is hand-maintained and every addition to it is a reason to run
+    the range again -- and 3 GB of cached zips is the price of that not being a
+    3 GB re-download from SEC each time.
+    """
+    root = cache or DEFAULT_CACHE
+    freed = 0
+    for name in TABLES:
+        path = root / "work" / f"{quarter}_{name}.txt"
+        if path.exists():
+            freed += path.stat().st_size
+            path.unlink()
+    if freed:
+        log.info("%s: pruned %.0f MB of extracted tables", quarter, freed / 1e6)
+    return freed
