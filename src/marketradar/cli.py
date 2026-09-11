@@ -696,12 +696,15 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     counts = shell.summary(ctx)
 
     print(f"wrote {target}")
-    print(f"  {counts[shell.LIVE]} live, {counts[shell.WAITING]} waiting, "
-          f"{counts[shell.NOT_BUILT]} not built")
+    # Every state, read off shell.STATES rather than listed here: a state the
+    # shell grew and this line did not would otherwise go uncounted, which is
+    # the drift the shell spent a commit closing.
+    print("  " + ", ".join(f"{counts[s]} {s}" for s in shell.STATES))
+    marks = {shell.LIVE: "+", shell.WAITING: "~", shell.NOT_BUILT: ".",
+             shell.DECLINED: "x"}
     for panel in shell.PANELS:
         state, detail = panel.resolve(ctx)
-        mark = {shell.LIVE: "+", shell.WAITING: "~", shell.NOT_BUILT: "."}[state]
-        print(f"  {mark} {panel.title:<24} {state:<10} {detail[:52]}")
+        print(f"  {marks[state]} {panel.title:<24} {state:<10} {detail[:52]}")
 
     if not args.no_open and shell.open_in_browser(target):
         print("opened in your browser")

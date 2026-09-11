@@ -436,6 +436,14 @@ each renders one of three states:
 | **live** | data is present and current |
 | **waiting** | built, but the data it needs has not landed. Says which data. |
 | **not built** | on the roadmap. Says which weekend. |
+| **declined** | measured and decided against. Says what the measurement was. |
+
+`declined` is a separate state from `not built` because only one of them is a
+promise. News read "planned for Weekend 3" for a day after news had been
+measured and declined — the same distinction as `absent` against `unmapped` in
+the XBRL coverage and `lapsed` against `declining` in the Form 5500 series,
+and it goes wrong the same way: collapsing them keeps the count and loses the
+reason.
 
 The point is that the dashboard is a picture of the whole system rather than
 of the parts that happen to work. An absent panel is indistinguishable from a
@@ -477,28 +485,37 @@ Grouped the way the sidebar groups them. "State" is what the panel resolves
 to on a fully loaded system — the probe decides at render time, and a panel
 that cannot be live says which data it is waiting on.
 
-| section | panel | state | notes |
-|---|---|---|---|
-| Markets | Health | live | sweep coverage, staleness per source, entity counts |
-| Markets | Macro | live | DGS10 and the two ICE BofA spreads. Local-only, per the FRED rule |
-| Markets | Volatility screens | live | 24 lists, two tab axes — see *Navigation* |
-| Markets | Company names | live | 54% coverage; the rest need W4 entity work |
-| Markets | Liquidity gate | live | 30-session trailing ADV. Was the blocking issue below; it is closed |
-| Markets | Ticker detail | not built | the backfill landed, so this is now W2.5 (U3) rather than waiting on data |
-| Markets | Day-over-day / NEW | live | needs two sessions of whole-universe history |
-| Filings | EDGAR filing feed | live | the seven watched form types |
-| Filings | Form 4 clusters — officers & directors | live | W3 |
-| Filings | Form 4 clusters — 10% holders | live | a separate panel, not a filter: the medians are 78x apart, so one floor cannot serve both |
-| Filings | 8-K deals | live | W3-T3. Both classifiers shown; disagreements are a review queue |
-| Filings | News | **declined** | measured 2026-09-10 and not built — see *News: measured, declined*. The panel itself still reads "planned for Weekend 3", which is now the wrong answer |
-| Private | Private companies | live | W4 |
-| Private | Mature targets | live | W4 |
-| Private | Entity review queue | live | W4 |
-| Analysis | XBRL fundamentals | not built | measured and scoped; no loader yet |
-| Analysis | Deal multiples | not built | beyond |
-| Analysis | Historical outcomes | live | W3-T3. The survivorship caveat renders beside the number, not in a docstring |
-| Analysis | DCF / 3-statement | not built | beyond |
-| Analysis | Pitch decks | not built | beyond |
+**This table is parsed by `tests/test_dashboard_spec.py`**, which resolves
+every panel against a fully-loaded context and fails the build where the two
+disagree on a panel's section or state. It is a doc, so it is not the source
+of truth — `shell.PANELS` and the probes are, and the shell must not read
+markdown to render itself. But both of the stale strings that prompted this
+drifted in the same direction: the table was updated and the code was not, and
+nothing compared them. Editing a state here now means editing the probe, or
+the build goes red naming both.
+
+| section | panel | id | state | notes |
+|---|---|---|---|---|
+| Markets | Health | `health` | live | sweep coverage, staleness per source, entity counts |
+| Markets | Macro | `macro` | live | DGS10 and the two ICE BofA spreads. Local-only, per the FRED rule |
+| Markets | Volatility screens | `screens` | live | 24 lists, two tab axes — see *Navigation* |
+| Markets | Company names | `names` | live | 54% coverage; the rest need W4 entity work |
+| Markets | Liquidity gate | `liquidity` | live | 30-session trailing ADV. Was the blocking issue below; it is closed |
+| Markets | Ticker detail | `ticker` | live | chart, bars, actions and gap markers, split-adjusted at read time. Waited on the backfill, then on U3, and on neither since |
+| Markets | Day-over-day | `dod` | live | NEW marks a name absent from the same list last session |
+| Filings | EDGAR filing feed | `filings` | live | the seven watched form types |
+| Filings | Form 4 clusters — officers & directors | `clusters_insider` | live | W3 |
+| Filings | Form 4 clusters — 10% holders | `clusters_tenpct` | live | a separate panel, not a filter: the medians are 78x apart, so one floor cannot serve both |
+| Filings | 8-K deals | `deals` | live | W3-T3. Both classifiers shown; disagreements are a review queue |
+| Filings | News | `news` | declined | measured 2026-09-10 and declined — see *News: measured, declined*. The panel carries the measurement, not a weekend |
+| Private | Private companies | `private` | live | W4 |
+| Private | Mature targets | `mature` | live | W4 |
+| Private | Entity review queue | `review` | live | W4 |
+| Analysis | XBRL fundamentals | `xbrl` | not built | measured and scoped; no loader yet |
+| Analysis | Deal multiples | `multiples` | not built | beyond |
+| Analysis | Historical outcomes | `outcomes` | live | W3-T3. The survivorship caveat renders beside the number, not in a docstring |
+| Analysis | DCF / 3-statement | `dcf` | not built | beyond |
+| Analysis | Pitch decks | `decks` | not built | beyond |
 
 #### Blocking issue, ahead of the backfill
 

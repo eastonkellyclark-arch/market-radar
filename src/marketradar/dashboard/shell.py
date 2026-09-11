@@ -12,15 +12,31 @@ boundary that keeps ``prices_eod_raw`` in R2 and FRED's ICE series local. The
 output path is gitignored and there is deliberately no publish function here.
 
 **The shell is the map.** Every panel in the whole build order is declared,
-including the six that do not exist yet, and each renders one of three states:
+including the ones that do not exist yet, and each renders one of four states:
 
     live        data is present and current
     waiting     built, but its data has not landed. Says which data.
     not built   on the roadmap. Says which weekend.
+    declined    measured and decided against. Says what the measurement was.
 
 An absent panel is indistinguishable from a broken one. A panel that says
 "waiting on the 10-year backfill" is not, and that distinction is the reason
 the shell declares things it cannot yet draw.
+
+``declined`` is the fourth state because "not built yet" and "measured and
+decided against" are different facts and only one of them is a promise. News
+read "Weekend 3" for a day after news was measured and declined, which is the
+shell making a commitment the project had already dropped -- the same
+distinction as ``absent`` against ``unmapped`` in the XBRL coverage, and
+``lapsed`` against ``declining`` in the Form 5500 series. Collapsing them
+loses the reason, which is the only part worth keeping.
+
+**A panel's state is derived, never declared twice.** Every state comes from
+the panel's probe reading the context, or from the one field that says the
+panel is off the roadmap. There was a ``waiting_on`` field here that nothing
+read: three panels carried a stale reason string for months because a field
+no consumer touches cannot be contradicted by anything. If it is not derived
+from what the code already knows, it drifts.
 
 State is a *status*, so it is never carried by colour alone: every chip pairs
 a glyph and a word with its colour, per the status rule in the dataviz skill.
@@ -59,14 +75,24 @@ NO_DIGEST: Final[str] = (
 LIVE: Final[str] = "live"
 WAITING: Final[str] = "waiting"
 NOT_BUILT: Final[str] = "not built"
+DECLINED: Final[str] = "declined"
+
+#: Every state, in the order the legend reads them: the two that describe data,
+#: then the two that describe the roadmap.
+STATES: Final[tuple[str, ...]] = (LIVE, WAITING, NOT_BUILT, DECLINED)
 
 #: Status palette from the dataviz reference instance. Fixed, never themed.
 #: "not built" is deliberately *not* a status colour -- it is a roadmap state,
 #: not an alarm, and muted ink keeps it from competing with `waiting`.
+#:
+#: `declined` shares that muted ink for the same reason and takes a different
+#: glyph, because it is a different fact: a crossed circle is a decision, an
+#: open one is a queue. Colour alone never carries a status here.
 STATE_STYLE: Final[dict[str, tuple[str, str]]] = {
     LIVE: ("#0ca30c", "●"),
     WAITING: ("#fab219", "◐"),
     NOT_BUILT: ("#898781", "○"),
+    DECLINED: ("#898781", "⊘"),
 }
 
 
@@ -76,14 +102,26 @@ class Panel:
     title: str
     section: str
     what: str
-    #: Set when the panel cannot be live. The whole point of declaring panels
-    #: that do not work yet is that they say *why*.
-    waiting_on: str = ""
+    #: On the roadmap: which weekend builds it. Read only when there is no
+    #: probe, because a panel with a probe derives its own answer.
     weekend: str = ""
+    #: Measured and decided against, and what the measurement was. Beats the
+    #: probe: a declined panel may well have data behind it, and chipping it
+    #: live would say it is being used.
+    declined: str = ""
     probe: Callable[["Context"], tuple[str, str]] | None = None
 
     def resolve(self, ctx: "Context") -> tuple[str, str]:
-        """(state, detail). A panel with no probe is on the roadmap."""
+        """(state, detail).
+
+        One answer, from one place. ``declined`` first because it is a
+        decision and outranks whatever the data happens to say; then the
+        probe, which reads the context; then the roadmap. There is
+        deliberately no field carrying a reason the probe could contradict --
+        see the module docstring on ``waiting_on``.
+        """
+        if self.declined:
+            return DECLINED, self.declined
         if self.probe is None:
             return NOT_BUILT, self.weekend
         return self.probe(ctx)
@@ -300,15 +338,20 @@ def _deep_years(ctx: Context) -> int:
 
 
 def _probe_ticker_detail(ctx: Context) -> tuple[str, str]:
-    """The data arrived; the panel has not been built yet.
+    """Waiting on the backfill, then on U3, and now neither.
 
-    Worth distinguishing: this was blocked on the backfill and is now blocked
-    on U3, which is a different answer and a different queue.
+    Three answers in three weeks, which is the argument for deriving it: the
+    chart was drawing in the page while this still said "Weekend 2.5 (U3)",
+    because the string was written by hand and nothing compared it to the
+    panel that had since been built.
     """
     years = _deep_years(ctx)
     if not years:
         return WAITING, "the 10-year backfill -- a chart would be three points"
-    return NOT_BUILT, f"Weekend 2.5 (U3); {years} years of history are ready"
+    return LIVE, (
+        f"{years} years of history, split-adjusted at read time; click any "
+        "ticker row"
+    )
 
 
 def _probe_day_over_day(ctx: Context) -> tuple[str, str]:
@@ -420,13 +463,13 @@ PANELS: Final[tuple[Panel, ...]] = (
           probe=_probe_names),
     Panel("liquidity", "Liquidity gate", "Markets",
           "The >$5M average-dollar-volume gate behind half the screen lists.",
-          waiting_on="trailing-window ADV", probe=_probe_liquidity),
+          probe=_probe_liquidity),
     Panel("ticker", "Ticker detail", "Markets",
           "Recent bars for one name, split-adjusted at read time.",
-          waiting_on="10-year backfill", probe=_probe_ticker_detail),
+          probe=_probe_ticker_detail),
     Panel("dod", "Day-over-day", "Markets",
           "NEW markers: names absent from the same list on the prior session.",
-          waiting_on="universe history", probe=_probe_day_over_day),
+          probe=_probe_day_over_day),
 
     Panel("filings", "EDGAR filing feed", "Filings",
           "The seven watched form types: 4, 8-K, S-4, DEFM14A, SC 13D, "
@@ -447,9 +490,17 @@ PANELS: Final[tuple[Panel, ...]] = (
           "both classifiers are shown and disagreements are a review queue "
           "rather than a hidden judgement call.",
           probe=_probe_deals),
+    # Not `weekend="Weekend 3"`, which is what this said for a day after the
+    # decision. A panel promising a weekend that is never coming is the shell
+    # misreporting the roadmap, and the measurement is the useful part.
     Panel("news", "News", "Filings",
-          "GDELT and Finnhub headlines against watched issuers.",
-          weekend="Weekend 3"),
+          "Headlines against watched issuers. Measured against real 8-K deal "
+          "dates and declined: M&A detection is by form type, and news is "
+          "not even the noisy secondary signal it was expected to be.",
+          declined="measured 2026-09-10: 14.3 articles per company per day, "
+                   "13.4% naming it in the headline, and not one leading "
+                   "article was about the deal. Reopen on lead time, not on "
+                   "volume"),
 
     Panel("private", "Private companies", "Private",
           "Form 5500 sponsors with no SEC match -- 94.8% of them, which is "
@@ -500,14 +551,16 @@ def _esc(value: Any) -> str:
 
 def _panel_html(panel: Panel, state: str, detail: str, body: str = "") -> str:
     color, glyph = STATE_STYLE[state]
+    # The label names the *kind* of answer, so a declined panel cannot read as
+    # "planned for" something that is not planned.
+    labels = {LIVE: "now", WAITING: "waiting on", NOT_BUILT: "planned for",
+              DECLINED: "declined"}
     waiting = ""
-    if state != LIVE and detail:
-        label = "waiting on" if state == WAITING else "planned for"
+    if detail:
         waiting = (
-            f'<p class="why"><span class="why-k">{label}</span> {_esc(detail)}</p>'
+            f'<p class="why"><span class="why-k">{labels[state]}</span> '
+            f'{_esc(detail)}</p>'
         )
-    elif detail:
-        waiting = f'<p class="why"><span class="why-k">now</span> {_esc(detail)}</p>'
     return f"""
       <article class="panel" id="panel-{_esc(panel.id)}"
                data-state="{_esc(state)}" data-panel="{_esc(panel.id)}">
@@ -744,10 +797,16 @@ def render(
         # is, in the panel, rather than leaving it to be diagnosed.
         for pid in ("health", "macro", "screens"):
             bodies[pid] = NO_DIGEST
+    # Unconditional, like every other body above, and for the reason they all
+    # are: the ticker panel chips *live* off the price history now, so a render
+    # that built no chart payload would leave it live with an empty slot --
+    # indistinguishable from a panel nobody wired up.
     if details:
         bodies["ticker"] = tk.panel_html()
     elif digest is None:
         bodies["ticker"] = NO_DIGEST
+    else:
+        bodies["ticker"] = tk.empty_html()
     bodies["filings"] = body_html.filings_html(ctx.recent_filings)
     bodies["clusters_insider"] = body_html.clusters_html(
         ctx.clusters, "insider", 50_000)
@@ -764,8 +823,7 @@ def render(
     object.__setattr__(ctx, "_private_stats", private_stats or {})
     object.__setattr__(ctx, "_mature_stats", mature_stats or {})
     resolved = [(p, *p.resolve(ctx)) for p in panels]
-    counts = {s: sum(1 for _, st, _ in resolved if st == s)
-              for s in (LIVE, WAITING, NOT_BUILT)}
+    counts = {s: sum(1 for _, st, _ in resolved if st == s) for s in STATES}
 
     nav, column = _nav_and_panels(resolved, bodies)
 
@@ -773,7 +831,7 @@ def render(
         f'<span class="chip" style="--chip:{STATE_STYLE[s][0]}">'
         f'<span class="glyph" aria-hidden="true">{STATE_STYLE[s][1]}</span>'
         f'{_esc(s)} · {counts[s]}</span>'
-        for s in (LIVE, WAITING, NOT_BUILT)
+        for s in STATES
     )
     notes = "".join(f"<li>{_esc(n)}</li>" for n in ctx.notes)
     stamp = ctx.generated_at.strftime("%Y-%m-%d %H:%M UTC")
@@ -892,7 +950,11 @@ h3 {{ font-size:14px; margin:0; font-weight:600; }}
   font-weight:600; margin-right:6px; color:var(--muted);
 }}
 .slot {{ flex:1; min-height:0; }}
-.panel[data-state="not built"] {{ opacity:.62; border-style:dashed; }}
+/* Dashed and dimmed: both roadmap states, because neither is drawing. A
+   dashed border is "nothing here yet"; `declined` earns the same treatment
+   because nothing is there, and its glyph and label carry the difference. */
+.panel[data-state="not built"],
+.panel[data-state="declined"] {{ opacity:.62; border-style:dashed; }}
 .notes {{ margin:18px 0 0; padding-left:18px; color:var(--muted); font-size:12px; }}
 footer {{ margin-top:40px; color:var(--muted); font-size:11.5px;
           border-top:1px solid var(--rule); padding-top:12px; }}
@@ -1059,4 +1121,4 @@ def open_in_browser(path: Path) -> bool:
 
 def summary(ctx: Context, panels: tuple[Panel, ...] = PANELS) -> dict[str, int]:
     resolved = [p.resolve(ctx)[0] for p in panels]
-    return {s: resolved.count(s) for s in (LIVE, WAITING, NOT_BUILT)}
+    return {s: resolved.count(s) for s in STATES}

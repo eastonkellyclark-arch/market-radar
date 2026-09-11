@@ -74,6 +74,24 @@ def test_a_not_built_panel_names_its_weekend() -> None:
             assert detail.strip(), f"{panel.id} gives no weekend"
 
 
+def test_a_declined_panel_says_what_was_measured() -> None:
+    """Same rule as the other three states, and the one that makes `declined`
+    worth having: a decision is only useful with its evidence attached."""
+    for panel in shell.PANELS:
+        state, detail = panel.resolve(ctx())
+        if state == shell.DECLINED:
+            assert detail.strip(), f"{panel.id} is declined but does not say why"
+
+
+def test_declined_beats_the_probe() -> None:
+    """A declined panel may well have data behind it -- news would, if GDELT
+    were still being fetched. Chipping it live would say it is being used."""
+    panel = shell.Panel("x", "X", "Analysis", "...",
+                        declined="measured and dropped",
+                        probe=lambda _c: (shell.LIVE, "plenty of data"))
+    assert panel.resolve(ctx()) == (shell.DECLINED, "measured and dropped")
+
+
 def test_missing_macro_names_the_command_that_fixes_it() -> None:
     state, detail = shell.Panel(
         "macro", "Macro", "Markets", "…", probe=shell._probe_macro
@@ -111,16 +129,19 @@ def test_the_liquidity_gate_waits_when_there_is_no_history() -> None:
     assert state == shell.WAITING
 
 
-def test_ticker_detail_moves_from_waiting_to_not_built() -> None:
-    """Blocked on the backfill, then blocked on U3. Different answers.
+def test_ticker_detail_waits_on_history_and_goes_live_with_it() -> None:
+    """Blocked on the backfill, then on U3, and now on neither.
 
-    A panel that still said "waiting on the backfill" after the backfill
-    landed would be the shell lying about its own roadmap.
+    Three answers in three weeks. The second outlived its truth by a week --
+    the panel was built and drawing a chart while this still said "Weekend 2.5
+    (U3)" -- which is why the state comes off the history now, and why whether
+    it agrees with what the panel draws is checked in test_dashboard_spec.py
+    instead of asserted as a string here.
     """
     assert shell._probe_ticker_detail(ctx(prices={}))[0] == shell.WAITING
     state, detail = shell._probe_ticker_detail(ctx(prices=DEEP))
-    assert state == shell.NOT_BUILT
-    assert "U3" in detail
+    assert state == shell.LIVE
+    assert "11 years" in detail
 
 
 def test_day_over_day_goes_live_with_history() -> None:
@@ -134,7 +155,7 @@ def test_day_over_day_goes_live_with_history() -> None:
 def test_state_is_never_carried_by_colour_alone() -> None:
     """Status rule from the dataviz skill: colour pairs with icon and label."""
     page = shell.render(ctx())
-    for state in (shell.LIVE, shell.WAITING, shell.NOT_BUILT):
+    for state in shell.STATES:
         colour, glyph = shell.STATE_STYLE[state]
         assert colour in page
         assert glyph in page
@@ -313,8 +334,14 @@ def test_a_live_panel_always_has_a_body() -> None:
     freshness line ("20,175,249 bars across 11 partitions"), with an empty
     slot. Indistinguishable from a panel nobody wired up, which is the one
     distinction this shell exists to draw.
+
+    The inverse is :func:`test_a_panel_off_the_roadmap_renders_nothing` in
+    test_dashboard_spec.py, which catches a panel drawing a body while
+    claiming not to exist. Neither direction implies the other.
     """
     from datetime import datetime, timezone
+
+    from conftest import panel_slot
 
     from marketradar.dashboard import shell
 
@@ -325,12 +352,13 @@ def test_a_live_panel_always_has_a_body() -> None:
         state, _ = panel.resolve(ctx)
         if state != shell.LIVE:
             continue
-        block = page.split(f'data-panel="{panel.id}"', 1)
-        if len(block) < 2:
-            offenders.append(f"{panel.id}: panel missing from the page")
-            continue
-        article = block[1].split("</article>", 1)[0]
-        if '<div class="slot"></div>' in article:
+        # `panel_slot`, not a split on `data-panel`. This test sliced on that
+        # and was written when it appeared once in the page; the sidebar made
+        # it appear twice, with the whole nav ahead of the whole column, so
+        # every lookup landed in the nav and ran on to the *health* panel.
+        # Nineteen of the twenty panels were not being inspected at all -- the
+        # same vacuous green this file exists to prevent, inside this file.
+        if not panel_slot(page, panel.id).strip():
             offenders.append(f"{panel.id}: chipped live with an empty slot")
     assert not offenders, (
         "Panels claiming live while rendering nothing:\n  "

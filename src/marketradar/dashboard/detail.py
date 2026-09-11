@@ -39,6 +39,21 @@ def panel_html() -> str:
         actions, and the gaps the screen suppresses.</p>"""
 
 
+def empty_html() -> str:
+    """No chart payload in this render, which is not the same as no history.
+
+    The panel chips live off the price partitions, so it has to own its empty
+    case the way the other nine bodies do -- and name the command, because the
+    payload is built from the screen rows and an empty screen is the usual
+    reason there is none.
+    """
+    return """
+      <p class="empty">No chart payload in this render. The history is in the
+        partitions; this page did not build a series for any screen row
+        &mdash; usually because the screens came back empty. Re-run
+        <code>mr dashboard</code> after <code>mr screens</code>.</p>"""
+
+
 SCRIPT: Final[str] = r"""
 (function () {
   var D = window.__TK__ || {}, EPOCH = Date.UTC(2016, 0, 1), DAY = 86400000;
