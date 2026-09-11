@@ -1,0 +1,598 @@
+"""The XBRL tag map and resolver, on a synthetic quarter.
+
+Synthetic because the real quarterly zips are ~100 MB each and a parser test
+fixture is "small and deliberately chosen" per CLAUDE.md, never a bulk archive.
+Every filer below exists to pin one decision, named in its comment, and the
+coverage numbers the map records were measured on the real 2024q1 -- those are
+checked by ``test_the_map_reproduces_its_own_measurement``, which is skipped
+only when the cache is absent, and never silently: a skip here says the real
+data is not on this machine, not that the map agrees with it.
+"""
+
+from __future__ import annotations
+
+import csv
+from datetime import date
+from pathlib import Path
+
+import duckdb
+import pytest
+
+from marketradar.sources.xbrl import download as fetch_mod
+from marketradar.sources.xbrl import resolve, tag_map
+
+# --- a quarter, built by hand -------------------------------------------
+
+SUB_COLS = ("adsh", "cik", "name", "sic", "form", "period", "fy", "fp", "filed")
+NUM_COLS = ("adsh", "tag", "version", "ddate", "qtrs", "uom", "segments",
+            "coreg", "value")
+PRE_COLS = ("adsh", "report", "line", "stmt", "inpth", "tag")
+
+FY_END = "20231231"
+PRIOR_END = "20221231"
+FILED = "20240215"
+
+
+def sub(adsh: str, name: str, sic: str, form: str = "10-K",
+        period: str = FY_END, fp: str = "FY") -> dict:
+    return {"adsh": adsh, "cik": adsh[:7].replace("-", ""), "name": name,
+            "sic": sic, "form": form, "period": period, "fy": "2023", "fp": fp,
+            "filed": FILED}
+
+
+def num(adsh: str, tag: str, value: str | None, *, qtrs: int,
+        ddate: str = FY_END, uom: str = "USD", segments: str = "",
+        coreg: str = "") -> dict:
+    return {"adsh": adsh, "tag": tag, "version": "us-gaap/2023",
+            "ddate": ddate, "qtrs": str(qtrs), "uom": uom,
+            "segments": segments, "coreg": coreg,
+            "value": "" if value is None else value}
+
+
+def pre(adsh: str, tag: str, line: int = 1, stmt: str = "IS") -> dict:
+    return {"adsh": adsh, "report": "2", "line": str(line), "stmt": stmt,
+            "inpth": "0", "tag": tag}
+
+
+def complete(adsh: str, *, revenue: str = "1000") -> list[dict]:
+    """Every concept stated, so a filer is in the population for all six."""
+    return [
+        num(adsh, "Revenues", revenue, qtrs=4),
+        num(adsh, "NetIncomeLoss", "100", qtrs=4),
+        num(adsh, "Assets", "5000", qtrs=0),
+        num(adsh, "Liabilities", "2000", qtrs=0),
+        num(adsh, "StockholdersEquity", "3000", qtrs=0),
+        num(adsh, "NetCashProvidedByUsedInOperatingActivities", "250", qtrs=4),
+    ]
+
+
+#: One filer per decision. The id is the decision.
+CLEAN = "0000000-24-000001"          # operating, everything stated
+BANK = "0000000-24-000002"           # SIC 6022 -- a different table
+NO_SIC = "0000000-24-000003"         # no SIC -- unknown, not operating
+QUARTERLY = "0000000-24-000004"      # 10-Q -- a different period
+PRE606 = "0000000-24-000005"         # FY began before the ASC 606 boundary
+NIL_REVENUE = "0000000-24-000006"    # tags revenue, reports no amount
+NEW_TAG = "0000000-24-000007"        # a revenue tag the map does not carry
+SEGMENTS = "0000000-24-000008"       # revenue only disaggregated
+CANADIAN = "0000000-24-000009"       # reports in CAD
+PRIOR_ONLY = "0000000-24-000010"     # revenue only for the prior year
+NO_STATEMENT = "0000000-24-000011"   # opens with R&D: pre-revenue
+BOTH_INCOMES = "0000000-24-000012"   # NetIncomeLoss and ProfitLoss, differing
+
+
+def write_quarter(work: Path, quarter: str = "2024q1") -> dict[str, Path]:
+    subs = [
+        sub(CLEAN, "CLEAN CO", "3711"),
+        sub(BANK, "BANK CO", "6022"),
+        sub(NO_SIC, "MYSTERY CO", ""),
+        sub(QUARTERLY, "QUARTERLY CO", "3711", form="10-Q", fp="Q1"),
+        # FY ending 2018-11-30 began 2017-12-01, one day inside the pre-606
+        # era. The off-by-one this pins is the whole reason fiscal_start exists.
+        sub(PRE606, "OLD ERA CO", "3711", period="20181130"),
+        sub(NIL_REVENUE, "NIL BIOTECH", "2836"),
+        sub(NEW_TAG, "NEW TAG CO", "7372"),
+        sub(SEGMENTS, "SEGMENTS CO", "3711"),
+        sub(CANADIAN, "CANADIAN CO", "1040"),
+        sub(PRIOR_ONLY, "PRIOR ONLY CO", "3711"),
+        sub(NO_STATEMENT, "PRE REVENUE CO", "2836"),
+        sub(BOTH_INCOMES, "CONSOLIDATOR CO", "3711"),
+    ]
+    nums = [
+        *complete(CLEAN),
+        *complete(BANK),
+        *complete(NO_SIC),
+        *complete(QUARTERLY),
+        *complete(PRE606),
+        # Tagged for its own year, with no amount. XBRL nil: the filer has said
+        # it has no revenue, which is evidence rather than an absence of it.
+        num(NIL_REVENUE, "RevenueFromContractWithCustomerExcludingAssessedTax",
+            None, qtrs=4),
+        num(NIL_REVENUE, "Assets", "900", qtrs=0),
+        # A real revenue line under a tag the map does not carry.
+        num(NEW_TAG, "ConsultingFees", "400", qtrs=4),
+        num(NEW_TAG, "Assets", "800", qtrs=0),
+        # Revenue by segment only; no consolidated total.
+        num(SEGMENTS, "Revenues", "600", qtrs=4, segments="ProductA"),
+        num(SEGMENTS, "Revenues", "300", qtrs=4, segments="ProductB"),
+        num(SEGMENTS, "Assets", "700", qtrs=0),
+        num(CANADIAN, "Revenues", "1200", qtrs=4, uom="CAD"),
+        num(CANADIAN, "Assets", "2400", qtrs=0, uom="CAD"),
+        # Only the comparative year, which is not this filing's period.
+        num(PRIOR_ONLY, "Revenues", "500", qtrs=4, ddate=PRIOR_END),
+        num(PRIOR_ONLY, "Assets", "600", qtrs=0),
+        num(NO_STATEMENT, "Assets", "300", qtrs=0),
+        # The definition case: both tags, different values. 1,280 real filers
+        # report both and 616 of them differ.
+        *complete(BOTH_INCOMES),
+        num(BOTH_INCOMES, "ProfitLoss", "175", qtrs=4),
+        num(BOTH_INCOMES,
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+            "3400", qtrs=0),
+    ]
+    pres = [
+        pre(CLEAN, "Revenues"),
+        pre(BANK, "InterestAndDividendIncomeOperating"),
+        pre(NIL_REVENUE, "RevenueFromContractWithCustomerExcludingAssessedTax"),
+        pre(NEW_TAG, "ConsultingFees"),
+        pre(SEGMENTS, "Revenues"),
+        pre(CANADIAN, "Revenues"),
+        pre(PRIOR_ONLY, "Revenues"),
+        # Opens with an expense: pre-revenue, and nothing to look for.
+        pre(NO_STATEMENT, "ResearchAndDevelopmentExpense"),
+        pre(BOTH_INCOMES, "Revenues"),
+    ]
+    work.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, Path] = {}
+    for name, cols, rows in (("sub", SUB_COLS, subs), ("num", NUM_COLS, nums),
+                             ("pre", PRE_COLS, pres)):
+        path = work / f"{quarter}_{name}.txt"
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=cols, delimiter="\t",
+                                    lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(rows)
+        paths[name] = path
+    return paths
+
+
+@pytest.fixture
+def quarter(tmp_path: Path) -> dict[str, Path]:
+    return write_quarter(tmp_path / "work")
+
+
+@pytest.fixture
+def con() -> duckdb.DuckDBPyConnection:
+    return duckdb.connect()
+
+
+def built(con, quarter, **kw):
+    return resolve.build("2024q1", con=con, tables=quarter, **kw)
+
+
+def status_of(con, concept: str, adsh: str) -> tuple[str, str | None, object]:
+    return con.execute(
+        "select status, tag, value from fundamentals "
+        "where concept = ? and adsh = ?", [concept, adsh]
+    ).fetchone()
+
+
+# --- eras ---------------------------------------------------------------
+
+
+def test_the_era_boundary_is_on_the_fiscal_year_s_start() -> None:
+    """A fiscal year ending 2018-12-31 began 2018-01-01 and is post-606.
+
+    The off-by-one version -- subtracting a year and not adding the day -- puts
+    every December filer on the wrong side of the cliff. That is half the
+    market, and both answers resolve cleanly, so nothing about it would look
+    wrong.
+    """
+    assert tag_map.fiscal_start(date(2018, 12, 31)) == date(2018, 1, 1)
+    assert tag_map.era_for(date(2018, 12, 31)) == tag_map.POST_606
+    # A November year end began in the previous December, before the boundary.
+    assert tag_map.fiscal_start(date(2018, 11, 30)) == date(2017, 12, 1)
+    assert tag_map.era_for(date(2018, 11, 30)) == tag_map.PRE_606
+    # The boundary itself is inclusive: "beginning on or after".
+    assert tag_map.era_for(date(2018, 12, 14)) == tag_map.POST_606
+
+
+def test_a_leap_day_year_end_does_not_raise() -> None:
+    assert tag_map.fiscal_start(date(2024, 2, 29)) == date(2023, 3, 1)
+
+
+def test_the_pre_606_map_is_empty_and_says_so() -> None:
+    """v1 is post-606 only. A pre-606 filing must resolve to nothing rather
+    than be run through a map built from the other side of the cliff, which
+    would resolve, and be wrong, and look identical."""
+    assert tag_map.TAGS_BY_ERA[tag_map.PRE_606] == {}
+    assert tag_map.concept("revenue", tag_map.PRE_606) is None
+    with pytest.raises(ValueError, match="pre-606 map is empty"):
+        resolve._resolve_concept(duckdb.connect(), "revenue", tag_map.PRE_606)
+
+
+# --- who is in the population ------------------------------------------
+
+
+def test_only_operating_companies_reach_the_table(con, quarter) -> None:
+    built(con, quarter)
+    names = {row[0] for row in con.execute(
+        "select distinct company from fundamentals").fetchall()}
+    assert "BANK CO" not in names, "a bank's statements are a different shape"
+    assert "MYSTERY CO" not in names, "no SIC is unknown, not operating"
+    assert "QUARTERLY CO" not in names, "a 10-Q is a different period"
+    assert "OLD ERA CO" not in names, "pre-606 is out of v1"
+    assert "CLEAN CO" in names
+
+
+def test_the_funnel_names_every_stage_that_removed_anything(con, quarter) -> None:
+    """The counts are the only thing that says whether a short list is
+    selective or broken, which is why a normalizer gets a funnel too."""
+    _, result = built(con, quarter)
+    stages = {s.name: s.remaining for s in result.funnel.stages}
+    assert stages["submissions"] == 12
+    assert stages["annual report"] == 11          # the 10-Q is out
+    assert stages["classified by SIC"] == 10      # no-SIC is out
+    assert stages["operating company"] == 9       # the bank is out
+    assert stages["post-606 era"] == 8            # the 2018 filer is out
+    assert result.filings == 8
+    for stage in result.funnel.stages:
+        assert stage.why, f"{stage.name} carries a count with no reason"
+
+
+def test_every_filing_gets_a_row_for_every_concept(con, quarter) -> None:
+    """The unresolved are the deliverable too: a concept at 51% and one at 99%
+    look identical downstream unless the misses are rows."""
+    _, result = built(con, quarter)
+    rows = int(con.execute("select count(*) from fundamentals").fetchone()[0])
+    assert rows == result.filings * len(tag_map.CONCEPTS)
+    assert con.execute(
+        "select count(*) from fundamentals where status is null"
+    ).fetchone()[0] == 0
+
+
+# --- the statuses -------------------------------------------------------
+
+
+def test_a_clean_filer_resolves_every_concept(con, quarter) -> None:
+    built(con, quarter)
+    for name in tag_map.CONCEPTS:
+        status, tag, value = status_of(con, name, CLEAN)
+        assert status == tag_map.STATED, f"{name} did not resolve"
+        assert tag and value is not None
+
+
+def test_a_nil_revenue_tag_is_absent_and_not_unmapped(con, quarter) -> None:
+    """The filer tagged revenue for its own year and reported no amount, which
+    is it saying it has none. Treating that as a mapping failure put 19 real
+    clinical-stage biotechs into a work queue under a tag the map carries.
+    """
+    built(con, quarter)
+    status, tag, value = status_of(con, "revenue", NIL_REVENUE)
+    assert status == tag_map.ABSENT
+    assert value is None, "a nil tag is not a reported zero"
+    assert tag is None
+
+
+def test_a_pre_revenue_income_statement_is_absent(con, quarter) -> None:
+    """Opens with research and development expense. 8.9% of real operating
+    filers do, and there is nothing to go and find for them."""
+    built(con, quarter)
+    assert status_of(con, "revenue", NO_STATEMENT)[0] == tag_map.ABSENT
+
+
+def test_an_unknown_revenue_tag_is_unmapped_and_names_itself(
+    con, quarter
+) -> None:
+    """The one status that is a work queue, and it has to name the tag or it is
+    an investigation rather than a list."""
+    _, result = built(con, quarter)
+    assert status_of(con, "revenue", NEW_TAG)[0] == tag_map.UNMAPPED
+    cov = next(c for c in result.coverage if c.concept == "revenue")
+    assert ("ConsultingFees", 1) in cov.unmapped_tags
+
+
+def test_segment_only_revenue_is_not_a_mapping_failure(con, quarter) -> None:
+    built(con, quarter)
+    assert status_of(con, "revenue", SEGMENTS)[0] == tag_map.SEGMENT_ONLY
+
+
+def test_a_foreign_currency_filer_is_out_of_scope_not_unmapped(
+    con, quarter
+) -> None:
+    """A CAD reporter is not a gap in the map, and counting it as one inflates
+    the work queue with work that does not exist."""
+    built(con, quarter)
+    assert status_of(con, "revenue", CANADIAN)[0] == tag_map.NOT_USD
+
+
+def test_a_prior_year_only_value_is_a_period_mismatch(con, quarter) -> None:
+    """The comparative column is not this filing's year, and taking it would
+    silently date every number one year early."""
+    built(con, quarter)
+    status, _tag, value = status_of(con, "revenue", PRIOR_ONLY)
+    assert status == tag_map.PERIOD_MISMATCH
+    assert value is None
+
+
+def test_no_concept_is_left_without_a_status(con, quarter) -> None:
+    built(con, quarter)
+    seen = {row[0] for row in con.execute(
+        "select distinct status from fundamentals").fetchall()}
+    assert seen <= set(tag_map.STATUSES), seen - set(tag_map.STATUSES)
+
+
+def test_the_statuses_a_reader_would_act_on_differently_stay_apart(
+    con, quarter
+) -> None:
+    """Five ways not to resolve, four of which need no work. Summing them into
+    "missing" would describe none of them -- the same reason `pending_years`
+    and `gap_years` are separate columns in the Form 5500 series.
+    """
+    _, result = built(con, quarter)
+    cov = next(c for c in result.coverage if c.concept == "revenue")
+    assert cov.by_status[tag_map.ABSENT] == 2          # nil tag, and pre-revenue
+    assert cov.by_status[tag_map.UNMAPPED] == 1
+    assert cov.by_status[tag_map.SEGMENT_ONLY] == 1
+    assert cov.by_status[tag_map.NOT_USD] == 1
+    assert cov.by_status[tag_map.PERIOD_MISMATCH] == 1
+    assert sum(cov.by_status.values()) == cov.population
+
+
+# --- which tag won, and why it matters ----------------------------------
+
+
+def test_the_preferred_tag_wins_and_the_row_says_which(con, quarter) -> None:
+    """The measurement that makes this a correctness test rather than a style
+    one: 1,280 of 2,804 real filers report both ``NetIncomeLoss`` and
+    ``ProfitLoss`` and **616 report different values**, because one excludes
+    noncontrolling interests and the other does not. An arbitrary pick makes
+    the column's meaning depend on scan order.
+    """
+    built(con, quarter)
+    status, tag, value = status_of(con, "net_income", BOTH_INCOMES)
+    assert status == tag_map.STATED
+    assert tag == "NetIncomeLoss", "the parent-attributable tag is preferred"
+    assert int(value) == 100, "ProfitLoss (175) is the other definition"
+    # Equity follows the same choice, so the two are consistent with each other.
+    assert status_of(con, "equity", BOTH_INCOMES)[1] == "StockholdersEquity"
+
+
+def test_three_loads_of_identical_input_agree_exactly(con, quarter) -> None:
+    """Idempotent is not enough; deterministic is the requirement.
+
+    ``build_sponsors`` produced 22,680, 22,685 and 22,686 review rows from
+    byte-identical input because a name was picked with an arbitrary-row
+    function. Every write was a correct upsert and every test passed, so this
+    one compares the whole output three times, counts included.
+    """
+    shots = []
+    for _ in range(3):
+        fresh = duckdb.connect()
+        resolve.build("2024q1", con=fresh, tables=quarter)
+        shots.append(fresh.execute(
+            "select adsh, concept, tag, value, status from fundamentals "
+            "order by adsh, concept"
+        ).fetchall())
+    assert shots[0] == shots[1] == shots[2]
+    assert shots[0], "the comparison is vacuous if nothing was loaded"
+
+
+# --- the published partition --------------------------------------------
+
+
+def test_the_load_writes_a_parquet_and_asserts_it(con, quarter, tmp_path,
+                                                  monkeypatch) -> None:
+    from marketradar import manifest
+
+    override = tmp_path / "manifest.toml"
+    target = (tmp_path / "out").as_posix()
+    override.write_text(
+        "[xbrl_fundamentals]\n"
+        f'2024q1 = {{ location = "{target}", backend = "github_release" }}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(manifest.OVERRIDE_ENV, str(override))
+    manifest.clear_cache()
+    try:
+        result = resolve.load("2024q1", tmp_path / "out", con=con,
+                              tables=quarter, min_rows=10)
+        assert result.target and result.target.exists()
+        assert result.observed.row_count == result.rows
+        # The max date is put back after the staleness check is skipped, or
+        # dataset_stats records NULL for every historical partition.
+        assert result.observed.max_date == date(2023, 12, 31)
+    finally:
+        manifest.clear_cache()
+
+
+def test_a_quarter_that_resolved_nothing_fails_rather_than_publishing(
+    con, tmp_path, monkeypatch
+) -> None:
+    """The failure this project cares most about: a job exiting green on empty
+    data. Every filing still produces six rows carrying a status, so a row
+    count over the whole table would pass -- which is why the assertion is on
+    the *resolved* rows.
+    """
+    from marketradar import manifest
+    from marketradar.freshness import StaleDataError
+
+    work = tmp_path / "work"
+    write_quarter(work)
+    # Strip every value, keeping the rows. The table stays full and nothing
+    # resolves.
+    num_path = work / "2024q1_num.txt"
+    lines = num_path.read_text(encoding="utf-8").splitlines()
+    head, body = lines[0], lines[1:]
+    num_path.write_text(
+        "\n".join([head] + [row.rsplit("\t", 1)[0] + "\t" for row in body]) + "\n",
+        encoding="utf-8",
+    )
+
+    override = tmp_path / "manifest.toml"
+    override.write_text(
+        "[xbrl_fundamentals]\n"
+        f'2024q1 = {{ location = "{(tmp_path / "out").as_posix()}", '
+        'backend = "github_release" }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(manifest.OVERRIDE_ENV, str(override))
+    manifest.clear_cache()
+    tables = {n: work / f"2024q1_{n}.txt" for n in ("sub", "num", "pre")}
+    try:
+        with pytest.raises(StaleDataError):
+            resolve.load("2024q1", tmp_path / "out", con=con, tables=tables,
+                         min_rows=10)
+    finally:
+        manifest.clear_cache()
+
+
+def test_a_private_backend_is_refused(con, quarter, tmp_path, monkeypatch) -> None:
+    """The licensing boundary, asserted in the direction that matters here.
+
+    SEC data is public domain and belongs in a Release. R2 is where
+    vendor-derived data goes, and a dataset drifting across that line is the
+    one mistake the manifest's backend column exists to make visible -- the
+    same check tiingo.publish makes, pointing the other way.
+    """
+    from marketradar import manifest
+
+    override = tmp_path / "manifest.toml"
+    override.write_text(
+        "[xbrl_fundamentals]\n"
+        '2024q1 = { location = "r2://market-radar/x.parquet", backend = "r2" }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(manifest.OVERRIDE_ENV, str(override))
+    manifest.clear_cache()
+    try:
+        with pytest.raises(ValueError, match="public domain"):
+            resolve.load("2024q1", tmp_path / "out", con=con, tables=quarter,
+                         min_rows=10)
+    finally:
+        manifest.clear_cache()
+
+
+# --- the map's own claims -----------------------------------------------
+
+
+def test_every_concept_carries_a_coverage_figure_and_a_definition() -> None:
+    """A concept at 51% and one at 99% are both just a number in a column
+    otherwise. The definition matters for the same reason: "net income" is two
+    different numbers."""
+    for name, got in tag_map.CONCEPTS.items():
+        assert got.tags, name
+        assert 0.0 < got.coverage_2024q1 <= 1.0, name
+        assert got.definition.strip(), name
+        assert got.qtrs in (tag_map.INSTANT, tag_map.ANNUAL), name
+
+
+def test_only_revenue_has_topline_evidence() -> None:
+    """What a filer puts at the top of its income statement is evidence about
+    revenue and about nothing else. Applying it to all six produced a
+    liabilities work queue of 445 filings whose suggested fixes were revenue
+    tags -- sorted, plausible, and meaningless.
+    """
+    assert tag_map.CONCEPTS["revenue"].unmapped_when is not None
+    for name, got in tag_map.CONCEPTS.items():
+        if name != "revenue":
+            assert got.unmapped_when is None, (
+                f"{name} would suggest income-statement tags as fixes"
+            )
+
+
+def test_the_deferred_concepts_are_named_with_their_coverage() -> None:
+    """Dropped from v1, not forgotten: each comes back carrying its own
+    number rather than as a speculative column."""
+    assert set(tag_map.DEFERRED_CONCEPTS) == {
+        "capex", "shares", "cash", "operating_income"}
+    assert not set(tag_map.DEFERRED_CONCEPTS) & set(tag_map.CONCEPTS)
+
+
+def test_the_rejected_liabilities_derivation_is_recorded() -> None:
+    """It would lift coverage 83.2% -> 99.0% and be wrong by 52x for ProKidney,
+    because mezzanine equity sits in neither tag. Recorded rather than
+    implemented, so the next reader does not re-derive it."""
+    assert "ProKidney" in tag_map.DERIVED_LIABILITIES_REJECTED
+    assert tag_map.CONCEPTS["liabilities"].tags == ("Liabilities",)
+
+
+def test_asking_for_a_deferred_concept_is_an_error_that_explains_itself(
+    con, quarter
+) -> None:
+    with pytest.raises(ValueError, match="measured and"):
+        built(con, quarter, concepts=("capex",))
+
+
+def test_one_concept_can_be_asked_for_alone(con, quarter) -> None:
+    """The point of the long shape: revenue alone should cost the coverage of
+    revenue alone, not of six concepts the caller never reads."""
+    _, result = built(con, quarter, concepts=("revenue",))
+    assert [c.concept for c in result.coverage] == ["revenue"]
+    assert con.execute(
+        "select count(distinct concept) from fundamentals").fetchone()[0] == 1
+
+
+# --- fetch --------------------------------------------------------------
+
+
+def test_quarter_names_are_validated() -> None:
+    """The name is interpolated into a URL and into filenames."""
+    for bad in ("2024", "2024q5", "24q1", "../etc", "2024q1; drop"):
+        with pytest.raises(fetch_mod.XbrlFetchError):
+            fetch_mod.fetch(bad)
+
+
+def test_a_quarter_range_is_inclusive_and_ordered() -> None:
+    assert fetch_mod.quarters("2023q3", "2024q2") == [
+        "2023q3", "2023q4", "2024q1", "2024q2"]
+    assert fetch_mod.quarters("2024q1", "2024q1") == ["2024q1"]
+    with pytest.raises(fetch_mod.XbrlFetchError, match="before"):
+        fetch_mod.quarters("2024q2", "2024q1")
+
+
+def test_a_missing_user_agent_refuses_before_any_request(monkeypatch) -> None:
+    """SEC blocks traffic without a real contact address, and asking anyway is
+    how an IP gets flagged."""
+    monkeypatch.delenv(fetch_mod.ENV_USER_AGENT, raising=False)
+    with pytest.raises(fetch_mod.XbrlFetchError, match="contact address"):
+        fetch_mod.user_agent()
+    monkeypatch.setenv(fetch_mod.ENV_USER_AGENT, "market-radar")
+    with pytest.raises(fetch_mod.XbrlFetchError, match="email"):
+        fetch_mod.user_agent()
+
+
+# --- against the real quarter -------------------------------------------
+
+REAL_WORK = Path(__file__).resolve().parents[1] / ".cache" / "xbrl" / "work"
+REAL = {n: REAL_WORK / f"2024q1_{n}.txt" for n in ("sub", "num", "pre")}
+
+
+@pytest.mark.skipif(
+    not all(p.exists() for p in REAL.values()),
+    reason=("the 2024q1 data set is not in .cache/xbrl/work on this machine. "
+            "Run `mr xbrl --quarter 2024q1` to fetch it. Skipped rather than "
+            "failed because this is a ~100 MB download, unlike the node "
+            "toolchain the DOM suite needs."),
+)
+def test_the_map_reproduces_its_own_measurement() -> None:
+    """Every coverage figure the map records, re-measured from the real data.
+
+    This is what stops the map's own numbers from becoming folklore. Baseline
+    tag churn between sampled years ran 11-20%, so these drift; the tolerance
+    is half a point, which is tight enough to catch a map that has rotted and
+    loose enough to survive the data set being restated.
+    """
+    con = duckdb.connect()
+    con.execute("set preserve_insertion_order=false")
+    _, result = resolve.build("2024q1", con=con, tables=REAL)
+    assert result.filings == 2_804, (
+        f"the population is {result.filings}, not the 2,804 the map's coverage "
+        "figures were measured over"
+    )
+    for cov in result.coverage:
+        assert abs(cov.drift) <= 0.005, (
+            f"{cov.concept}: {cov.rate:.1%} now against "
+            f"{tag_map.CONCEPTS[cov.concept].coverage_2024q1:.1%} in the map "
+            f"({cov.drift:+.1%})"
+        )

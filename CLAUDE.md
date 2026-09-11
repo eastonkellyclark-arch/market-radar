@@ -64,6 +64,7 @@ uv run mr prices --date 2026-09-03  # single source, one date
 uv run mr screens                   # rebuild screens from local data
 uv run mr digest --dry-run          # render email, don't send
 uv run mr backfill --budget 200     # drain N queue items
+uv run mr xbrl --quarter 2024q1     # normalize one quarter of fundamentals
 ```
 
 Every job runs standalone from CLI. If it only works inside a GitHub Action,
@@ -302,6 +303,23 @@ on or after 2017-12-15), and the two halves are not equal work: pre-606 has
 419 distinct top-line tags with the top 5 covering 71.9%, post-606 has 133
 with the top 5 covering 93.0%. Build post-606 first; pre-2019 is a separate
 decision on evidence.
+
+**When two XBRL tags carry "the same" concept, the choice between them is
+the column's definition.** 1,280 of 2,804 operating filers in 2024q1 report
+both `NetIncomeLoss` and `ProfitLoss`, and 616 report *different values* — one
+excludes noncontrolling interests, one does not. 781 report two equity tags and
+608 of those differ. So tag priority is a documented decision, never a
+tiebreak, and the resolved tag rides on every row so a consumer can see which
+definition it got. Third time this shape has appeared: `TOT_PARTCP_BOY_CNT`
+over active participants, the Form 5500 headcount sum over the largest plan,
+and now this. A source offering a total and a component under similar names is
+the default case, not the exception.
+
+**A nil XBRL tag is evidence, and it is not a zero.** A filer that tags revenue
+for its own fiscal year and reports no amount has stated that it has no
+revenue — stronger evidence of `absent` than anything inferable from the
+statement layout. Keep those rows and read them; do not write a 0 in their
+place, for the same reason a missing split is never inferred from a price jump.
 
 **Banks, insurers, brokers and REITs are not a SIC branch — they are a
 different table.** 23.7% of filers in 2024q1 and 26.2% in 2013q1. A bank's

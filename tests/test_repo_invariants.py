@@ -18,13 +18,43 @@ SCREENS = SRC / "screens"
 
 
 def _source_modules() -> list[Path]:
-    """Every real loader module. ``__init__.py`` is package scaffolding."""
-    return sorted(p for p in SOURCES.glob("*.py") if p.name != "__init__.py")
+    """Every real loader file, **including inside a source package**.
+
+    ``rglob``, not ``glob``. A source big enough to be a package -- xbrl is
+    three files: fetch, tag map, loader -- was invisible to all three rules
+    below while this was non-recursive: no URL check, no freshness check, no
+    ban on non-deterministic row picks. Nothing failed, which is the problem.
+    A rule that silently stops applying to the largest module in the tree is
+    worse than no rule, because the tree looks covered.
+    """
+    return sorted(p for p in SOURCES.rglob("*.py") if p.name != "__init__.py")
 
 
 def _screen_modules() -> list[Path]:
     """Every screen. They do not load data, but they do shape what is read."""
-    return sorted(p for p in SCREENS.glob("*.py") if p.name != "__init__.py")
+    return sorted(p for p in SCREENS.rglob("*.py") if p.name != "__init__.py")
+
+
+def _source_units() -> list[tuple[str, list[Path]]]:
+    """One entry per *source*, which is a module or a package of them.
+
+    The freshness rule is per source, not per file: a package's loader calls
+    ``assert_fresh`` and its fetch and tag-map halves have nothing to assert
+    about. Demanding the call in every file would either force a meaningless
+    call into a pure mapping table or -- much more likely -- get the rule
+    deleted. So the unit is the thing that loads, and the test below asks only
+    that *something* in it ends with the assertion.
+    """
+    units: list[tuple[str, list[Path]]] = []
+    for path in sorted(SOURCES.iterdir()):
+        if path.is_dir() and (path / "__init__.py").exists():
+            files = [p for p in sorted(path.rglob("*.py"))
+                     if p.name != "__init__.py"]
+            if files:
+                units.append((f"{path.name}/", files))
+        elif path.suffix == ".py" and path.name != "__init__.py":
+            units.append((path.name, [path]))
+    return units
 
 
 def test_sources_package_exists() -> None:
@@ -64,10 +94,9 @@ def test_every_source_asserts_freshness() -> None:
     a base class would have given us, without coupling every source to a
     shared parent.
     """
-    delinquent: list[str] = []
-    for module in _source_modules():
+    def calls_assert_fresh(module: Path) -> bool:
         tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
-        called = any(
+        return any(
             isinstance(node, ast.Call)
             and (
                 (isinstance(node.func, ast.Name) and node.func.id == "assert_fresh")
@@ -78,8 +107,11 @@ def test_every_source_asserts_freshness() -> None:
             )
             for node in ast.walk(tree)
         )
-        if not called:
-            delinquent.append(module.name)
+
+    units = _source_units()
+    assert units, "the invariant is vacuous; no sources were found"
+    delinquent = [name for name, files in units
+                  if not any(calls_assert_fresh(f) for f in files)]
 
     assert not delinquent, (
         f"These modules never call assert_fresh(): {', '.join(delinquent)}. "

@@ -93,6 +93,23 @@ archives = { location = "https://www.sec.gov/Archives", backend = "vendor_api" }
 main = { location = "https://askebsa.dol.gov/FOIA%20Files/{year}/Latest/F_5500_{year}_Latest.zip", backend = "vendor_api" }
 short = { location = "https://askebsa.dol.gov/FOIA%20Files/{year}/Latest/F_5500_SF_{year}_Latest.zip", backend = "vendor_api" }
 
+[sec_financial_statements]
+# SEC Financial Statement Data Sets: one zip per calendar quarter holding
+# sub/num/pre/tag as tab-separated text. Public domain, no key, but SEC
+# requires a descriptive User-Agent with a real contact address
+# (MR_SEC_USER_AGENT).
+#
+# **Not companyfacts.zip**, and the reason is the whole point. These are values
+# *as filed*, one row per accession, with each filing kept separately;
+# companyfacts gives today's view of history with restatements folded in
+# silently. An analog engine comparing a 2018 deal against 2018 fundamentals
+# needs what was knowable in 2018, and only this can answer that. Same defect
+# as the yfinance fundamentals rule in CLAUDE.md, which already cost a rule.
+#
+# {quarter} is e.g. 2024q1. ~44 downloads covers the eleven years the price
+# history covers, at roughly 100 MB each.
+quarterly = { location = "https://www.sec.gov/files/dera/data/financial-statement-data-sets/{quarter}.zip", backend = "vendor_api" }
+
 [sec_files]
 # CIK <-> ticker map for every SEC filer with a listed security. One small
 # file, no key, but SEC requires a descriptive User-Agent with a real contact
@@ -128,6 +145,25 @@ all = { location = "macro_series", backend = "supabase" }
 2023 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2023.parquet", backend = "github_release" }
 2024 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2024.parquet", backend = "github_release" }
 2025 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2025.parquet", backend = "github_release" }
+
+[xbrl_fundamentals]
+# One row per (accession, concept) -- **long, not wide**, and that is a
+# decision rather than a convenience. Individually these concepts clear 98%;
+# all six on the same filer is 64%. A consumer asking for revenue and net
+# income should pay the coverage cost of revenue and net income, not of six it
+# never reads, and a wide table makes that impossible to express.
+#
+# Partitioned by source quarter, which is also the download unit: re-running
+# one quarter is cheap, and no partition ever has to be filtered out of another
+# quarter's rows. The whole eleven years is under a million rows.
+#
+# SEC data is public domain, so a GitHub Release is correct.
+2024q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2024q1.parquet", backend = "github_release" }
+2023q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2023q1.parquet", backend = "github_release" }
+2022q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2022q1.parquet", backend = "github_release" }
+2021q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2021q1.parquet", backend = "github_release" }
+2020q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2020q1.parquet", backend = "github_release" }
+2019q1 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/xbrl/xbrl_fundamentals_2019q1.parquet", backend = "github_release" }
 
 [entity_review]
 # The review queue: sponsors whose *name* matched an SEC filer while their

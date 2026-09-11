@@ -168,6 +168,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_5500.add_argument("--no-load", action="store_true",
                         help="report only; write no parquet and no queue rows")
 
+    p_xbrl = sub.add_parser(
+        "xbrl",
+        help="normalize one quarter of SEC fundamentals and report coverage",
+    )
+    p_xbrl.add_argument("--quarter", nargs="+", required=True, metavar="YYYYqQ",
+                        help="one or more quarters, e.g. --quarter 2023q4 "
+                             "2024q1. Each is loaded into its own partition")
+    p_xbrl.add_argument("--out", default=".cache/xbrl/out", metavar="DIR",
+                        help="where the partition parquet is written")
+    p_xbrl.add_argument("--cache", default=None, metavar="DIR",
+                        help="where the quarterly zips are kept "
+                             "(default .cache/xbrl)")
+    p_xbrl.add_argument("--concept", nargs="+", default=None, metavar="NAME",
+                        help="only these concepts. The table is long, so "
+                             "asking for revenue costs the coverage of "
+                             "revenue and nothing else")
+    p_xbrl.add_argument("--no-load", action="store_true",
+                        help="report coverage only; write no parquet")
+
     p_targets = sub.add_parser(
         "targets",
         help="old private employers whose headcount stopped growing",
@@ -632,6 +651,52 @@ def _mature_rows(limit: int = 200, series=None, built=None):
         "candidates": len(targets),
         "population": mature_target.population(series),
     }
+
+
+def _cmd_xbrl(args: argparse.Namespace) -> int:
+    """Normalize quarters of SEC fundamentals, printing the coverage report.
+
+    The coverage report *is* the deliverable, not a side effect. A concept that
+    resolves for 51% of filers and one that resolves for 99% look identical
+    downstream -- both are a number in a column -- so the funnel and the
+    per-concept figures print every run, the same way a screen prints its own.
+    """
+    import duckdb
+
+    from marketradar.sources.xbrl import resolve as xbrl
+
+    out = Path(args.out)
+    cache = Path(args.cache) if args.cache else None
+    concepts = tuple(args.concept) if args.concept else None
+    worst = 0.0
+    for quarter in args.quarter:
+        con = duckdb.connect()
+        # A quarter is ~600k facts and the order they land in is never read.
+        con.execute("set preserve_insertion_order=false")
+        if args.no_load:
+            _, result = xbrl.build(quarter, con=con, cache=cache,
+                                   concepts=concepts)
+        else:
+            result = xbrl.load(quarter, out, con=con, cache=cache,
+                               concepts=concepts)
+        for line in result.lines():
+            print(line)
+        if result.target:
+            print()
+            print(f"wrote {result.target}")
+        print()
+        for cov in result.coverage:
+            if cov.drift is not None:
+                worst = min(worst, cov.drift)
+
+    # Drift is the thing that rots quietly: the map is hand-maintained and
+    # baseline tag churn between sampled years ran 11-20%. Said out loud rather
+    # than left in a column nobody reads.
+    if worst < -0.01:
+        print(f"note: a concept is {abs(worst):.1%} below the coverage the tag "
+              "map records. The map may need a tag -- the unmapped counts "
+              "above name which.", file=sys.stderr)
+    return EXIT_OK
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
@@ -1542,6 +1607,17 @@ def main(argv: list[str] | None = None) -> int:
 
             label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
             print(f"mr form5500: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "xbrl":
+        load_dotenv()
+        try:
+            return _cmd_xbrl(args)
+        except StaleDataError as exc:
+            print(f"mr xbrl: STALE DATA: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        except Exception as exc:
+            print(f"mr xbrl: error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "targets":

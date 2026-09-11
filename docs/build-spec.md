@@ -1115,7 +1115,7 @@ them.** Operating companies, per concept:
 
 | concept | 2013q1 | 2024q1 |
 |---|---|---|
-| liabilities | 99.0% | 99.9% |
+| liabilities | 99.0% | 99.9% — **wrong, see below** |
 | operating cash flow | 98.1% | 99.7% |
 | assets | 98.0% | 99.7% |
 | equity | 96.4% | 98.2% |
@@ -1126,6 +1126,26 @@ them.** Operating companies, per concept:
 | revenue | 82.4% | 86.8% |
 | capex | 74.4% | 79.9% |
 | **all ten on one filer** | **51.6%** | **64.2%** |
+
+**The liabilities row is wrong and the way it is wrong is the point.** Building
+the loader re-measured it at **83.2%**, not 99.9%. The original number was
+counting `LiabilitiesAndStockholdersEquity`, which is the balance-sheet total
+and equals *assets* — not liabilities at all. That is this document's own
+"check what the column counts before naming it" rule, applied to this
+document's own measurement, and it went unnoticed because 99.9% is exactly what
+a reader hopes for from a balance-sheet total.
+
+The obvious repair is `LiabilitiesAndStockholdersEquity - equity`, which lifts
+coverage to 99.0% and was **measured and rejected**: it disagrees with the
+stated figure by more than 5% for 5.5% of the filers that report both, and 84%
+of those carry temporary or redeemable equity, where the gap equals the
+mezzanine amount exactly. Redeemable NCI sits between liabilities and equity,
+in neither tag, so the subtraction files it under debt. ProKidney Corp states
+$29.2M and derives $1.52B — a 52x overstatement that would top any leverage
+screen. Subtracting mezzanine as well would fix 84% and leave the rest wrong
+invisibly, which is worse: a derivation that is usually right is harder to
+distrust than one that is absent. So liabilities is stated-only, and 17% is a
+stated gap rather than a silent error.
 
 Individually most concepts look solved. Together they are not: requiring all
 ten halves the population in 2013 and takes a third of it in 2024. **Any
@@ -1252,10 +1272,13 @@ why the other four were dropped and what it would take to add them back.
 
 #### Order
 
-1. `sources/xbrl/fetch.py` — the quarterly zips, cached and resumable.
+1. `sources/xbrl/download.py` — the quarterly zips, cached and
+   resumable. Named `download`, not `fetch`: the package exports
+   `fetch()` as a function and a submodule of the same name shadows it.
 2. The measurement above, recorded in this document.
-3. `sources/xbrl/tag_map.py` + a resolver that reports coverage per concept
-   as a funnel, with unresolved filers named rather than dropped.
+3. `sources/xbrl/tag_map.py` + `resolve.py`, reporting coverage per concept
+   as a funnel, with unresolved filers named rather than dropped. **Done
+   2026-09-10** — see "v1 as built" below.
 4. ~~SIC branches for banks, insurers and REITs~~ — **out of v1.** They are
    a separate table if they are ever built at all; see the v1 scope below.
 5. `U10` fundamentals panel, shipping with step 3.
@@ -1264,6 +1287,59 @@ why the other four were dropped and what it would take to add them back.
 unresolved are listed by SIC with the tags they used instead, and no
 downstream consumer reads a fundamental without also being able to read how
 many filers it covers.
+
+#### v1 as built — 2026-09-10
+
+`sources/xbrl/` is three modules: `download.py` (quarterly zips, cached and
+resumable), `tag_map.py` (the hand-maintained map), `resolve.py` (one quarter
+into rows plus the coverage report). `mr xbrl --quarter 2024q1` runs it.
+
+Coverage on 2024q1, 2,804 operating 10-K filers — each figure reproduced by a
+test against the real data, so the map's own numbers cannot become folklore:
+
+| concept | resolved | note |
+|---|---|---|
+| net income | 99.6% | |
+| operating cash flow | 99.6% | |
+| assets | 99.5% | one tag, the only concept needing no choice |
+| equity | 97.7% | |
+| revenue | 87.9% | |
+| liabilities | 83.2% | stated only; see the rejected derivation above |
+
+Three things the build found that the measurement had not.
+
+**Which tag wins is the definition of the column, not a tiebreak.** 1,280 of
+the 2,804 filers report both `NetIncomeLoss` and `ProfitLoss`, and **616 report
+different values** — one excludes noncontrolling interests and the other does
+not. 781 report two equity tags and 608 of those differ. So the priority order
+is a documented decision (parent-attributable throughout, consistently across
+net income and equity), and **the resolved tag is carried on every row** so a
+consumer can see which definition it was handed. Same lesson as
+`TOT_PARTCP_BOY_CNT`: a total and a component under similar names, and it never
+errors.
+
+**A nil tag is the strongest evidence of `absent` there is.** A filer that tags
+revenue for its own fiscal year and reports no amount has said in the tag that
+it has no revenue. The first loader filtered those rows out before resolution,
+and 19 clinical-stage biotechs then read as `unmapped` under a tag the map
+already carries — a work-queue item that does not exist. The value stays NULL
+rather than becoming a zero: a nil tag is not a reported zero, and writing one
+in is the same mistake as inferring a split ratio from a price jump.
+
+**"Did not resolve" is five different facts with five different remedies**, so
+they are five statuses and never a sum. `absent` needs no work, `unmapped` is
+the queue and names the tag, `not_usd` is out of scope, `segment_only` is a
+question about aggregating segments, `period_mismatch` is about the filing
+rather than the map. The first version applied revenue's evidence — the
+income-statement top line — to all six concepts, which produced a liabilities
+work queue of 445 filings whose top three suggested fixes were revenue tags:
+sorted, plausible, and meaningless. What a filer puts at the top of its income
+statement is evidence about revenue and about nothing else.
+
+Also corrected on the way through: `tests/test_repo_invariants.py` globbed
+`sources/*.py` non-recursively, so a source that is a *package* was invisible to
+all three repo rules — no URL check, no freshness check, no ban on
+non-deterministic row picks. Nothing failed, which is the problem.
 
 #### Decisions needed before starting
 
