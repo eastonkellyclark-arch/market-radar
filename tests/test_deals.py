@@ -498,3 +498,104 @@ def test_substantially_all_of_the_assets_alone_is_not_a_division() -> None:
     prose = ("The Company agreed to sell substantially all of the assets of "
              "the Company to Buyer Inc. for $40 million.")
     assert deals.deal_type(_filing(), prose, "m_and_a") == "operating"
+
+
+# --- target-side discovery ----------------------------------------------
+
+
+def test_the_routine_annual_proxy_is_not_a_watched_form() -> None:
+    """The trap in reading a form-frequency table.
+
+    DEF 14A is on 96% of sampled deal filers and DEFA14A on 93% -- because they
+    are the annual-meeting proxy and its supplements, not merger disclosure.
+    Sweeping them would multiply the population by twenty and add nothing. The
+    two most common forms in the sample are the two least relevant.
+    """
+    from marketradar.signals import deals
+
+    assert "DEF 14A" not in deals.WATCHED_FORMS
+    assert "DEFA14A" not in deals.WATCHED_FORMS
+    assert "DEFM14A" in deals.TARGET_SIDE_FORMS
+    assert "SC 13E3" in deals.TARGET_SIDE_FORMS
+
+
+def test_the_watched_set_is_the_8ks_plus_the_target_side() -> None:
+    """One index read answers both questions, which is why discovery is free."""
+    from marketradar.signals import deals
+
+    assert set(deals.WATCHED_FORMS) == (
+        set(deals.FORM_TYPES) | set(deals.TARGET_SIDE_FORMS))
+    assert not set(deals.FORM_TYPES) & set(deals.TARGET_SIDE_FORMS)
+
+
+def test_a_target_side_filing_is_discovered_from_the_index_line_alone(
+    monkeypatch
+) -> None:
+    """No header fetch, no body fetch, no extra request.
+
+    The index line carries form, company, CIK and accession, which is everything
+    needed to say *that* a disclosure exists and where it is. Reading it is a
+    separate job: a DEFM14A is 1.26 million characters whose valuable content is
+    in HTML tables formatted per investment bank, so the numbers are a
+    located-section plus cheap-LLM extraction rather than a regex.
+    """
+    from datetime import date as _d
+
+    from marketradar.signals import deals
+
+    # Built to the real column widths: form occupies [0:12] and the company
+    # name [12:74], which is how daily_filings slices the line. A fixture with
+    # the wrong widths tests the fixture.
+    def idx_line(form: str, company: str, cik: str, path: str) -> str:
+        return f"{form:<12}{company:<62}{cik:<10}20220119    {path}"
+
+    index = "\n".join([
+        f"{'Form Type':<12}{'Company Name':<62}{'CIK':<10}Date Filed  File Name",
+        "-" * 100,
+        idx_line("8-K", "ACME CORP", "1000001",
+                 "edgar/data/1000001/0001000001-22-000001.txt"),
+        idx_line("DEFM14A", "TARGET CO", "2000002",
+                 "edgar/data/2000002/0002000002-22-000002.txt"),
+        # The routine annual proxy, which must be ignored entirely.
+        idx_line("DEF 14A", "ROUTINE CO", "3000003",
+                 "edgar/data/3000003/0003000003-22-000003.txt"),
+    ]) + "\n"
+
+    class FakeResponse:
+        status_code = 200
+        text = index
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def get(self, url, **kw):
+            if url.endswith(".idx"):
+                return FakeResponse()
+            raise AssertionError(
+                f"discovery fetched {url} -- it must cost no extra requests"
+            )
+
+        def close(self) -> None:
+            return None
+
+    # The real guard rejects "example.com" as a placeholder, which is correct and
+    # is why the fixture uses something that reads like a person.
+    monkeypatch.setenv("MR_SEC_USER_AGENT", "market-radar tests <tests@mr.test>")
+    sink: list = []
+    # The 8-K would need a header fetch, which the fake client refuses; stopping
+    # at the first yield is enough to prove the sink was filled from the index.
+    gen = deals.daily_filings(_d(2022, 1, 19), client=FakeClient(),
+                              pacer=deals.Pacer(per_second=1000),
+                              target_side=sink)
+    with pytest.raises(AssertionError, match="no extra requests"):
+        list(gen)
+
+    assert len(sink) == 1, [f.form for f in sink]
+    found = sink[0]
+    assert found.form == "DEFM14A"
+    assert found.company == "TARGET CO"
+    assert found.cik == "2000002"
+    assert found.accession == "0002000002-22-000002"
+    assert found.filed_date == _d(2022, 1, 19)
+    assert found.url.endswith("edgar/data/2000002/0002000002-22-000002.txt")

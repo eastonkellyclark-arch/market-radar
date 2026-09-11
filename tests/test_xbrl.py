@@ -1058,3 +1058,39 @@ def test_the_matrix_ignores_another_dataset_in_the_same_directory(
         "a neighbouring dataset was read as a partition"
     )
     assert {r["concept"] for r in rows} == set(tag_map.CONCEPTS)
+
+
+def test_an_already_extracted_table_needs_neither_zip_nor_network(
+    tmp_path, monkeypatch
+) -> None:
+    """The property that makes dropping the zips safe.
+
+    ``fetch`` checks the extracts **before** the zip, so a quarter whose tables
+    are unpacked needs no download. The other ordering -- which is what it had --
+    would quietly re-fetch 3 GB to read files already on disk, and the only
+    symptom would be a slow command.
+
+    Proved by removing the zip and breaking the credentials, so any attempt to
+    reach SEC raises rather than succeeding and hiding the fetch.
+    """
+    cache = tmp_path / "cache"
+    write_quarter(cache / "work", "2024q1")
+    assert not (cache / "2024q1.zip").exists()
+    monkeypatch.setenv(fetch_mod.ENV_USER_AGENT, "")
+
+    got = fetch_mod.fetch("2024q1", cache=cache, tables=("sub",))
+
+    assert got.downloaded is False
+    assert got.tables["sub"].exists()
+
+
+def test_a_missing_table_still_needs_the_zip(tmp_path, monkeypatch) -> None:
+    """The other half: asking for a table that is not unpacked must not silently
+    report success. A quarter with only sub.txt cannot answer a resolve."""
+    cache = tmp_path / "cache"
+    write_quarter(cache / "work", "2024q1")
+    (cache / "work" / "2024q1_num.txt").unlink()
+    monkeypatch.setenv(fetch_mod.ENV_USER_AGENT, "")
+
+    with pytest.raises(fetch_mod.XbrlFetchError, match="contact address"):
+        fetch_mod.fetch("2024q1", cache=cache, tables=("sub", "num"))

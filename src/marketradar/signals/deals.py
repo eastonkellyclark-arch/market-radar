@@ -74,6 +74,49 @@ SOURCE: Final[str] = "edgar_8k"
 #: read and the accession unique key keeps them as separate rows.
 FORM_TYPES: Final[tuple[str, ...]] = ("8-K", "8-K/A")
 
+#: The target-side forms: what the company being bought discloses.
+#:
+#: Measured 2026-09-10 over 120 sampled filers in the deal-multiples population.
+#: 64% have at least one; individually DEFM14A 27%, S-4 33%, PREM14A 18%,
+#: SC TO-T 10%, SC TO-I 8%, SC 13E3 4%.
+#:
+#: **DEF 14A and DEFA14A are deliberately absent.** They are on 96% and 93% of
+#: filers because they are the routine annual-meeting proxy and its supplements,
+#: so including them would multiply the population by twenty and add no merger
+#: disclosure. That is the trap in reading a form-frequency table: the two most
+#: common forms in the sample are the two least relevant.
+TARGET_SIDE_FORMS: Final[tuple[str, ...]] = (
+    "DEFM14A", "DEFM14C", "PREM14A", "PREM14C",
+    "SC 13E3", "SC 13E3/A",
+    "SC TO-T", "SC TO-T/A", "SC TO-I", "SC TO-I/A",
+    "S-4", "S-4/A",
+)
+
+#: Every form the daily index read looks at. One index request answers both
+#: questions, which is why discovery is free.
+WATCHED_FORMS: Final[tuple[str, ...]] = FORM_TYPES + TARGET_SIDE_FORMS
+
+
+@dataclass(frozen=True, slots=True)
+class TargetFiling:
+    """A target-side filing, from the index line alone.
+
+    **Discovery, not extraction.** The index gives form, filer, date and
+    accession, which is everything needed to say *that* a disclosure exists and
+    where it is -- and no request beyond the one already made. Reading it is a
+    separate job: a DEFM14A is 1.26 million characters whose valuable content is
+    HTML tables formatted per investment bank, so the numbers are a
+    located-section plus cheap-LLM extraction rather than a regex, and that lands
+    in its own table when it is built.
+    """
+
+    accession: str
+    cik: str
+    company: str
+    form: str
+    filed_date: date
+    url: str
+
 #: 1.01 is the announcement; 2.01 is the completion. 2.01 needs no classifier
 #: -- "Completion of Acquisition or Disposition of Assets" is M&A by the
 #: item's own definition -- but it is extracted through the same path so the
@@ -797,8 +840,15 @@ def daily_filings(
     *,
     client: httpx.Client | None = None,
     pacer: Pacer | None = None,
+    target_side: list[TargetFiling] | None = None,
 ) -> Iterator[Filing]:
     """Every 8-K filed on ``day`` that carries Item 1.01 or 2.01.
+
+    ``target_side``, when given, is appended with the merger proxies and tender
+    offers from the same index read -- see :class:`TargetFiling`. It is a sink
+    rather than a second return value so the generator contract is unchanged for
+    existing callers, and it costs nothing: the index lists every form whether or
+    not anyone looks.
 
     One request for the daily index, then one ``-index-headers.html`` per
     8-K. The header page is read rather than the full submission because it
@@ -830,11 +880,28 @@ def daily_filings(
         rows: list[tuple[str, str, str]] = []
         for line in resp.text.splitlines():
             form = line[:12].strip()
-            if form not in FORM_TYPES:
+            if form not in WATCHED_FORMS:
                 continue
             path = line.split()[-1]
-            if path.endswith(".txt"):
-                rows.append((form, line[12:74].strip(), path))
+            if not path.endswith(".txt"):
+                continue
+            company = line[12:74].strip()
+            if form in TARGET_SIDE_FORMS:
+                # Recorded from the index line and nothing else: no header
+                # fetch, no body fetch, no extra request. The caller supplies a
+                # sink because this function already has the index in hand and
+                # reading it twice to answer two questions would double the
+                # cost of the most expensive sweep in the project.
+                if target_side is not None:
+                    cik = path.split("/")[2]
+                    accession = path.rsplit("/", 1)[1].removesuffix(".txt")
+                    target_side.append(TargetFiling(
+                        accession=accession, cik=cik, company=company,
+                        form=form, filed_date=day,
+                        url=f"{archives}/{path}",
+                    ))
+                continue
+            rows.append((form, company, path))
 
         log.info("%s: %d 8-K filings", day, len(rows))
         for form, company, path in rows:
@@ -874,8 +941,13 @@ def fetch(
     client: httpx.Client | None = None,
     pacer: Pacer | None = None,
     read_exhibits: bool = True,
+    target_side: list[TargetFiling] | None = None,
 ) -> list[Deal]:
-    """Every deal candidate filed between ``start`` and ``end`` inclusive."""
+    """Every deal candidate filed between ``start`` and ``end`` inclusive.
+
+    ``target_side`` is passed straight through to :func:`daily_filings`, so a
+    sweep collects the merger proxies alongside the 8-Ks for no extra requests.
+    """
     headers = {"User-Agent": user_agent(), "Accept-Encoding": "gzip, deflate"}
     con, owns = _client(client)
     pacer = pacer or Pacer()
@@ -883,7 +955,8 @@ def fetch(
     try:
         day = start
         while day <= end:
-            for filing in daily_filings(day, client=con, pacer=pacer):
+            for filing in daily_filings(day, client=con, pacer=pacer,
+                                        target_side=target_side):
                 if not filing.primary:
                     log.warning("%s has no primary document", filing.accession)
                     continue
@@ -924,6 +997,17 @@ def fetch(
 # --- persistence --------------------------------------------------------
 
 
+def _lit(v: Any) -> str:
+    """A SQL literal. One escaper for both loaders, rather than two that drift."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, Decimal):
+        return str(v)
+    return "'" + str(v).replace("'", "''") + "'"
+
+
 def load(deals: Iterable[Deal], con: Any = None, *, min_rows: int = 1,
          historical: bool = False) -> dict[str, int]:
     """Upsert deals, keyed on accession.
@@ -956,14 +1040,7 @@ def load(deals: Iterable[Deal], con: Any = None, *, min_rows: int = 1,
     def q(sql: str) -> list[tuple]:
         return con.execute("SELECT * FROM postgres_query('pg', ?)", [sql]).fetchall()
 
-    def lit(v: Any) -> str:
-        if v is None:
-            return "null"
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        if isinstance(v, Decimal):
-            return str(v)
-        return "'" + str(v).replace("'", "''") + "'"
+    lit = _lit
 
     before = q("select count(*) from deals")[0][0]
     for chunk in (rows[i:i + 100] for i in range(0, len(rows), 100)):
@@ -1071,6 +1148,7 @@ def filings_for_cik(
     client: httpx.Client | None = None,
     pacer: Pacer | None = None,
     since: date | None = None,
+    target_side: list[TargetFiling] | None = None,
 ) -> Iterator[Filing]:
     """Every deal-item 8-K a CIK ever filed, newest first.
 
@@ -1080,13 +1158,26 @@ def filings_for_cik(
     one found by walking a daily index. Two populations that had to agree would
     otherwise drift.
 
-    **Why by CIK at all.** A company that stopped filing in 2021 is thinly
-    represented in a day sweep -- it existed for a third of the years the sweep
-    covers -- and it is exactly the population an acquisition study needs. Asking
-    EDGAR for one company's history is a single request; finding the same filings
-    by walking eleven years of daily indexes is about fifty thousand. The CIK
-    list comes from the point-in-time filer universe, which is the thing that
-    knows these companies existed at all.
+    **Why by CIK at all, measured 2026-09-10.** Two reasons, and the second
+    turned out to matter far more.
+
+    A company that stopped filing in 2021 is thinly represented in a day sweep --
+    it existed for a third of the years the sweep covers -- and it is exactly the
+    population an acquisition study needs. The CIK list comes from the
+    point-in-time filer universe, which is the thing that knows these companies
+    existed at all.
+
+    And the submissions JSON carries the **items** field. A day sweep has to
+    fetch ``-index-headers.html`` for every 8-K it sees just to learn whether the
+    filing has Item 1.01 or 2.01 -- about 35 requests a day before a single body
+    is read. One re-swept month ran past fifteen minutes, putting a full
+    eleven-year re-sweep near thirty hours. By CIK the items arrive with the
+    filing list, so the whole universe is ~11,000 requests plus the deal-item
+    bodies: under an hour. Forty times cheaper for the same rows, because the
+    expensive request answers a question the cheap one already answered.
+
+    ``target_side`` is filled from the same JSON, so discovering the merger
+    proxies costs nothing either.
     """
     archives = manifest.get("edgar", "archives").location
     url = manifest.get("sec_submissions", "company").location.format(
@@ -1112,6 +1203,21 @@ def filings_for_cik(
             recent.get("filingDate") or (),
         ))
         for accession, form, items, filed_text in rows:
+            if form in TARGET_SIDE_FORMS and target_side is not None:
+                try:
+                    filed = date.fromisoformat(filed_text)
+                except (TypeError, ValueError):
+                    continue
+                if since is not None and filed < since:
+                    continue
+                bare = accession.replace("-", "")
+                target_side.append(TargetFiling(
+                    accession=accession, cik=str(cik).lstrip("0"),
+                    company=company, form=form, filed_date=filed,
+                    url=(f"{archives}/edgar/data/{str(cik).lstrip('0')}/"
+                         f"{bare}/{accession}.txt"),
+                ))
+                continue
             if form not in CIK_FORMS:
                 continue
             # The JSON's `items` is a comma-joined string. Filtered here so a
@@ -1160,6 +1266,7 @@ def fetch_for_ciks(
     read_exhibits: bool = True,
     since: date | None = None,
     on_progress: Any = None,
+    target_side: list[TargetFiling] | None = None,
 ) -> list[Deal]:
     """Deal candidates for a list of CIKs, by asking EDGAR about each one.
 
@@ -1175,7 +1282,8 @@ def fetch_for_ciks(
         for index, cik in enumerate(ciks):
             found_here = 0
             for filing in filings_for_cik(cik, client=con, pacer=pacer,
-                                          since=since):
+                                          since=since,
+                                          target_side=target_side):
                 if not filing.primary:
                     log.warning("%s has no primary document", filing.accession)
                     continue
@@ -1210,3 +1318,77 @@ def fetch_for_ciks(
         if owns:
             con.close()
     return out
+
+
+def load_target_filings(
+    filings: Iterable[TargetFiling], con: Any = None, *, min_rows: int = 0
+) -> dict[str, int]:
+    """Upsert discovered target-side filings. Keyed on accession.
+
+    ``on conflict (accession) do nothing``: a discovery row carries no derived
+    fields, so there is nothing to update and re-running a sweep must not churn
+    ``ingested_at``. That is the opposite choice from ``deals``, where the
+    classification genuinely improves between runs and the update is the point.
+
+    ``min_rows`` defaults to zero and that is deliberate rather than a weakened
+    assertion: a month can legitimately contain no merger proxy at all -- 2020q2
+    had weeks of none -- so a floor here would fail on a true answer. What is
+    asserted instead is the span, which catches the failure that matters: rows
+    whose dates did not parse.
+    """
+    # Deduplicated on accession before the write, the same as `load`: one day's
+    # index cannot list the same accession twice, but a range re-swept across a
+    # chunk boundary can.
+    from marketradar import storage
+
+    unique: dict[str, TargetFiling] = {}
+    for filing in filings:
+        unique[filing.accession] = filing
+    rows = list(unique.values())
+    con = con or storage.connect(attach_postgres=True)
+    if not storage.postgres_attached(con):
+        raise DealError("No Postgres attached; cannot upsert target filings.")
+
+    def ex(sql: str) -> None:
+        con.execute("CALL postgres_execute('pg', ?)", [sql])
+
+    def q(sql: str) -> list[tuple]:
+        return con.execute(
+            "SELECT * FROM postgres_query('pg', ?)", [sql]).fetchall()
+
+    before = q("select count(*) from target_filing")[0][0]
+    for chunk in (rows[i:i + 200] for i in range(0, len(rows), 200)):
+        values = ", ".join(
+            "({})".format(", ".join(_lit(v) for v in (
+                f.accession, f.cik, f.company, f.form,
+                f.filed_date.isoformat(), f.url, "edgar_daily_index",
+            )))
+            for f in chunk
+        )
+        ex(
+            "insert into target_filing (accession, cik, company, form, "
+            f"filed_date, url, source) values {values} "
+            "on conflict (accession) do nothing"
+        )
+    after = q("select count(*) from target_filing")[0][0]
+
+    if rows:
+        spans = con.sql(
+            "select * from (values "
+            + ", ".join(f"('{f.accession}', DATE '{f.filed_date.isoformat()}')"
+                        for f in rows)
+            + ") as t(accession, date)"
+        )
+        observed = assert_fresh(
+            "target_filing", spans, min_rows=max(min_rows, 1),
+            date_column=None, expect_cols=("accession", "date"),
+        )
+        newest = spans.query("s", "select max(date) from s").fetchone()[0]
+        if newest is None or newest > utc_today():
+            raise StaleDataError(
+                f"target_filing: {observed.row_count:,} rows with a newest date "
+                f"of {newest}, which is not a date in the past. Check the "
+                "index parsing."
+            )
+    return {"discovered": len(rows), "before": before, "after": after,
+            "inserted": after - before}

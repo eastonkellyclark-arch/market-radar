@@ -130,15 +130,20 @@ def fetch(
     work.mkdir(parents=True, exist_ok=True)
 
     zip_path = root / f"{quarter}.zip"
-    downloaded = False
-    if not zip_path.exists() or zip_path.stat().st_size < 1_000_000:
-        _download(quarter, zip_path, client=client)
-        downloaded = True
-
     paths = {name: work / f"{quarter}_{name}.txt" for name in tables}
     missing = [name for name, path in paths.items()
                if not path.exists() or path.stat().st_size == 0]
+
+    # The extracts are checked **before** the zip, so a quarter whose tables are
+    # already unpacked needs neither the zip nor the network. That ordering is
+    # the point of keeping sub.txt after a load: the filer universe rebuilds from
+    # 1.8 MB a quarter with the 110 MB zips deleted, and the other way round it
+    # would quietly re-download 3 GB to read files that were already there.
+    downloaded = False
     if missing:
+        if not zip_path.exists() or zip_path.stat().st_size < 1_000_000:
+            _download(quarter, zip_path, client=client)
+            downloaded = True
         _extract(zip_path, quarter, work, missing)
 
     for name, path in paths.items():

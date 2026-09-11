@@ -1422,6 +1422,92 @@ work queue of 445 filings whose top three suggested fixes were revenue tags:
 sorted, plausible, and meaningless. What a filer puts at the top of its income
 statement is evidence about revenue and about nothing else.
 
+#### The target-side forms: measured 2026-09-10, before building on them
+
+`deals` reads 8-K Items 1.01 and 2.01 and **nothing else** — `FORM_TYPES` was
+`("8-K", "8-K/A")` — so six of the seven watched form types in CLAUDE.md had
+never been swept. "We cannot see the target side" was half a data limitation and
+half a missing sweep.
+
+**What exists.** 120 sampled filers from the deal-multiples population; 64% have
+at least one target-side form.
+
+| form | share of filers | what it is |
+|---|---|---|
+| S-4 / S-4A | 33% | stock-merger registration, carrying the target's financials |
+| **DEFM14A** | **27%** | the merger proxy, filed by the target |
+| PREM14A | 18% | its preliminary version |
+| SC TO-T | 10% | third-party tender offer |
+| SC TO-I | 8% | issuer tender offer |
+| SC 13E3 | 4% | going-private |
+
+**The trap in that table**: `DEF 14A` is on 96% of these filers and `DEFA14A` on
+93%. They are the routine annual-meeting proxy and its supplements — the two most
+common forms in the sample are the two least relevant, and sweeping them would
+multiply the population twenty-fold and add no merger disclosure.
+
+**What a DEFM14A actually contains.** Opened one (Tetraphase Pharmaceuticals,
+2020-04-24): **1.26 million characters** of visible text, 2.6 MB of HTML — twenty
+to forty times an 8-K body. Present and located by heading: Opinion of Financial
+Advisor, Selected Public Companies Analysis, Selected Precedent Transaction
+Analysis, Discounted Cash Flow Analysis, Premiums Paid Analysis, Background of
+the Merger, and management's prospective financial information.
+
+**What is extractable, honestly.** Section *presence* is reliable — the headings
+are standardised by market practice. Specific figures are **not** reliable by
+regex: nine probes hit three. The exchange ratio came out (0.6303 AcelRx shares
+per Tetraphase share) and an EV/Revenue exit multiple range (2.25x–2.75x); the
+discount-rate range, implied per-share range and premium did not, and two
+"misses" were correct absences — a stock deal has no cash price per share, and a
+pre-revenue biotech has no EBITDA. The valuable content is in HTML tables
+formatted per investment bank.
+
+So a DEFM14A reader is **locate the section deterministically, then extract with
+the cheap LLM tier** — which is what `llm/router.py` exists for, since
+"classification and extraction go to local Ollama or Groq". A located section is
+5–20k characters, which fits; the whole document does not.
+
+**Four things it adds that nothing else here has.** The first is the one that
+matters most for multiples:
+
+1. **The merger consideration, stated unambiguously by the company being bought.**
+   This is the fix for the residual error in deal multiples — Dean Foods showing
+   a $48M liquidation asset sale, Anixter showing $400M against a $4.5B deal.
+2. **Management projections.** Forward revenue and EBITDA. Nothing else in this
+   system has a forward estimate of any kind.
+3. **The banker's comps and precedent transactions, with multiples** — someone
+   else's multiples table, which is both a cross-check and a source of EV/EBITDA
+   where we have no EBITDA.
+4. **Premiums paid.** The takeout premium, stated. CLAUDE.md records that a
+   forward-return study keyed on our price history can *never* measure a takeout
+   premium, because completing a deal delists the target. The proxy states it
+   outright — a partial answer to something recorded as unmeasurable.
+
+**Cost.** ~500 proxies over the 1,852 filers in the multiples population, ~1.3 GB
+of fetching. Discovery is free: the submissions JSON and the daily index both
+list every form, so `target_filing` is populated by the sweep that was already
+happening. Reading them is the separate job.
+
+#### The re-sweep, and why it goes by CIK
+
+The stored table was written by an earlier classifier: on 2022-01-19 the current
+one finds 7 candidates where the table held 3.
+
+A day sweep has to fetch `-index-headers.html` for **every** 8-K it sees just to
+learn whether the filing carries Item 1.01 or 2.01 — about 35 requests a day
+before a single body is read. One re-swept month ran past fifteen minutes,
+putting a full eleven-year re-sweep near **thirty hours**.
+
+The submissions JSON carries the `items` field. By CIK, the items arrive with the
+filing list, so the cost is one request per company plus the deal-item bodies:
+**~8 hours for all 11,323 filers in the universe**, four times cheaper for the
+same rows. The expensive request was answering a question the cheap one already
+answered.
+
+And it loses nothing: **100% of the 12,103 stored deal rows have a filer in the
+universe**, so a CIK sweep re-extracts every one of them. That is what makes this
+a re-sweep rather than a sample.
+
 #### The point-in-time universe is two things, and only one was a purchase
 
 Recorded 2026-09-10, because the two halves wear one name and the project has

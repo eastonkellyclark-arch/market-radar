@@ -275,6 +275,13 @@ def build_parser() -> argparse.ArgumentParser:
                          help="last day to read (default: today)")
     p_deals.add_argument("--days", type=int, default=5, metavar="N",
                          help="how many days back to read (default 5)")
+    p_deals.add_argument("--from", dest="from_date", type=_iso_date,
+                         metavar="YYYY-MM-DD",
+                         help="re-sweep from this day to --date, chunked and "
+                              "checkpointed. The plain --days form holds every "
+                              "candidate in memory and stores once at the end, "
+                              "which is right for five days and loses everything "
+                              "for two thousand")
     p_deals.add_argument(
         "--no-exhibits", action="store_true",
         help="skip the press-release fetch. Body-only value coverage was 68%% "
@@ -1353,6 +1360,79 @@ def _filer_universe(con: Any) -> Any:
     return filers.build(con, quarters)
 
 
+def _cmd_deals_range(args: argparse.Namespace) -> int:
+    """Re-sweep a date range, chunked and checkpointed.
+
+    The stored table was written by an earlier version of the extractor: on
+    2022-01-19 the current one finds 7 candidates where the table holds 3, and
+    everything downstream reads the stale rows. So a re-sweep is not a backfill
+    of missing days -- every business day 2016-2026 was already visited -- it is
+    a re-extraction of days that were visited with worse code.
+
+    Chunked by month because the work list has to be stable across resumes:
+    Checkpoint refuses a checkpoint whose chunk count changed, which is the guard
+    against resuming against a different range.
+    """
+    from datetime import timedelta as _td
+
+    from marketradar import storage
+    from marketradar.checkpoint import Checkpoint
+    from marketradar.clock import market_today
+    from marketradar.signals import deals
+
+    end = args.date or market_today()
+    start = args.from_date
+    if start > end:
+        print(f"mr deals: --from {start} is after {end}", file=sys.stderr)
+        return EXIT_ERROR
+
+    # One chunk per calendar month. Months rather than a fixed day count so the
+    # chunk boundaries do not move when the range does.
+    months: list[tuple[date, date]] = []
+    cursor = date(start.year, start.month, 1)
+    while cursor <= end:
+        nxt = date(cursor.year + (cursor.month == 12),
+                   cursor.month % 12 + 1, 1)
+        months.append((max(cursor, start), min(nxt - _td(days=1), end)))
+        cursor = nxt
+
+    book = Checkpoint.load_or_create(
+        f"deals_range_{start:%Y%m%d}_{end:%Y%m%d}",
+        run_id=f"{start}_{end}", total_chunks=len(months),
+    )
+    pending = book.pending()
+    print(f"re-sweeping {start} to {end}: {len(months)} months, "
+          f"{book.done_count} already done, {len(pending)} to go")
+    if not pending:
+        print("nothing to do")
+        return EXIT_OK
+
+    con = storage.connect()
+    before = int(con.execute(
+        f"select count(*) from {storage.PG_ALIAS}.deals").fetchone()[0])
+    total_found = total_new = 0
+    for index in pending:
+        lo, hi = months[index]
+        found = deals.fetch(lo, hi, read_exhibits=not args.no_exhibits)
+        total_found += len(found)
+        new = 0
+        if found and not args.no_load:
+            # Historical by construction for anything but the current month.
+            stats = deals.load(found, historical=hi < market_today())
+            new = stats["inserted"]
+            total_new += new
+        print(f"  {lo:%Y-%m}  {len(found):>4} candidates  {new:>4} new")
+        book.mark_done(index, month=f"{lo:%Y-%m}", candidates=len(found),
+                       inserted=new)
+    after = int(con.execute(
+        f"select count(*) from {storage.PG_ALIAS}.deals").fetchone()[0])
+    print(f"\n{total_found:,} candidates, {total_new:,} new rows; "
+          f"table {before:,} -> {after:,}")
+    print(f"{total_proxies:,} target-side filings discovered "
+          "(merger proxies, tender offers, S-4s)")
+    return EXIT_OK
+
+
 def _cmd_deals_by_cik(args: argparse.Namespace) -> int:
     """Sweep deal filings for the filers the day sweep has least of.
 
@@ -1406,24 +1486,33 @@ def _cmd_deals_by_cik(args: argparse.Namespace) -> int:
         print("nothing to do")
         return EXIT_OK
 
-    total_found = 0
+    total_found = total_proxies = 0
     for index in pending:
         batch = chunks[index]
+        # The merger proxies and tender offers come out of the same submissions
+        # JSON as the 8-K list, so discovering them costs no extra request.
+        proxies: list = []
         found = deals.fetch_for_ciks(
-            batch, read_exhibits=not args.no_exhibits, since=since)
+            batch, read_exhibits=not args.no_exhibits, since=since,
+            target_side=proxies)
         total_found += len(found)
-        inserted = 0
-        after = 0
-        if found and not args.no_load:
-            # Historical: these filings are years old by construction, so the
-            # wall-clock contract would reject every batch.
-            stats = deals.load(found, historical=True)
-            inserted, after = stats["inserted"], stats["after"]
+        total_proxies += len(proxies)
+        inserted = new_proxies = after = 0
+        if not args.no_load:
+            if found:
+                # Historical: these filings are years old by construction, so
+                # the wall-clock contract would reject every batch.
+                stats = deals.load(found, historical=True)
+                inserted, after = stats["inserted"], stats["after"]
+            if proxies:
+                new_proxies = deals.load_target_filings(proxies)["inserted"]
         print(f"  chunk {index + 1:>3}/{len(chunks)}  {len(batch):>3} filers  "
-              f"{len(found):>4} candidates  {inserted:>4} new"
+              f"{len(found):>4} candidates  {inserted:>4} new  "
+              f"{len(proxies):>4} target-side  {new_proxies:>4} new"
               + (f"  {after:,} in table" if after else ""))
         book.mark_done(index, filers=len(batch), candidates=len(found),
-                       inserted=inserted)
+                       inserted=inserted, proxies=len(proxies),
+                       proxies_new=new_proxies)
     print(f"\n{total_found:,} candidates from {len(pending) * args.chunk:,} "
           "filers swept this run")
     return EXIT_OK
@@ -1444,6 +1533,8 @@ def _cmd_deals(args: argparse.Namespace) -> int:
 
     if getattr(args, "targets", None):
         return _cmd_deals_by_cik(args)
+    if getattr(args, "from_date", None):
+        return _cmd_deals_range(args)
 
     end = args.date or market_today()
     start = end - timedelta(days=args.days - 1)
