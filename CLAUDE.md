@@ -59,7 +59,7 @@ knows nothing about any other source.
 
 ```bash
 uv sync                             # install
-uv run pytest                       # tests
+uv run pytest                       # tests (npm ci first, for the DOM suite)
 uv run mr prices --date 2026-09-03  # single source, one date
 uv run mr screens                   # rebuild screens from local data
 uv run mr digest --dry-run          # render email, don't send
@@ -251,6 +251,10 @@ next provider. Six free tiers means six things that can change without notice.
 - Dates as `date` objects, never strings, outside of I/O boundaries
 - Embeddings: 256 dimensions, stored as `halfvec`
 - New dependencies need a reason — Actions install time is real
+- Node and jsdom are a **test-only** dependency, for running the dashboard's
+  inline script in a real DOM rather than asserting on its source text. Nothing
+  in `src/` touches node and neither data job does; `tests.yml` installs it
+  because `tests/test_dashboard_js.py` fails rather than skips without it
 
 ---
 

@@ -44,8 +44,9 @@ htmlcov/
 # --- node: test support only ----------------------------------------------
 # jsdom, so the suite can run the dashboard's inline script in a real DOM.
 # package.json and package-lock.json are committed; the tree is not. Nothing
-# in src/ or .github/workflows/ touches node -- the dashboard has no build
-# step and ships as one file.
+# in src/ touches node and neither data job does -- the dashboard has no build
+# step and ships as one file. The only workflow that installs it is tests.yml,
+# which runs the suite.
 node_modules/
 
 # --- editors and os -------------------------------------------------------

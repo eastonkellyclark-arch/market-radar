@@ -1,0 +1,103 @@
+name: tests
+
+# The suite, on every push. This did not exist until 2026-09-10: `prices` and
+# `digest` are data jobs and neither one runs pytest, so nothing ran the tests
+# anywhere but a laptop.
+#
+# It is here now because the suite grew a check that needs a second toolchain.
+# tests/test_dashboard_js.py runs the dashboard's inline script in jsdom and
+# **fails rather than skips** when node is missing -- deliberately, because a
+# skipped test reports the same green as a passing one to anybody reading a
+# summary line, and green-without-looking is the exact failure that file was
+# written to stop. That choice is only honest if the runner is actually given
+# node and `npm ci`. Red on a runner that was never set up is a broken build,
+# not a caught bug.
+#
+# No secrets, and none needed: every test works with no network, no
+# credentials and no Supabase -- tests/conftest.py clears the credential
+# variables that would change behaviour if they happened to be set.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # Per ref, and cancel: unlike the price sweep there is no checkpoint to
+  # protect here, and a superseded run on the same branch is wasted minutes.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node is test-only. The dashboard has no build step and still ships as
+      # one static HTML file with an inline script; nothing in src/ or in the
+      # two scheduled data jobs touches node. This is here so the suite can
+      # run that script in a real DOM instead of asserting on its source text.
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install jsdom
+        # `npm ci` rather than `npm install`: the lockfile is committed and a
+        # test dependency that drifts between the laptop and the runner would
+        # make a DOM failure unreproducible in the one place it matters.
+        run: npm ci
+
+      - name: Install uv
+        # setup-uv publishes floating major tags only up to v7, so the Node 24
+        # line is pinned to an exact patch. Same pin as the other workflows.
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Verify the DOM toolchain
+        # Checked before pytest so a broken install says so in one line here,
+        # instead of arriving as twenty red tests about the dashboard.
+        run: |
+          set -euo pipefail
+          node --version
+          node -e "require.resolve('jsdom'); console.log('jsdom resolves')"
+
+      - name: Tests
+        id: pytest
+        run: uv run pytest
+
+      - name: Confirm the DOM suite actually ran
+        # The guard on the guard. The toolchain check above proves node works
+        # and `uv run pytest` proves the suite passed, and neither proves the
+        # jsdom tests were *collected* -- a renamed or moved file would leave
+        # this workflow green with the browser-side checks silently gone,
+        # which is the same shape as the bug they exist to catch.
+        run: |
+          set -euo pipefail
+          n=$(uv run pytest tests/test_dashboard_js.py --collect-only -q \
+                | sed -n 's/^tests\/test_dashboard_js.py: \([0-9]*\)$/\1/p')
+          echo "collected ${n:-0} DOM tests"
+          test "${n:-0}" -ge 15
+
+      - name: Summary
+        if: success() || failure()
+        run: |
+          {
+            echo "### tests"
+            echo ""
+            echo "- outcome: \`${{ steps.pytest.outcome }}\`"
+            echo "- node: \`$(node --version)\`"
+          } >> "$GITHUB_STEP_SUMMARY"

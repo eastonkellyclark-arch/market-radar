@@ -472,6 +472,33 @@ Two properties hold it together, and both were learned by breaking them:
   panel's in-page state — a checked gate, a sort order — which is the price of
   re-injection and is worth it at this size.
 
+#### The page is tested by running it
+
+659 tests were green on a page where no tab worked and the ticker script died
+on its first statement with a `ReferenceError`. Every one asserted on the
+*text* of the generated HTML — the markup said `data-axis="band"`, the script
+said `addEventListener`, and nothing anywhere ran the two together. Three
+breakages hid in that gap at once.
+
+So `tests/test_dashboard_js.py` loads the rendered page in jsdom, with the
+scripts running, and drives it with real click events; the assertions are about
+what *changed*. Two origins, because a `file://` page is an opaque origin where
+`localStorage` throws outright and a guard nothing exercises is a guess.
+
+Two rules keep it honest, and both are the same rule:
+
+- **Missing tooling fails, never skips.** A skipped test reports the same green
+  as a passing one to anyone reading a summary line.
+- **So CI has to supply the tooling.** `.github/workflows/tests.yml` exists for
+  that — it is also the first workflow to run the suite at all, since `prices`
+  and `digest` are data jobs. Red on a runner that was never given `npm ci` is
+  a broken build, not a caught bug. A step there also asserts the DOM tests
+  were *collected*, because a renamed file would otherwise leave the workflow
+  green with the browser-side checks silently gone.
+
+Node is test-only. Nothing in `src/` touches it and neither data job does: the
+dashboard has no build step and still ships as one static file.
+
 The screens panel is **two tab axes** rather than twenty-four stacked
 collapsibles: security type and price band, which are the two axes a list is
 in exactly one of. Direction is deliberately not an axis — gainers and losers

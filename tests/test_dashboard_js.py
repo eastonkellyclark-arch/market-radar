@@ -18,8 +18,11 @@ run.** `test_the_probe_ran_at_all` is the guard on that, and a missing node or
 jsdom is a failure with the command to fix it, never a skip. A skipped test is
 the same green-without-looking that made this file necessary.
 
-Install with `npm ci`. Nothing in `src/` or `.github/workflows/` touches node:
-the dashboard has no build step and ships as one static file.
+Install with `npm ci`. Node is test-only: nothing in `src/` touches it and
+neither scheduled data job does -- the dashboard has no build step and still
+ships as one static file. `.github/workflows/tests.yml` installs it, because
+the failure-rather-than-skip rule above is only honest on a runner that was
+actually given the toolchain.
 """
 
 from __future__ import annotations
@@ -260,7 +263,7 @@ def _require_toolchain() -> str:
         pytest.fail(
             "jsdom is not installed, so the dashboard's script was never run. "
             "Run `npm ci` in the repo root. It is a test-only dependency: "
-            "nothing in src/ or .github/workflows/ touches node."
+            "nothing in src/ touches node and neither data job does."
         )
     return node
 
