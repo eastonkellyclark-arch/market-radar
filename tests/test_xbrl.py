@@ -1035,3 +1035,26 @@ def test_every_declared_partition_is_a_real_quarter() -> None:
     assert declared == sorted(
         fetch_mod.quarters(declared[0], declared[-1])), (
         "the declared partitions have a gap in them")
+
+
+def test_the_matrix_ignores_another_dataset_in_the_same_directory(
+    tmp_path, monkeypatch, con
+) -> None:
+    """The filer universe is written beside the partitions, so the reader has to
+    glob the dataset prefix and not ``*.parquet``.
+
+    Found by doing it wrong: a scratch script globbed everything, unioned
+    ``sec_filers.parquet`` into the fundamentals, and DuckDB reported a missing
+    ``period_end`` column. That is the *lucky* version -- two datasets that
+    happened to share a column set would have unioned silently.
+    """
+    out = _load_two(tmp_path, monkeypatch, con)
+    duckdb.connect().execute(
+        "copy (select 1 as cik, 'X' as company) to ? (format parquet)",
+        [(out / "sec_filers.parquet").as_posix()],
+    )
+    quarters, rows = resolve.coverage_matrix(duckdb.connect(), out)
+    assert quarters == ["2019q1", "2019q2"], (
+        "a neighbouring dataset was read as a partition"
+    )
+    assert {r["concept"] for r in rows} == set(tag_map.CONCEPTS)

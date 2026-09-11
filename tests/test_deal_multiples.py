@@ -284,11 +284,14 @@ def test_every_stage_carries_a_reason() -> None:
     assert res.funnel.stages[0].name == "deal candidates"
 
 
-def test_the_collapse_is_marked_and_says_it_is_the_population() -> None:
-    """The identity stage removes nearly everything on real data, and the
-    funnel marks it. The marking has to point at the deals population rather
-    than read as a filter that is too strict, or the next person loosens the
-    filter and the screen starts reporting division sales.
+def test_the_collapse_is_marked_and_says_it_is_meant_to() -> None:
+    """The identity stage removes nearly everything on real data -- 21 of 2,320
+    -- and the funnel marks it.
+
+    What the marking says matters. A 99% cut reads as a filter that is too
+    strict, and the next person loosens it; it has to say that the cut is the
+    point, because most 8-K deal filings are by companies that go on existing,
+    which is what an acquirer or a divesting parent is.
     """
     con = duckdb.connect()
     kept = [deal(f"m-{i}", f"000000{2000 + i}", f"CO {i}", date(2022, 6, 1))
@@ -305,7 +308,10 @@ def test_the_collapse_is_marked_and_says_it_is_the_population() -> None:
     assert "target identity confirmed" in collapsed
     stage = next(s for s in res.funnel.stages
                  if s.name == "target identity confirmed")
-    assert "survivorship" in stage.why
+    assert "meant to collapse" in stage.why, stage.why
+    assert "Loosening it" in stage.why, (
+        "the marking does not say what happens if the filter is relaxed"
+    )
 
 
 def test_an_empty_population_does_not_raise() -> None:
@@ -317,3 +323,92 @@ def test_an_empty_population_does_not_raise() -> None:
     assert res.rows == []
     assert res.coverage_to is None
     assert res.funnel.stages[0].remaining == 0
+
+
+# --- identity comes from the wide table, not the narrow one --------------
+
+
+def test_a_filer_that_left_the_narrow_table_is_not_treated_as_acquired() -> None:
+    """CleanSpark appeared as a 1.18x takeout. It is alive.
+
+    It had left the *fundamentals* table because its SIC moved into a financial
+    class the operating-company filter excludes, and "disappeared from the narrow
+    table" was being read as "stopped filing". Only the filer universe can tell
+    those apart, which is why it covers every form type and every SIC -- whether
+    a company still exists is a different question from whether its income
+    statement is comparable.
+    """
+    con = duckdb.connect()
+    setup(
+        con,
+        [deal("n-1", "0000001300", "RECLASSIFIED CO", date(2022, 6, 1), 900.0)],
+        annual("0000001300", date(2021, 12, 31))
+        + annual("0000000999", COVERAGE_TO),
+    )
+    # The wide table knows it kept reporting after the deal, under a SIC the
+    # fundamentals table does not carry.
+    con.execute("""
+        create or replace table sec_filers as select * from (values
+            ('0000001300', DATE '2025-12-31', DATE '2026-03-01', 'filing'),
+            ('0000000999', DATE '2026-03-31', DATE '2026-05-01', 'filing')
+        ) as t(cik, last_period, last_filed, status)
+    """)
+    res = dm.screen(con, today=TODAY)
+    assert res.identities.get(dm.ACQUIRED_WHOLE, 0) == 0, (
+        "a live company was reported as an acquisition target"
+    )
+    assert res.identities.get(dm.KEPT_FILING) == 1
+    assert res.rows == []
+
+
+def test_the_funnel_says_which_table_identity_came_from() -> None:
+    """The fallback is the weaker answer, so a reader has to be able to tell
+    which one produced the number in front of them."""
+    con = duckdb.connect()
+    setup(con, [deal("o-1", "0000001400", "A CO", date(2022, 6, 1))],
+          annual("0000001400", date(2021, 12, 31))
+          + annual("0000000999", COVERAGE_TO))
+
+    narrow = dm.screen(con, filers=None, today=TODAY)
+    stage = next(s for s in narrow.funnel.stages
+                 if s.name == "target appears in XBRL")
+    assert "narrower" in stage.why
+
+    con.execute("""
+        create or replace table sec_filers as select * from (values
+            ('0000001400', DATE '2021-12-31', DATE '2022-03-01', 'stopped'),
+            ('0000000999', DATE '2026-03-31', DATE '2026-05-01', 'filing')
+        ) as t(cik, last_period, last_filed, status)
+    """)
+    wide = dm.screen(con, today=TODAY)
+    stage = next(s for s in wide.funnel.stages
+                 if s.name == "target appears in XBRL")
+    assert "filer universe" in stage.why
+
+
+def test_a_later_deal_filing_by_the_same_target_excludes_the_earlier_one() -> None:
+    """One CIK in the real sample had twenty deal filings between 2019 and 2025 --
+    a stream of $1-31M transactions -- and every priced one read as a takeout
+    because its 10-K history had ended. It filed an 8-K in September 2025.
+
+    A company cannot be acquired twice, and a later filing is proof it outlived
+    the earlier transaction.
+    """
+    con = duckdb.connect()
+    setup(
+        con,
+        [deal("p-1", "0000001500", "SERIAL CO", date(2021, 6, 1), 10.0),
+         deal("p-2", "0000001500", "SERIAL CO", date(2023, 6, 1), 20.0)],
+        annual("0000001500", date(2020, 12, 31))
+        + annual("0000000999", COVERAGE_TO),
+    )
+    con.execute("""
+        create or replace table sec_filers as select * from (values
+            ('0000001500', DATE '2020-12-31', DATE '2021-03-01', 'stopped'),
+            ('0000000999', DATE '2026-03-31', DATE '2026-05-01', 'filing')
+        ) as t(cik, last_period, last_filed, status)
+    """)
+    res = dm.screen(con, today=TODAY)
+    # Only the last one can be the transaction that ended it.
+    assert [r.accession for r in res.rows] == ["p-2"]
+    assert res.identities.get(dm.KEPT_FILING) == 1

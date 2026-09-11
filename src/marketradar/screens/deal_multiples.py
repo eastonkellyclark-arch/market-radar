@@ -58,6 +58,24 @@ somewhere, so a recent deal has no "after" to look at. Those are
 :data:`TOO_RECENT` and are counted apart from both other answers, because
 folding them into "acquired whole" would admit exactly the cases that have not
 had time to contradict it.
+
+**And here is what the filing record cannot do, which matters more than what it
+can.** It establishes that a company stopped reporting. It does **not** establish
+*which of its filings was the transaction that ended it*, and the first version of
+this screen quietly assumed those were the same thing. One CIK in the sample had
+twenty deal filings between 2019 and 2025 -- a stream of $1-31M transactions --
+and every priced one read as a takeout because its 10-K history had ended. It had
+filed an 8-K in September 2025.
+
+Two guards follow, both from evidence already on hand: a later 10-K period means
+the filer is still reporting, and **a later deal filing by the same CIK means it
+existed after this transaction**. What remains is "the last stated deal value a
+company filed before it stopped reporting", which is a weaker claim than "the
+price it was acquired for" and is named as such wherever it is shown.
+
+Closing the gap properly needs the target-side forms -- DEFM14A, SC 13E-3,
+SC TO-T -- where a merger price is stated unambiguously by the company being
+bought. Those are in CLAUDE.md's watched set and are not swept by anything yet.
 """
 
 from __future__ import annotations
@@ -169,7 +187,7 @@ class Result:
     rows: list[Multiple]
     funnel: funnel_mod.Funnel
     #: ``{identity: count}`` over the population that had a pre-deal report, so
-    #: the 84% is visible rather than inferred from a shrinking list.
+    #: what was excluded is visible rather than inferred from a shrinking list.
     identities: dict[str, int]
     #: The newest period end in the loaded XBRL, which is what bounds
     #: :data:`TOO_RECENT`. Reported because the screen's answer moves when more
@@ -194,14 +212,29 @@ def screen(
     *,
     deals: str = "deals",
     fundamentals: str = "xb",
+    filers: str | None = "sec_filers",
     today: date | None = None,
 ) -> Result:
     """Multiples for every deal whose target can be identified exactly.
 
-    ``deals`` and ``fundamentals`` are relation names the caller has already
-    put in scope, so this function does no I/O and no manifest resolution --
-    the same shape as the volatility screen, and what lets it be tested on a
-    handful of rows.
+    Three relations, and the split between the last two is the point.
+    ``fundamentals`` supplies the *figures* and is deliberately narrow --
+    operating-company annual 10-Ks, because those are the statements that
+    compare. ``filers`` supplies *identity* and is deliberately wide -- every
+    form, every SIC -- because whether a company still exists is a different
+    question from whether its income statement is comparable.
+
+    Reading identity off the fundamentals instead was wrong in a way worth
+    recording. CleanSpark appeared as an acquired target at 1.18x revenue: it is
+    alive, and it had left the fundamentals table because its SIC moved into a
+    financial class the operating-company filter excludes. "Disappeared from the
+    narrow table" is not "stopped filing", and only the wide one can tell them
+    apart. That is the whole reason the filer universe covers every form type and
+    every SIC.
+
+    ``filers`` may be None, which falls back to the fundamentals for identity and
+    is the weaker answer; it exists so the screen still runs before a universe
+    has been built, and the funnel says which was used.
     """
     con.execute(f"""
         create or replace view dm_deals as
@@ -235,6 +268,27 @@ def screen(
          "and a division_sale is a business unit rather than a company"),
     ]
 
+    # Identity from the wide table where there is one. `last_period` is the
+    # newest fiscal period the filer reported *anything* for, across every form
+    # and every SIC.
+    using_universe = False
+    if filers:
+        try:
+            con.execute(
+                "create or replace view dm_filers as "
+                "select lpad(cast(cik as varchar), 10, '0') as cik10, "
+                f"last_period, last_filed, status from {filers}")
+            using_universe = True
+        except duckdb.Error:
+            log.warning("no filer universe in scope; identity falls back to the "
+                        "fundamentals table, which is narrower")
+    if not using_universe:
+        con.execute(
+            "create or replace view dm_filers as "
+            "select cik10, max(period_end) as last_period, "
+            "max(period_end) as last_filed, NULL as status "
+            "from dm_facts group by cik10")
+
     coverage_to = con.execute(
         "select max(period_end) from dm_facts").fetchone()[0]
 
@@ -250,19 +304,22 @@ def screen(
         spans as (
             select d.accession,
                    max(case when f.period_end < d.filed_date
-                            then f.period_end end)            as pre_end,
-                   max(f.period_end)                          as last_end
+                            then f.period_end end)            as pre_end
             from d join dm_facts f on f.cik10 = d.cik10
             group by d.accession
         )
-        select d.*, s.pre_end, s.last_end
-        from d left join spans s using (accession)
+        select d.*, s.pre_end, u.last_period as last_end, u.status as filer_status
+        from d
+        left join spans s using (accession)
+        left join dm_filers u using (cik10)
     """)
     stages.append((
         "target appears in XBRL", int(con.execute(
             "select count(*) from dm_matched where last_end is not null"
         ).fetchone()[0]),
-        "the loaded range starts at 2019q1; an older deal cannot match",
+        "the loaded range starts at 2019q1; an older deal cannot match"
+        + ("; identity from the filer universe" if using_universe
+           else "; identity from the fundamentals table, which is narrower"),
     ))
     stages.append((
         "has a pre-deal annual report", int(con.execute(
@@ -271,13 +328,34 @@ def screen(
         "point-in-time: what was knowable when the deal was announced",
     ))
 
+    # A company's own later filings are evidence it still exists, and the deals
+    # table carries its filing dates. This is the second half of the
+    # confirmation and it is what the first version was missing: one CIK in the
+    # sample had **twenty** deal filings between 2019 and 2025, a stream of $1-31M
+    # transactions, and every priced one read as a takeout because its *10-K*
+    # history had ended. It filed an 8-K in September 2025. It exists.
+    con.execute("""
+        create or replace table dm_later as
+        select a.accession,
+               max(b.filed_date) as last_deal_filing
+        from dm_deals a join dm_deals b
+          on lpad(cast(b.cik as varchar), 10, '0')
+             = lpad(cast(a.cik as varchar), 10, '0')
+        group by a.accession
+    """)
+
     # Identity, from the filing record rather than from prose.
     con.execute(f"""
         create or replace table dm_identity as
-        select m.*,
+        select m.*, l.last_deal_filing,
             case
                 when m.pre_end is null then NULL
+                -- A 10-K for a period after the deal: the filer is still
+                -- reporting, so what it sold was not the filer.
                 when m.last_end > m.pre_end then '{KEPT_FILING}'
+                -- Any later deal filing at all, by the same CIK: it existed
+                -- after this transaction, so this transaction did not end it.
+                when l.last_deal_filing > m.filed_date then '{KEPT_FILING}'
                 when DATE '{(today or date.today()).isoformat()}'
                      - m.filed_date < {CONFIRM_LAG.days}
                   or DATE '{(coverage_to or date(1900, 1, 1)).isoformat()}'
@@ -285,7 +363,7 @@ def screen(
                     then '{TOO_RECENT}'
                 else '{ACQUIRED_WHOLE}'
             end as identity
-        from dm_matched m
+        from dm_matched m left join dm_later l using (accession)
     """)
     identities = {
         row[0]: int(row[1]) for row in con.execute(
@@ -295,12 +373,13 @@ def screen(
     }
     stages.append((
         "target identity confirmed", identities.get(ACQUIRED_WHOLE, 0),
-        f"filed nothing after the deal. {identities.get(KEPT_FILING, 0):,} kept "
-        "filing, so they sold a division and their own revenue is the wrong "
-        f"denominator; {identities.get(TOO_RECENT, 0):,} are too recent to tell. "
-        "This stage collapsing is the survivorship bias in the deal "
-        "population, not a filter that is too strict -- see the module "
-        "docstring",
+        "the filer reported nothing after the deal and filed nothing after it. "
+        f"{identities.get(KEPT_FILING, 0):,} did one or the other, so the thing "
+        "sold was not the filer -- a division, or a transaction it outlived; "
+        f"{identities.get(TOO_RECENT, 0):,} are too recent to tell. **This stage "
+        "is meant to collapse**: most 8-K deal filings are by companies that go "
+        "on existing, which is what an acquirer or a divesting parent is. "
+        "Loosening it is how division sales get back in",
     ))
 
     # The figures, pivoted off the long table -- one column per concept asked

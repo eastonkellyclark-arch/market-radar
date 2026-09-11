@@ -1047,6 +1047,45 @@ no reason attached is the number nobody checks.
   arrived free with the XBRL load. Rebuilding the 8-K deal population against it
   is the next task and is a real sweep, not a query rewrite.
 
+  **Re-run against the rebuilt population, 2026-09-10.** The targeted sweep
+  (`mr deals --targets stopped`) took the deals table from 10,764 rows toward
+  ~13,500, and deal multiples from **10 rows to 21** at a quarter of the way
+  through — with a list that is now recognisably real takeouts rather than noise:
+  KEMET at 1.27x (Yageo, 2020), Tallgrass at 4.03x (Blackstone), Instructure at
+  7.74x (Thoma Bravo), AquaVenture at 5.41x (Culligan), Habit Restaurants at
+  0.80x (Yum!), Ra Pharmaceuticals at 700x (UCB — a correct multiple of a
+  meaningless denominator, being clinical-stage).
+
+  Getting there cost two corrections, both of which had produced plausible
+  output:
+
+  - **Identity must come from the wide table, not the narrow one.** CleanSpark
+    appeared as a 1.18x takeout. It is alive; it had left the *fundamentals*
+    table because its SIC moved into a financial class the operating-company
+    filter excludes. "Disappeared from the narrow table" is not "stopped
+    filing", and only the filer universe — every form, every SIC — tells them
+    apart. This is what that universe is *for*.
+  - **A company stopping is not the same as this filing being what stopped it.**
+    One CIK had twenty deal filings 2019–2025, a stream of $1–31M transactions,
+    and every priced one read as a takeout because its 10-K history had ended —
+    it filed an 8-K in September 2025. A later filing by the same CIK is proof it
+    outlived the earlier transaction, and is now a second guard.
+
+  What survives is **"the last stated deal value a company filed before it
+  stopped reporting, over its last reported revenue"** — weaker than "the price
+  it was acquired for", and named that way. Two residual error classes, both
+  visible in the output rather than silent:
+
+  - *Which filing was the takeout.* Dean Foods shows $48M over $7,329M of
+    revenue: it did cease, but that filing is a liquidation asset sale and not
+    the DFA purchase. Pier 1 is the same shape. Closing this needs the
+    target-side forms — DEFM14A, SC 13E-3, SC TO-T — where the company being
+    bought states the price unambiguously. They are in CLAUDE.md's watched set
+    and **nothing sweeps them**: `deals.FORM_TYPES` is `("8-K", "8-K/A")` alone.
+  - *Partial value extraction.* Anixter reported $400M against a $4.5B WESCO
+    deal before the identity guards removed it — the regex found a figure, just
+    not the one that mattered.
+
   Operating income is the other gap: EBITDA is the standard M&A denominator and
   operating income is the available proxy, measured at 91.3% and deferred out of
   the tag map's v1. Adding it is a map edit plus a re-resolve of the 30 quarters,
