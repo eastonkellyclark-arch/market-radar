@@ -486,6 +486,34 @@ Say which of the two problems it fixes, because they look alike:
 reports an outcome, and never describe such a result as "returns after a
 deal" when it is "returns after a deal, among companies that survived it".
 
+**The premium is unmeasurable from prices and is stated in the proxy.** Both
+halves are true and the second one changes what this system can answer.
+
+It remains true that our *price history* can never give a takeout premium: the
+premium is the move from the undisturbed price to the deal price, and completing
+a deal delists the target, so the bars that would measure it are the ones we do
+not have. No amount of identification fixes that — see the filer-universe note
+above on which half of a point-in-time universe came free.
+
+But a merger proxy **states the premium outright**, because the target's board
+has to justify the price to its own shareholders. `DEFM14A` carries a Premiums
+Paid Analysis on 27% of the deal-multiples population, and `signals/proxy.py`
+reads it. So:
+
+- A premium sourced from `proxy_figure` is **disclosed**, not computed, and
+  carries the accession, the section and the verbatim quote it came from.
+- A premium is still **never** derived from our price history, and a study that
+  wants one must read the proxy or report that it has none.
+- The two must not be mixed in a column. A disclosed premium exists for the
+  filings we have read and for no others, so its population is the proxies read
+  rather than the deals known — which is a different denominator, and the funnel
+  rule applies: say how many of which.
+
+The general shape, because it will recur: **"we cannot measure X" and "X is not
+disclosed anywhere" are different claims**, and this codebase had been treating
+the first as the second. Before recording something as unmeasurable, ask whether
+somebody is required to publish it.
+
 Watch for the second-order version too. A recycled ticker makes a dead
 company look alive — SGEN carries bars through 2026 because a different
 issuer took the symbol after Seagen was acquired in 2023. The 30-day anchor
