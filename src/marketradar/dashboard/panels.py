@@ -6,7 +6,7 @@ them two chances to disagree about what today's moves were.
 
 **The expansion policy is one function.** Twenty-four lists is more than
 anyone scans over coffee, so most open collapsed behind a header carrying the
-top row and a count. Which ones open is :func:`default_expanded` and nothing
+top row and a count. Which tab opens is :func:`default_tab` and nothing
 else -- it is expected to be wrong at first and to be changed after a week of
 actually reading it.
 
@@ -39,36 +39,40 @@ def _key(sl: volatility.ScreenList) -> tuple[str, str, str, str]:
     return (sl.security_type, sl.band, sl.direction, sl.liquidity)
 
 
-def default_expanded(
+def default_tab(
     lists: list[volatility.ScreenList],
-) -> set[tuple[str, str, str, str]]:
-    """Which lists are open on load.
+) -> tuple[str, str]:
+    """Which (security type, price band) tab opens on load.
 
-    Two that are always worth reading -- liquid $10+ gainers and losers --
-    plus whichever band actually moved today, so an unusual day in the sub-$1
-    band is not hidden behind a header on the one morning it matters.
+    Was ``default_expanded``, which chose which of 24 collapsibles started
+    open. The collapsibles are gone and the question survived intact: stock
+    $10+ is the pair always worth reading, *unless* another band actually
+    moved today -- so an unusual day in the sub-$1 band is not hidden behind a
+    tab on the one morning it matters, which is the same reason it was not
+    hidden behind a header before.
 
     A hypothesis, not a conclusion. Change this function; nothing else needs
     to know.
     """
-    open_keys = {
-        ("stock", "$10+", "gainers", "liquid"),
-        ("stock", "$10+", "losers", "liquid"),
-    }
+    default = ("stock", "$10+")
     # The loudest list, chosen from the liquid ones so the default view does
-    # not mix tradeable with untradeable. Collapsing hides nothing anyway --
-    # every closed header carries its own top row -- so this is about what
-    # opens, not about what is reachable.
+    # not open on something untradeable. Every other tab is one click away, so
+    # this is about what opens, not about what is reachable.
     populated = [sl for sl in lists if sl.rows and sl.liquidity == "liquid"]
     if not populated:
         populated = [sl for sl in lists if sl.rows]
-    if populated:
-        loudest = max(
-            populated,
-            key=lambda sl: max(abs(m.pct_move) for m in sl.rows),
-        )
-        open_keys.add(_key(loudest))
-    return open_keys
+    if not populated:
+        return default
+    loudest = max(populated, key=lambda sl: max(abs(m.pct_move) for m in sl.rows))
+    # Only defer to it when it beats what $10+ did; otherwise the default
+    # stands and the sub-$1 band does not win every quiet day by construction.
+    baseline = [sl for sl in populated
+                if (sl.security_type, sl.band) == default]
+    if baseline:
+        best = max(max(abs(m.pct_move) for m in sl.rows) for sl in baseline)
+        if max(abs(m.pct_move) for m in loudest.rows) <= best:
+            return default
+    return (loudest.security_type, loudest.band)
 
 
 # --- health -------------------------------------------------------------
@@ -177,15 +181,17 @@ def _list_html(
         if head else '<span class="peek empty">empty</span>'
     )
     body = "".join(_row_html(m, digest, fresh) for m in rows)
+    # A div, not <details>. Inside a tab the list is already the thing you
+    # asked for, and a collapsible that is always open is a row of chrome.
     return f"""
-      <details class="list" {"open" if is_open else ""}
-               data-sec="{_esc(sl.security_type)}" data-band="{_esc(sl.band)}"
-               data-dir="{_esc(sl.direction)}" data-liq="{_esc(sl.liquidity)}">
-        <summary>
+      <div class="list" data-sec="{_esc(sl.security_type)}"
+           data-band="{_esc(sl.band)}" data-dir="{_esc(sl.direction)}"
+           data-liq="{_esc(sl.liquidity)}" data-n="{len(sl.rows)}">
+        <header class="lhead">
           <span class="ltitle">{_esc(sl.title)}</span>
           <span class="count">{len(sl.rows)}</span>
           {peek}
-        </summary>
+        </header>
         <table class="rows">
           <thead><tr><th></th><th data-s="t">ticker</th><th>company</th>
             <th data-s="n" class="num">pct</th><th data-s="n" class="num">ticks</th>
@@ -193,14 +199,27 @@ def _list_html(
             <th></th></tr></thead>
           <tbody>{body}</tbody>
         </table>
-      </details>"""
+      </div>"""
 
 
 def screens_html(digest: Digest) -> str:
+    """The 24 lists as two tab axes, with gainers and losers side by side.
+
+    Twenty-four stacked collapsibles did not survive contact with fourteen
+    panels: finding one list meant scrolling past twenty-three, and the
+    default-expanded heuristic was a guess about which three mattered today.
+
+    The axes are the two that are mutually exclusive -- a list is either
+    stocks or ETFs, and it is in exactly one price band. Direction is *not* an
+    axis, because gainers and losers are read together: a name at the top of
+    one and the bottom of the other is the interesting case, and separating
+    them hides it. The $5M ADV gate is a toggle rather than a third axis for
+    the same reason the bands are kept apart in the first place -- it changes
+    which names qualify, not which question is being asked.
+    """
     lists = [sl for sl in digest.screen.lists if sl.rows]
     if not lists:
         return '<p class="empty">No moves. Run <code>mr prices</code>.</p>'
-    open_keys = default_expanded(lists)
     s = digest.screen
 
     # Shared with the digest and `mr screens` -- see volatility.caveats.
@@ -208,48 +227,123 @@ def screens_html(digest: Digest) -> str:
     if not digest.prior_day:
         notes.append("no prior session, so NEW is unavailable")
 
-    bands = sorted({sl.band for sl in lists})
+    bands = sorted({sl.band for sl in lists}, key=_band_order)
     secs = sorted({sl.security_type for sl in lists})
-    chips = "".join(
-        f'<button class="f" data-f="band" data-v="{_esc(b)}">{_esc(b)}</button>'
-        for b in bands
-    ) + "".join(
-        f'<button class="f" data-f="sec" data-v="{_esc(x)}">{_esc(x)}s</button>'
-        for x in secs
-    ) + '<button class="f" data-f="liq" data-v="liquid">&gt;$5M ADV</button>'
+    has_gated = any(sl.liquidity == "liquid" for sl in lists)
+    open_sec, open_band = default_tab(lists)
+    if open_sec not in secs:
+        open_sec = secs[0]
+    if open_band not in bands:
+        open_band = bands[0]
 
+    def count(sec: str, band: str) -> int:
+        return sum(len(sl.rows) for sl in lists
+                   if sl.security_type == sec and sl.band == band)
+
+    # `open_sec`/`open_band`, not `secs[0]`/`bands[0]`. The first version
+    # marked the alphabetically-first tab current and left default_tab's
+    # answer on the floor -- so the panel opened on etfs/$1-10, a combination
+    # that is routinely empty, and the policy function was dead code that
+    # every test of it still passed.
+    sec_tabs = "".join(
+        f'<button class="tab" data-axis="sec" data-v="{_esc(x)}"'
+        f'{" aria-current=\"true\"" if x == open_sec else ""}>'
+        f'{_esc(x)}s</button>' for x in secs)
+    band_tabs = "".join(
+        f'<button class="tab" data-axis="band" data-v="{_esc(b)}"'
+        f'{" aria-current=\"true\"" if b == open_band else ""}>'
+        f'{_esc(b)}<span class="count">{count(open_sec, b):,}</span></button>'
+        for b in bands)
+    gate = (
+        '<label class="toggle"><input type="checkbox" id="gate"> '
+        '&gt;$5M ADV only<span class="note"> &mdash; the liquidity gate, '
+        'applied in place</span></label>' if has_gated else "")
+
+    # Every list is rendered; the script shows the two that match. Open by
+    # default and not a <details>: inside a tab there is nothing to collapse.
+    blocks = "".join(_list_html(sl, digest, True) for sl in lists)
     return f"""
       <p class="note">{s.moves_screened:,} moves screened for
-        {s.day.isoformat()}.</p>
+        {s.day.isoformat()}. Gainers and losers are shown together because a
+        name near the top of one and the bottom of the other is the case
+        worth seeing.</p>
       {_notes_html(notes)}
-      <div class="filters">{chips}
-        <button class="f reset" data-f="reset">all</button></div>
-      {''.join(_list_html(sl, digest, _key(sl) in open_keys) for sl in lists)}"""
+      <div class="tabs" data-axis-row="sec">{sec_tabs}</div>
+      <div class="tabs" data-axis-row="band">{band_tabs}</div>
+      {gate}
+      <div class="pair" id="pair">{blocks}</div>
+      <p class="empty" id="pair-empty" hidden>No list for that combination.</p>"""
+
+
+#: Bands sort by price, not alphabetically: "$1-10" before "$10+" before
+#: "sub-$1" is nobody's reading order.
+_BAND_RANK: Final[dict[str, int]] = {"sub-$1": 0, "$1-10": 1, "$10+": 2}
+
+
+def _band_order(band: str) -> tuple[int, str]:
+    return (_BAND_RANK.get(band, 99), band)
 
 
 #: Sort and filter only. Kept small and inline on purpose: the file has to
 #: stay one file that opens from disk with no server and no build step.
 SCRIPT: Final[str] = """
-(function () {
-  var on = {};
-  function apply() {
-    document.querySelectorAll('details.list').forEach(function (d) {
-      var ok = Object.keys(on).every(function (k) { return d.dataset[k] === on[k]; });
-      d.hidden = !ok;
+/* Registered as a binder rather than run once at load.
+
+   With one panel in the DOM at a time, a script that queried `document` on
+   DOMContentLoaded bound to elements that had not been injected yet and
+   silently did nothing. Each binder takes the freshly injected root and is
+   re-run after every panel switch; the old elements are gone with the old
+   innerHTML, so re-binding cannot double up. */
+(window.__MR_BINDERS__ = window.__MR_BINDERS__ || []).push(
+  function (root) {
+  /* Tabs. Two axes, both mutually exclusive, so the state is two strings
+     rather than a set of filters. Gainers and losers are deliberately not an
+     axis: both matching lists are shown together. */
+  var tabs = root.querySelectorAll('.tabs');
+  if (tabs.length) {
+    var pick = {};
+    root.querySelectorAll('.tabs .tab[aria-current]').forEach(function (b) {
+      pick[b.dataset.axis] = b.dataset.v;
     });
-  }
-  document.querySelectorAll('button.f').forEach(function (b) {
-    b.addEventListener('click', function () {
-      if (b.dataset.f === 'reset') { on = {}; }
-      else if (on[b.dataset.f] === b.dataset.v) { delete on[b.dataset.f]; }
-      else { on[b.dataset.f] = b.dataset.v; }
-      document.querySelectorAll('button.f').forEach(function (o) {
-        o.classList.toggle('sel', on[o.dataset.f] === o.dataset.v);
+    var gate = root.querySelector('#gate');
+    var empty = root.querySelector('#pair-empty');
+    function apply() {
+      var shown = 0;
+      root.querySelectorAll('div.list').forEach(function (d) {
+        var ok = d.dataset.sec === pick.sec && d.dataset.band === pick.band;
+        if (ok && gate && gate.checked) { ok = d.dataset.liq === 'liquid'; }
+        else if (ok && gate && !gate.checked) { ok = d.dataset.liq !== 'liquid'; }
+        d.hidden = !ok;
+        if (ok) { shown++; }
       });
-      apply();
+      if (empty) { empty.hidden = shown > 0; }
+      /* Per-tab counts follow the chosen security type, so the number on a
+         band tab is the number you get when you press it. */
+      root.querySelectorAll('.tabs .tab[data-axis="band"]').forEach(function (b) {
+        var c = b.querySelector('.count');
+        if (!c) { return; }
+        var n = 0;
+        root.querySelectorAll('div.list').forEach(function (d) {
+          if (d.dataset.sec === pick.sec && d.dataset.band === b.dataset.v) {
+            n += parseInt(d.dataset.n || '0', 10);
+          }
+        });
+        c.textContent = n.toLocaleString();
+      });
+    }
+    root.querySelectorAll('.tabs .tab').forEach(function (b) {
+      b.addEventListener('click', function () {
+        pick[b.dataset.axis] = b.dataset.v;
+        root.querySelectorAll('.tabs .tab[data-axis="' + b.dataset.axis + '"]')
+          .forEach(function (o) { o.removeAttribute('aria-current'); });
+        b.setAttribute('aria-current', 'true');
+        apply();
+      });
     });
-  });
-  document.querySelectorAll('table.rows thead th[data-s]').forEach(function (th) {
+    if (gate) { gate.addEventListener('change', apply); }
+    apply();
+  }
+  root.querySelectorAll('table.rows thead th[data-s]').forEach(function (th) {
     th.addEventListener('click', function () {
       var table = th.closest('table');
       var i = Array.prototype.indexOf.call(th.parentNode.children, th);
@@ -270,7 +364,7 @@ SCRIPT: Final[str] = """
       rows.forEach(function (r) { body.appendChild(r); });
     });
   });
-})();
+});
 """
 
 
@@ -371,15 +465,23 @@ def clusters_html(rows: list[dict[str, Any]], role: str, floor: int) -> str:
 #: Filing-feed filtering and the cluster floor. Kept with the other inline
 #: script: one file, no build step.
 FEED_SCRIPT: Final[str] = """
-(function () {
+/* Registered as a binder rather than run once at load.
+
+   With one panel in the DOM at a time, a script that queried `document` on
+   DOMContentLoaded bound to elements that had not been injected yet and
+   silently did nothing. Each binder takes the freshly injected root and is
+   re-run after every panel switch; the old elements are gone with the old
+   innerHTML, so re-binding cannot double up. */
+(window.__MR_BINDERS__ = window.__MR_BINDERS__ || []).push(
+  function (root) {
   var form = null;
-  document.querySelectorAll('button.f[data-f="form"]').forEach(function (b) {
+  root.querySelectorAll('button.f[data-f="form"]').forEach(function (b) {
     b.addEventListener('click', function () {
       form = (form === b.dataset.v) ? null : b.dataset.v;
-      document.querySelectorAll('button.f[data-f="form"]').forEach(function (o) {
+      root.querySelectorAll('button.f[data-f="form"]').forEach(function (o) {
         o.classList.toggle('sel', o.dataset.v === form);
       });
-      document.querySelectorAll('#filing-rows tbody tr').forEach(function (r) {
+      root.querySelectorAll('#filing-rows tbody tr').forEach(function (r) {
         r.hidden = !!form && r.dataset.form !== form;
       });
     });
@@ -387,9 +489,9 @@ FEED_SCRIPT: Final[str] = """
   var fr = document.querySelector('button.f[data-f="formreset"]');
   if (fr) fr.addEventListener('click', function () {
     form = null;
-    document.querySelectorAll('button.f[data-f="form"]').forEach(function (o) {
+    root.querySelectorAll('button.f[data-f="form"]').forEach(function (o) {
       o.classList.remove('sel'); });
-    document.querySelectorAll('#filing-rows tbody tr').forEach(function (r) {
+    root.querySelectorAll('#filing-rows tbody tr').forEach(function (r) {
       r.hidden = false; });
   });
 
@@ -411,11 +513,11 @@ FEED_SCRIPT: Final[str] = """
     var c = document.querySelector('.cl-count[data-role="' + role + '"]');
     if (c) c.textContent = shown + ' of ' + total + ' clusters';
   }
-  document.querySelectorAll('.cl-floor').forEach(function (i) {
+  root.querySelectorAll('.cl-floor').forEach(function (i) {
     i.addEventListener('input', function () { applyClusters(i.dataset.role); });
     applyClusters(i.dataset.role);
   });
-  document.querySelectorAll('button.f[data-f="fund"]').forEach(function (b) {
+  root.querySelectorAll('button.f[data-f="fund"]').forEach(function (b) {
     b.addEventListener('click', function () {
       var role = b.dataset.role;
       hideFund[role] = !hideFund[role];
@@ -424,7 +526,7 @@ FEED_SCRIPT: Final[str] = """
       applyClusters(role);
     });
   });
-})();
+});
 """
 
 
@@ -558,7 +660,15 @@ def deals_html(rows: list[dict[str, Any]]) -> str:
 #: Deal-panel filtering. Kept with the other inline script: one file, no
 #: build step.
 DEALS_SCRIPT: Final[str] = """
-(function () {
+/* Registered as a binder rather than run once at load.
+
+   With one panel in the DOM at a time, a script that queried `document` on
+   DOMContentLoaded bound to elements that had not been injected yet and
+   silently did nothing. Each binder takes the freshly injected root and is
+   re-run after every panel switch; the old elements are gone with the old
+   innerHTML, so re-binding cannot double up. */
+(window.__MR_BINDERS__ = window.__MR_BINDERS__ || []).push(
+  function (root) {
   var table = document.getElementById('deal-rows');
   if (!table) { return; }
   var dtype = null, reviewOnly = false;
@@ -576,10 +686,10 @@ DEALS_SCRIPT: Final[str] = """
     var c = document.querySelector('.dl-count');
     if (c) { c.textContent = shown + ' of ' + total + ' candidates'; }
   }
-  document.querySelectorAll('button.f[data-f="dtype"]').forEach(function (b) {
+  root.querySelectorAll('button.f[data-f="dtype"]').forEach(function (b) {
     b.addEventListener('click', function () {
       dtype = (dtype === b.dataset.v) ? null : b.dataset.v;
-      document.querySelectorAll('button.f[data-f="dtype"]').forEach(function (o) {
+      root.querySelectorAll('button.f[data-f="dtype"]').forEach(function (o) {
         o.classList.toggle('sel', o.dataset.v === dtype);
       });
       apply();
@@ -598,14 +708,14 @@ DEALS_SCRIPT: Final[str] = """
     rs.addEventListener('click', function () {
       dtype = null;
       reviewOnly = false;
-      document.querySelectorAll('button.f').forEach(function (o) {
+      root.querySelectorAll('button.f').forEach(function (o) {
         o.classList.remove('sel');
       });
       apply();
     });
   }
   apply();
-})();
+});
 """
 
 
@@ -1140,7 +1250,15 @@ def review_html(rows: list[dict[str, Any]], counts: dict[str, int]) -> str:
 
 #: Filtering for both Weekend 4 panels. Same inline-script rule as the rest.
 PRIVATE_SCRIPT: Final[str] = """
-(function () {
+/* Registered as a binder rather than run once at load.
+
+   With one panel in the DOM at a time, a script that queried `document` on
+   DOMContentLoaded bound to elements that had not been injected yet and
+   silently did nothing. Each binder takes the freshly injected root and is
+   re-run after every panel switch; the old elements are gone with the old
+   innerHTML, so re-binding cannot double up. */
+(window.__MR_BINDERS__ = window.__MR_BINDERS__ || []).push(
+  function (root) {
   function wire(tableId, countSel, rowClass, filters) {
     var table = document.getElementById(tableId);
     if (!table) { return; }
@@ -1165,10 +1283,10 @@ PRIVATE_SCRIPT: Final[str] = """
     function (r, s) { return !s.dfeOnly || r.dataset.dfe === '1'; }
   ]);
   if (pv) {
-    document.querySelectorAll('button.f[data-f="naics"]').forEach(function (b) {
+    root.querySelectorAll('button.f[data-f="naics"]').forEach(function (b) {
       b.addEventListener('click', function () {
         pv.state.naics = (pv.state.naics === b.dataset.v) ? null : b.dataset.v;
-        document.querySelectorAll('button.f[data-f="naics"]').forEach(
+        root.querySelectorAll('button.f[data-f="naics"]').forEach(
           function (o) { o.classList.toggle('sel', o.dataset.v === pv.state.naics); });
         pv.apply();
       });
@@ -1182,7 +1300,7 @@ PRIVATE_SCRIPT: Final[str] = """
     var pr = document.querySelector('button.f[data-f="pvreset"]');
     if (pr) pr.addEventListener('click', function () {
       pv.state.naics = null; pv.state.dfeOnly = false;
-      document.querySelectorAll('button.f').forEach(function (o) {
+      root.querySelectorAll('button.f').forEach(function (o) {
         o.classList.remove('sel'); });
       pv.apply();
     });
@@ -1215,5 +1333,5 @@ PRIVATE_SCRIPT: Final[str] = """
     });
     rv.apply();
   }
-})();
+});
 """

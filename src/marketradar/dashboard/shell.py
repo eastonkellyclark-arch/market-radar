@@ -411,7 +411,8 @@ PANELS: Final[tuple[Panel, ...]] = (
           probe=_probe_macro),
     Panel("screens", "Volatility screens", "Markets",
           "24 lists: gainers and losers, three price bands, stocks apart from "
-          "ETFs, a parallel >$5M ADV set. Ungated lists collapsed.",
+          "ETFs, a parallel >$5M ADV set. Two tab axes; gainers and losers "
+          "are read together and the ADV gate is a toggle.",
           probe=_probe_screens),
     Panel("names", "Company names", "Markets",
           "Issuer names joined onto screen rows; ambiguous tickers marked "
@@ -508,7 +509,7 @@ def _panel_html(panel: Panel, state: str, detail: str, body: str = "") -> str:
     elif detail:
         waiting = f'<p class="why"><span class="why-k">now</span> {_esc(detail)}</p>'
     return f"""
-      <article class="panel{' wide' if body else ''}"
+      <article class="panel" id="panel-{_esc(panel.id)}"
                data-state="{_esc(state)}" data-panel="{_esc(panel.id)}">
         <header>
           <h3>{_esc(panel.title)}</h3>
@@ -520,6 +521,189 @@ def _panel_html(panel: Panel, state: str, detail: str, body: str = "") -> str:
         {waiting}
         <div class="slot">{body}</div>
       </article>"""
+
+
+def _nav_and_panels(
+    resolved: list[tuple[Panel, str, str]],
+    bodies: dict[str, str],
+) -> tuple[str, str]:
+    """The sidebar and the panel column.
+
+    Both are rendered whole, server-side, and that is the point: the nav is a
+    list of ordinary in-page anchors and every panel is in the document. With
+    the script off the page degrades to one long readable document rather
+    than an empty frame -- the same property the screens panel keeps by not
+    hiding its lists in the markup. :data:`PANEL_SCRIPT` is what takes the
+    panels back out on load.
+
+    Section headings live here now rather than over a grid of cards. Fourteen
+    panels down a page meant the one you wanted was always below the fold,
+    and the heading you were scrolling past was the only thing telling you
+    where you were.
+    """
+    groups: list[str] = []
+    blocks: list[str] = []
+    for section in SECTIONS:
+        items = [r for r in resolved if r[0].section == section]
+        if not items:
+            continue
+        links = "".join(
+            f'<li><a href="#panel-{_esc(p.id)}" data-panel="{_esc(p.id)}"'
+            f' data-state="{_esc(st)}"'
+            f' title="{_esc(p.title)} - {_esc(st)}">'
+            f'<span class="glyph" style="--chip:{STATE_STYLE[st][0]}"'
+            f' aria-hidden="true">{STATE_STYLE[st][1]}</span>'
+            f'<span class="nav-t">{_esc(p.title)}</span>'
+            f'<span class="nav-s">{_esc(st)}</span></a></li>'
+            for p, st, _ in items
+        )
+        groups.append(f"<h2>{_esc(section)}</h2><ul>{links}</ul>")
+        blocks.extend(
+            _panel_html(p, st, d, bodies.get(p.id, "")) for p, st, d in items
+        )
+    nav = (
+        '<nav class="nav" id="mr-nav" aria-label="Panels">'
+        f'{"".join(groups)}</nav>'
+    )
+    return nav, "".join(blocks)
+
+
+#: The panel runtime: one panel in the DOM at a time.
+#:
+#: Fourteen panels on one page meant the thing you wanted was always below the
+#: fold. Worse, every inline script queried ``document`` once at load and bound
+#: whatever it found -- which is why the four panel scripts became *binders*
+#: rather than IIFEs, and why this had to exist to call them.
+#:
+#: The page still renders every panel. This takes them out on load and keeps
+#: each one's markup as a **string**, deliberately not as the node: re-injecting
+#: the markup is what clears the listeners a binder attached, so re-running the
+#: binders after a switch cannot double them up. The cost is that a panel's
+#: in-page state -- a checked gate, a sort order -- resets when you leave it.
+#: That is the right trade at this size, and it is why the open panel is the
+#: only thing remembered.
+PANEL_SCRIPT: Final[str] = r"""
+(function () {
+  var main = document.getElementById('mr-main');
+  var nav = document.getElementById('mr-nav');
+  if (!main) { return; }
+
+  var KEY = 'mr.panel', store = {}, order = [];
+  var found = main.querySelectorAll('article.panel');
+  for (var i = 0; i < found.length; i++) {
+    var pid = found[i].getAttribute('data-panel');
+    if (!pid) { continue; }
+    store[pid] = found[i].outerHTML;
+    order.push(pid);
+  }
+  if (!order.length) { return; }
+  main.innerHTML = '';
+
+  var current = null, prior = null;
+
+  /* Every binder runs against the freshly injected root, and each one is
+     responsible for finding nothing and returning quietly -- thirteen of the
+     fourteen panels are not the one that just went in. A binder that throws
+     must not take the others down with it: that is the failure this whole
+     arrangement exists to stop repeating, and swallowing it silently would
+     be the same mistake one level down, so it is logged. */
+  function bind(root) {
+    var bs = window.__MR_BINDERS__ || [];
+    for (var b = 0; b < bs.length; b++) {
+      try {
+        bs[b](root);
+      } catch (err) {
+        if (window.console && window.console.error) {
+          window.console.error('panel binder ' + b + ' failed', err);
+        }
+      }
+    }
+  }
+
+  function mark(id) {
+    if (!nav) { return; }
+    var links = nav.querySelectorAll('a[data-panel]');
+    for (var i = 0; i < links.length; i++) {
+      if (links[i].getAttribute('data-panel') === id) {
+        links[i].setAttribute('aria-current', 'page');
+      } else {
+        links[i].removeAttribute('aria-current');
+      }
+    }
+  }
+
+  /* file:// localStorage works in the browsers this opens in, but it throws
+     outright where site data is blocked. Every touch is guarded, and the page
+     simply opens on the default when it is. */
+  function remember(id) {
+    try { window.localStorage.setItem(KEY, id); } catch (e) { /* no store */ }
+  }
+  function remembered() {
+    try { return window.localStorage.getItem(KEY); } catch (e) { return null; }
+  }
+
+  function show(id, keepPrior) {
+    if (!store[id]) { return false; }
+    if (!keepPrior && current && current !== id) { prior = current; }
+    current = id;
+    main.innerHTML = store[id];
+    mark(id);
+    bind(main);
+    remember(id);
+    return true;
+  }
+
+  function fromHash() {
+    var h = String(window.location.hash || '').replace(/^#/, '');
+    if (h.indexOf('panel-') === 0) { h = h.slice(6); }
+    return store[h] ? h : null;
+  }
+
+  if (nav) {
+    nav.addEventListener('click', function (ev) {
+      var a = ev.target.closest ? ev.target.closest('a[data-panel]') : null;
+      if (!a) { return; }
+      var id = a.getAttribute('data-panel');
+      if (!store[id]) { return; }
+      ev.preventDefault();
+      show(id);
+      /* replaceState rather than assigning location.hash: the hash is what
+         makes an open panel linkable, and assigning it would also scroll to
+         an anchor that has just been replaced. */
+      try {
+        window.history.replaceState(null, '', '#panel-' + id);
+      } catch (e) { /* some browsers refuse this on file://; it is a nicety */ }
+      window.scrollTo(0, 0);
+    });
+  }
+  window.addEventListener('hashchange', function () {
+    var id = fromHash();
+    if (id && id !== current) { show(id); }
+  });
+
+  /* A hash beats the stored panel: it was asked for explicitly, where the
+     stored one is only where you happened to be last time. */
+  var stored = remembered();
+  show(fromHash() || (stored && store[stored] ? stored : null) || order[0]);
+
+  window.__MR_SHOW_PANEL__ = show;
+  window.__MR_PANEL_IDS__ = order;
+
+  /* The two hooks detail.py looks for. Clicking a ticker row in the screens
+     panel has to bring the ticker panel into the DOM before anything can be
+     drawn into it -- those chart elements do not exist until then, which is
+     the whole reason the drawing code stopped resolving them at load. */
+  window.__MR_OPEN_TICKER__ = function (sym) {
+    if (!store.ticker) { return false; }
+    if (current !== 'ticker') { show('ticker'); }
+    window.scrollTo(0, 0);
+    return window.__MR_TK_DRAW__ ? window.__MR_TK_DRAW__(sym) : false;
+  };
+  window.__MR_BACK__ = function () {
+    return show(prior || order[0], true);
+  };
+})();
+"""
 
 
 def render(
@@ -583,17 +767,7 @@ def render(
     counts = {s: sum(1 for _, st, _ in resolved if st == s)
               for s in (LIVE, WAITING, NOT_BUILT)}
 
-    sections = []
-    for section in SECTIONS:
-        items = [r for r in resolved if r[0].section == section]
-        if not items:
-            continue
-        body = "".join(
-            _panel_html(p, st, d, bodies.get(p.id, "")) for p, st, d in items
-        )
-        sections.append(
-            f'<section><h2>{_esc(section)}</h2><div class="grid">{body}</div></section>'
-        )
+    nav, column = _nav_and_panels(resolved, bodies)
 
     legend = "".join(
         f'<span class="chip" style="--chip:{STATE_STYLE[s][0]}">'
@@ -617,7 +791,18 @@ def render(
             "window.__TK__=" + json.dumps(details, separators=(",", ":")) + ";"
         )
         parts.append(tk.SCRIPT)
-    script = f"<script>{''.join(parts)}</script>" if parts else ""
+    # Last, and unconditional. Every script above only *registers* a binder;
+    # this is the one that calls them, and it is what moves the page from
+    # fourteen stacked panels to one. Appending it before a registration
+    # would run the binders against a list that did not have it yet.
+    parts.append(PANEL_SCRIPT)
+    # One tag per part, not one tag holding all of them. A parse or reference
+    # error anywhere in a single concatenated script kills everything after it
+    # in the same tag -- which is how one stale line in the chart code took
+    # the navigation down with it, two scripts later and entirely unrelated.
+    # Separate tags make that blast radius one panel, which is the same rule
+    # the binder loop keeps one level down.
+    script = "".join(f"<script>{part}</script>" for part in parts)
 
     return f"""<!doctype html>
 <html lang="en"><head>
@@ -665,10 +850,35 @@ h3 {{ font-size:14px; margin:0; font-weight:600; }}
   background:var(--surface); white-space:nowrap;
 }}
 .glyph {{ color:var(--chip); font-size:13px; line-height:1; }}
-.grid {{
-  display:grid; gap:12px;
-  grid-template-columns:repeat(auto-fill,minmax(288px,1fr));
+/* Sidebar and one panel. The grid of cards is gone: with fourteen panels it
+   put the one you wanted below the fold and gave four headings to scroll
+   past, and those headings are now the nav itself. */
+.app {{
+  display:grid; grid-template-columns:214px minmax(0,1fr);
+  gap:26px; align-items:start; margin-top:20px;
 }}
+@media (max-width:820px) {{ .app {{ grid-template-columns:1fr; }} }}
+.nav {{ position:sticky; top:16px; }}
+.nav h2 {{ margin:15px 0 5px; }}
+.nav h2:first-child {{ margin-top:0; }}
+.nav ul {{ list-style:none; margin:0; padding:0; }}
+.nav a {{
+  display:flex; align-items:baseline; gap:7px; padding:4px 8px;
+  border-radius:6px; text-decoration:none; color:var(--ink-2);
+  font-size:12.5px; line-height:1.35;
+}}
+.nav a:hover {{ background:var(--surface); color:var(--ink); }}
+.nav a[aria-current] {{
+  background:var(--surface); color:var(--ink); font-weight:600;
+  box-shadow:inset 2px 0 0 var(--ink);
+}}
+.nav .nav-t {{ flex:1; }}
+/* The state word, for the two states that are not the norm. `live` is
+   carried by the glyph's shape, which is not a colour either. */
+.nav .nav-s {{ font-size:10px; color:var(--muted); }}
+.nav a[data-state="live"] .nav-s {{ display:none; }}
+.main {{ min-width:0; }}
+.main .panel {{ margin:0; }}
 .panel {{
   background:var(--surface); border:1px solid var(--rule);
   border-radius:10px; padding:14px 15px 13px; min-height:132px;
@@ -686,7 +896,6 @@ h3 {{ font-size:14px; margin:0; font-weight:600; }}
 .notes {{ margin:18px 0 0; padding-left:18px; color:var(--muted); font-size:12px; }}
 footer {{ margin-top:40px; color:var(--muted); font-size:11.5px;
           border-top:1px solid var(--rule); padding-top:12px; }}
-.panel.wide {{ grid-column:1/-1; }}
 .status {{ display:flex; align-items:center; gap:7px; margin:10px 0 8px;
            font-weight:600; font-size:13px; }}
 .status .glyph {{ color:var(--chip); font-size:12px; font-weight:700; }}
@@ -805,7 +1014,7 @@ tr.cl td {{ border-bottom:none; }}
 <h1>Market Radar</h1>
 <p class="sub">Panel map · generated {_esc(stamp)}</p>
 <div class="legend">{legend}</div>
-{''.join(sections)}
+<div class="app">{nav}<main class="main" id="mr-main">{column}</main></div>
 {f'<ul class="notes">{notes}</ul>' if notes else ''}
 <footer>
   Local file. Never published: the screens are computed from Tiingo prices, so

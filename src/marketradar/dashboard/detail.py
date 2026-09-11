@@ -42,8 +42,17 @@ def panel_html() -> str:
 SCRIPT: Final[str] = r"""
 (function () {
   var D = window.__TK__ || {}, EPOCH = Date.UTC(2016, 0, 1), DAY = 86400000;
-  var box = document.getElementById('tk'), svg = document.getElementById('tk-chart');
-  if (!box || !svg) return;
+  /* Resolved per draw, not at load: the ticker panel is injected on demand
+     now, so at load time none of these elements exist.
+
+     The load-time guard that used to stand here outlived the variables it
+     tested. It read a free `svg`, which is a ReferenceError rather than a
+     falsy value, so it did not skip the drawer -- it took the whole script
+     down, including the delegated click handlers at the bottom that have
+     nothing to do with the chart. The guard belongs per draw, where the
+     elements either exist or do not. */
+  function box() { return document.getElementById('tk'); }
+  function svgEl() { return document.getElementById('tk-chart'); }
   var W = 760, H = 220, PL = 48, PR = 12, PT = 12, PB = 22;
 
   function iso(d) { return new Date(EPOCH + d * DAY).toISOString().slice(0, 10); }
@@ -61,9 +70,14 @@ SCRIPT: Final[str] = r"""
   function fx(v) { return v >= 100 ? v.toFixed(2) : v.toFixed(4); }
 
   function draw(sym, d) {
+    /* Resolved once, then held as locals for the rest of the draw: every
+       element this function touches belongs to whichever panel is in the DOM
+       at this moment, and re-querying per append would say otherwise. */
+    var svg = svgEl(), b = box();
+    if (!svg || !b) { return false; }
     while (svg.firstChild) { svg.removeChild(svg.firstChild); }
     var s = d.s || [];
-    if (!s.length) { return; }
+    if (!s.length) { return false; }
     var x0 = s[0][0], x1 = s[s.length - 1][0];
     var lo = Infinity, hi = -Infinity;
     for (var i = 0; i < s.length; i++) {
@@ -219,19 +233,40 @@ SCRIPT: Final[str] = r"""
       : '<tbody><tr><td class="note">none on record</td></tr></tbody>';
 
     document.getElementById('tk-sym').textContent = sym;
-    box.hidden = false;
-    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    b.hidden = false;
+    return true;
   }
 
+  /* Delegated on document, so it survives every panel switch. It routes
+     through the shell when there is one: the shell opens the ticker panel in
+     the main area first, then asks for the draw. Standalone, it draws in
+     place as before. */
+  window.__MR_TK_DRAW__ = function (sym) {
+    if (D[sym]) { return draw(sym, D[sym]); }
+    return false;
+  };
+  window.__MR_TK_HAS__ = function (sym) { return !!D[sym]; };
   document.addEventListener('click', function (ev) {
     var row = ev.target.closest ? ev.target.closest('tr[data-ticker]') : null;
-    if (row && D[row.getAttribute('data-ticker')]) {
-      draw(row.getAttribute('data-ticker'), D[row.getAttribute('data-ticker')]);
+    if (!row) { return; }
+    var sym = row.getAttribute('data-ticker');
+    if (!D[sym]) { return; }
+    if (window.__MR_OPEN_TICKER__) { window.__MR_OPEN_TICKER__(sym); return; }
+    /* No shell: the drawer is already on the page rather than being switched
+       to, so it has to be scrolled to. Without this the click reads as having
+       done nothing whenever the drawer sits below the fold. The shell path
+       does not need it -- switching panels puts the chart at the top. */
+    if (draw(sym, D[sym]) && box().scrollIntoView) {
+      box().scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
   });
-  var closer = document.getElementById('tk-x');
-  if (closer) {
-    closer.addEventListener('click', function () { box.hidden = true; });
-  }
+  /* Delegated too: the close button only exists while the ticker panel is
+     the open panel, so a load-time binding found nothing. */
+  document.addEventListener('click', function (ev) {
+    if (!ev.target.closest || !ev.target.closest('#tk-x')) { return; }
+    if (window.__MR_BACK__) { window.__MR_BACK__(); return; }
+    var b = box();
+    if (b) { b.hidden = true; }
+  });
 })();
 """

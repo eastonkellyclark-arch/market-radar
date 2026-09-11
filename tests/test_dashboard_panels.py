@@ -57,34 +57,41 @@ def digest_for(result) -> digest_mod.Digest:
 LIQUID, THIN = 900_000, 1
 
 
-# --- the expansion policy ----------------------------------------------
+# --- which tab opens ----------------------------------------------------
 
 
-def test_the_two_anchors_are_always_open() -> None:
+def test_the_default_tab_is_liquid_ten_dollars_up() -> None:
     result = build([("BIG", 100, 110, "stock", LIQUID),
                     ("DWN", 100, 90, "stock", LIQUID)])
-    keys = panels.default_expanded(result.lists)
-    assert ("stock", "$10+", "gainers", "liquid") in keys
-    assert ("stock", "$10+", "losers", "liquid") in keys
+    assert panels.default_tab(result.lists) == ("stock", "$10+")
 
 
-def test_the_loudest_liquid_band_also_opens() -> None:
-    """So an unusual day in a quiet band is not hidden the morning it matters."""
+def test_the_loudest_band_takes_the_tab_when_it_beats_the_default() -> None:
+    """So an unusual day in a quiet band is not hidden the morning it matters
+    -- the same reason it was not hidden behind a collapsed header before."""
     result = build([("BIG", 100, 101, "stock", LIQUID),
                     ("MID", 5, 9, "stock", LIQUID)])
-    keys = panels.default_expanded(result.lists)
-    assert ("stock", "$1-10", "gainers", "liquid") in keys
+    assert panels.default_tab(result.lists) == ("stock", "$1-10")
 
 
-def test_expansion_never_opens_an_ungated_list_when_a_liquid_one_exists() -> None:
-    """The default view should not mix tradeable with untradeable.
+def test_a_quiet_day_keeps_the_default_tab() -> None:
+    """Otherwise the widest-moving band wins every day by construction, and
+    sub-$1 moves more than $10+ almost every session."""
+    result = build([("BIG", 100, 130, "stock", LIQUID),
+                    ("MID", 5, 5.1, "stock", LIQUID)])
+    assert panels.default_tab(result.lists) == ("stock", "$10+")
 
-    Nothing is hidden by this: every collapsed header carries its own top row.
-    """
+
+def test_the_tab_never_opens_on_an_ungated_list_when_a_liquid_one_exists(
+) -> None:
+    """The default view should not open on something untradeable. Nothing is
+    hidden by this: every other tab is one click away."""
     result = build([("BIG", 100, 101, "stock", LIQUID),
                     ("THIN", 5, 20, "stock", THIN)])
-    for key in panels.default_expanded(result.lists):
-        assert key[3] == "liquid"
+    sec, band = panels.default_tab(result.lists)
+    liquid_bands = {sl.band for sl in result.lists
+                    if sl.rows and sl.liquidity == "liquid"}
+    assert band in liquid_bands
 
 
 def test_the_policy_is_one_function() -> None:
@@ -92,23 +99,25 @@ def test_the_policy_is_one_function() -> None:
     import inspect
 
     source = inspect.getsource(panels)
-    assert source.count("def default_expanded") == 1
-    assert source.count("default_expanded(") == 2  # the def and one call site
+    assert source.count("def default_tab") == 1
+    assert source.count("default_tab(") == 2  # the def and one call site
 
 
 # --- rendering ----------------------------------------------------------
 
 
-def test_every_list_is_present_even_when_collapsed() -> None:
+def test_every_list_is_present_even_when_its_tab_is_not_open() -> None:
+    """All 24 are in the page; the script shows the two that match. Rendering
+    only the open tab would mean re-rendering in JS to change tabs."""
     result = build([("BIG", 100, 110, "stock", LIQUID),
                     ("ETF", 20, 26, "etf", LIQUID)])
     page = panels.screens_html(digest_for(result))
     populated = [sl for sl in result.lists if sl.rows]
-    assert page.count('<details class="list"') == len(populated)
+    assert page.count('<div class="list"') == len(populated)
 
 
-def test_a_collapsed_header_carries_its_top_row() -> None:
-    """Collapsing must not hide the headline, only the depth."""
+def test_each_list_header_carries_its_top_row() -> None:
+    """The headline travels with the list, so a glance at a tab is enough."""
     result = build([("BIG", 100, 110, "stock", LIQUID),
                     ("ETF", 20, 26, "etf", LIQUID)])
     page = panels.screens_html(digest_for(result))
@@ -116,19 +125,43 @@ def test_a_collapsed_header_carries_its_top_row() -> None:
     assert "ETF" in page
 
 
-def test_collapse_works_without_the_script() -> None:
-    """<details> is native, so the page degrades to readable, not broken."""
-    page = panels.screens_html(digest_for(build([("BIG", 100, 110, "stock", LIQUID)])))
-    assert "<details" in page and "<summary>" in page
+def test_the_screens_panel_is_readable_without_the_script() -> None:
+    """The property the old <details> gave for free, now an explicit one.
 
-
-def test_filters_cover_band_and_security_type() -> None:
+    Tabs are driven by script, so with JS off nothing must be hidden by CSS:
+    the page has to degrade to *every list visible*, not to a blank panel.
+    No list may carry `hidden` or inline display:none in the markup.
+    """
     result = build([("BIG", 100, 110, "stock", LIQUID),
                     ("ETF", 20, 26, "etf", LIQUID)])
     page = panels.screens_html(digest_for(result))
-    assert 'data-f="band"' in page
-    assert 'data-f="sec"' in page
-    assert 'data-f="liq"' in page
+    for block in page.split('<div class="list"')[1:]:
+        head = block[:200]
+        assert "hidden" not in head, "a list is hidden in the markup"
+        assert "display:none" not in head.replace(" ", "")
+    assert "BIG" in page and "ETF" in page
+
+
+def test_the_tabs_cover_both_axes_and_the_gate_is_a_toggle() -> None:
+    result = build([("BIG", 100, 110, "stock", LIQUID),
+                    ("ETF", 20, 26, "etf", LIQUID)])
+    page = panels.screens_html(digest_for(result))
+    assert 'data-axis="sec"' in page
+    assert 'data-axis="band"' in page
+    # The gate changes which names qualify, not which question is asked, so
+    # it is one in-place toggle rather than a third tab axis.
+    assert 'id="gate"' in page
+    assert 'data-axis="liq"' not in page
+    assert 'data-axis="dir"' not in page, "gainers and losers are read together"
+
+
+def test_exactly_one_tab_per_axis_is_current() -> None:
+    result = build([("BIG", 100, 110, "stock", LIQUID),
+                    ("ETF", 20, 26, "etf", LIQUID)])
+    page = panels.screens_html(digest_for(result))
+    for axis in ("sec", "band"):
+        row = page.split(f'data-axis-row="{axis}"', 1)[1].split("</div>", 1)[0]
+        assert row.count("aria-current") == 1, f"{axis}: {row.count('aria-current')}"
 
 
 def test_the_caveats_reach_the_panel(monkeypatch) -> None:

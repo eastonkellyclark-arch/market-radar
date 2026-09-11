@@ -41,6 +41,13 @@ venv/
 .coverage
 htmlcov/
 
+# --- node: test support only ----------------------------------------------
+# jsdom, so the suite can run the dashboard's inline script in a real DOM.
+# package.json and package-lock.json are committed; the tree is not. Nothing
+# in src/ or .github/workflows/ touches node -- the dashboard has no build
+# step and ships as one file.
+node_modules/
+
 # --- editors and os -------------------------------------------------------
 .vscode/
 .idea/

@@ -200,9 +200,17 @@ def test_the_chart_carries_no_external_reference_either() -> None:
     _assert_no_external(page)
 
 
-def test_the_map_alone_carries_no_script() -> None:
-    """With no digest there is nothing to sort, so nothing is emitted."""
-    assert "<script" not in shell.render(ctx())
+def test_the_map_alone_carries_the_runtime_and_no_binders() -> None:
+    """With no digest there is nothing to sort or filter, so no panel binder
+    is emitted -- but the runtime always is.
+
+    Navigation is not optional the way sorting is. It is what puts one panel
+    in the DOM instead of twenty, so a page that skipped it would render the
+    whole map into a column and call it a dashboard.
+    """
+    page = shell.render(ctx())
+    assert "__MR_SHOW_PANEL__" in page, "the map cannot switch panels"
+    assert "|| []).push(" not in page, "a binder was emitted with nothing to bind"
 
 
 def test_panel_text_is_escaped() -> None:
@@ -210,8 +218,11 @@ def test_panel_text_is_escaped() -> None:
         ctx(), panels=(shell.Panel("x", "<script>alert(1)</script>", "Markets",
                                    "…", weekend="W9"),)
     )
-    assert "<script>" not in page
-    assert "&lt;script&gt;" in page
+    # Not `"<script>" not in page` -- the page carries a real one now, and
+    # that assertion would have gone on passing for the wrong reason the day
+    # it stopped being true.
+    assert "<script>alert(1)</script>" not in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
 
 
 def test_the_footer_states_why_it_is_never_published() -> None:

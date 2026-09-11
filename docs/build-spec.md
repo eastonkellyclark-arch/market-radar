@@ -441,25 +441,64 @@ The point is that the dashboard is a picture of the whole system rather than
 of the parts that happen to work. An absent panel is indistinguishable from a
 broken one; a panel that says "waiting on the 10-year backfill" is not.
 
+#### Navigation
+
+One panel is in the DOM at a time, behind a sidebar that lists all twenty
+grouped by section, each with its state glyph. The open panel is remembered
+in `localStorage` and is linkable as `#panel-<id>`; a hash beats the stored
+panel, because a hash was asked for and the stored one is only where you
+happened to be.
+
+Two properties hold it together, and both were learned by breaking them:
+
+- **The page renders every panel, then the runtime takes them out.** So with
+  the script off it degrades to one long readable document rather than an
+  empty frame — the same property the screens panel keeps by never hiding a
+  list in the markup. The sidebar is plain in-page anchors for the same
+  reason.
+- **A panel's script is a binder, not an IIFE.** Each is registered on
+  `window.__MR_BINDERS__` and re-run against the freshly injected root after
+  every switch. The old elements leave with the old `innerHTML`, so re-binding
+  cannot double up, and a binder that throws is caught and logged rather than
+  taking the other thirteen with it. What does *not* survive a switch is a
+  panel's in-page state — a checked gate, a sort order — which is the price of
+  re-injection and is worth it at this size.
+
+The screens panel is **two tab axes** rather than twenty-four stacked
+collapsibles: security type and price band, which are the two axes a list is
+in exactly one of. Direction is deliberately not an axis — gainers and losers
+are read together, because a name near the top of one and the bottom of the
+other is the case worth seeing. The $5M ADV gate is an in-place toggle for a
+related reason: it changes which names qualify, not which question is asked.
+
 #### Panels
 
-| panel | state today | needs |
-|---|---|---|
-| Health | live | — |
-| Macro | live | — |
-| Screens (24 lists, ungated collapsed) | live | — |
-| Company names on screen rows | live | 54% coverage; the rest need W4 entity work |
-| EDGAR filing feed | live | — |
-| Form 4 clusters | W3 | cluster detection |
-| Ticker detail — price chart | waiting | 10-year backfill |
-| Day-over-day / NEW markers | waiting | 2+ sessions of universe history |
-| Liquidity gate (12 of the 24 lists) | **waiting, see below** | trailing-window ADV |
-| News | not built | W3 |
-| 8-K deals | LIVE | W3-T3 |
-| Deal multiples | not built | beyond |
-| Historical outcomes | LIVE | W3-T3 |
-| DCF / 3-statement | not built | beyond |
-| Pitch decks | not built | beyond |
+Grouped the way the sidebar groups them. "State" is what the panel resolves
+to on a fully loaded system — the probe decides at render time, and a panel
+that cannot be live says which data it is waiting on.
+
+| section | panel | state | notes |
+|---|---|---|---|
+| Markets | Health | live | sweep coverage, staleness per source, entity counts |
+| Markets | Macro | live | DGS10 and the two ICE BofA spreads. Local-only, per the FRED rule |
+| Markets | Volatility screens | live | 24 lists, two tab axes — see *Navigation* |
+| Markets | Company names | live | 54% coverage; the rest need W4 entity work |
+| Markets | Liquidity gate | live | 30-session trailing ADV. Was the blocking issue below; it is closed |
+| Markets | Ticker detail | not built | the backfill landed, so this is now W2.5 (U3) rather than waiting on data |
+| Markets | Day-over-day / NEW | live | needs two sessions of whole-universe history |
+| Filings | EDGAR filing feed | live | the seven watched form types |
+| Filings | Form 4 clusters — officers & directors | live | W3 |
+| Filings | Form 4 clusters — 10% holders | live | a separate panel, not a filter: the medians are 78x apart, so one floor cannot serve both |
+| Filings | 8-K deals | live | W3-T3. Both classifiers shown; disagreements are a review queue |
+| Filings | News | **declined** | measured 2026-09-10 and not built — see *News: measured, declined*. The panel itself still reads "planned for Weekend 3", which is now the wrong answer |
+| Private | Private companies | live | W4 |
+| Private | Mature targets | live | W4 |
+| Private | Entity review queue | live | W4 |
+| Analysis | XBRL fundamentals | not built | measured and scoped; no loader yet |
+| Analysis | Deal multiples | not built | beyond |
+| Analysis | Historical outcomes | live | W3-T3. The survivorship caveat renders beside the number, not in a docstring |
+| Analysis | DCF / 3-statement | not built | beyond |
+| Analysis | Pitch decks | not built | beyond |
 
 #### Blocking issue, ahead of the backfill
 
@@ -472,6 +511,12 @@ are gated on that number.
 
 Fix the window before the backfill, not after: the gate silently changes
 meaning the moment the data arrives, and nothing fails.
+
+**Closed.** The gate is a 30-session trailing average, and a name with fewer
+sessions than that stays in the ungated lists and is counted there rather
+than being silently dropped or silently passed. Kept above rather than
+deleted because the shape recurs: a number that is accidentally right on
+small data and wrong on full data fails no test on the way between.
 
 ### Weekend 1 — Skeleton and prices
 
@@ -900,6 +945,24 @@ no reason attached is the number nobody checks.
   embeddings exist.
 - **Similarity ranking** — deterministic filter first (SIC, size bucket, cash
   vs stock, era), embeddings only to rank within the result.
+- **EX-21 subsidiary extraction** — the named fix for the private list's
+  known blind spot. `ARCELORMITTAL TUBULAR PRODUCTS USA LLC` ranks as a
+  century-old private employer because the *parent* files with the SEC while
+  the subsidiary sponsors the plan, so its EIN matches nothing. Every 10-K
+  carries an EX-21 "Subsidiaries of the Registrant" exhibit naming them, so
+  the link exists in the filings we already fetch.
+
+  Worth noting what kind of solution this is: EX-21 is **prose, not a
+  table** — a list of names and jurisdictions with no EIN and no CIK. So it
+  cannot be the join key; it can only produce *candidates* for one. That
+  makes it the review-queue shape rather than the EIN shape, and it must not
+  become fuzzy name matching on the public-match path by the back door:
+  a parent-subsidiary claim goes into `entity_review` with the exhibit text
+  as its evidence, and a human confirms it. Scoped that way it is a few
+  thousand high-value links rather than a matcher.
+
+  Until it exists, a recognisable corporate name in the private list is a
+  prompt to check rather than a finding, and the caveat stays in `U8`.
 - DCF / 3-statement engine
 - python-pptx deck generation
 - FMCSA, OSHA, EPA, state licensing, state SoS/UCC as sectors demand

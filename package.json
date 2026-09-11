@@ -1,0 +1,8 @@
+{
+  "name": "market-radar-testsupport",
+  "private": true,
+  "description": "Test support only. The dashboard ships as one static HTML file with inline script and no build step; this exists so the suite can run that script in a real DOM instead of asserting on its source text.",
+  "devDependencies": {
+    "jsdom": "^27.0.0"
+  }
+}
