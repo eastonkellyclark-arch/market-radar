@@ -87,7 +87,20 @@ def test_a_multi_year_stage_writes_one_partition_per_year(env) -> None:
 
 def test_a_partition_never_takes_another_year_s_rows(env) -> None:
     """The bug this prevents: a sweep crossing New Year putting both years in
-    whichever partition the caller happened to name."""
+    whichever partition the caller happened to name.
+
+    It then caught a second one, which is why there is a note here. `publish`
+    merged into a fixed `staging/merged.parquet`, rewritten once per partition,
+    and read the result back from that path -- so on a fast POSIX runner every
+    partition after the first published and asserted the *previous* year's
+    rows. 2024 got 2023. The merge now runs in a scratch directory of its own
+    per call.
+
+    Both of these tests passed on Windows for weeks and failed the first time
+    the suite ran on an Actions runner. The portable half of the check is
+    :func:`test_publish_leaves_nothing_but_the_chunks_behind` below -- a shared
+    mutable path is visible as the file it leaves lying there, on any platform.
+    """
     tmp_path, con = env
     staging = stage(tmp_path, "newyear",
                     full_year(2024) + full_year(2025))
@@ -100,6 +113,36 @@ def test_a_partition_never_takes_another_year_s_rows(env) -> None:
             [(tmp_path / f"prices_{y}.parquet").as_posix()],
         ).fetchall()
         assert got == [(y,)]
+
+
+def test_publish_leaves_nothing_but_the_chunks_behind(env) -> None:
+    """No scratch parquet in staging afterwards, on any platform.
+
+    This is the portable form of the stale-merge bug above. The merge has to
+    stream through a local file -- reading and writing the same remote object
+    in one lazy statement truncates it -- but that file must not be a fixed
+    path shared between partitions, and the cheap way to see that it is not is
+    that nothing is left behind to share.
+
+    It is also a real cost: the staging tree is carried forward by the Actions
+    cache between sweeps, and a leftover merge of a full year is millions of
+    rows of dead weight in it.
+    """
+    tmp_path, con = env
+    staging = stage(tmp_path, "scratch",
+                    full_year(2023) + full_year(2024) + full_year(2025))
+
+    tiingo.publish_all(staging, con=con)
+
+    leftovers = sorted(
+        p.name for p in staging.iterdir() if not p.name.startswith("chunk_")
+    )
+    assert leftovers == [], (
+        f"publish left {leftovers} in the staging directory. A merge scratch "
+        "file shared between partitions is how 2024 came to publish 2023's "
+        "rows; it needs a path of its own per call, and cleaning up is how "
+        "this test can see that it has one."
+    )
 
 
 def test_staged_years_reports_what_is_present(env) -> None:

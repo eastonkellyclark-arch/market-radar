@@ -270,6 +270,20 @@ holds raw OHLCV; `corporate_actions` holds `split_factor` and `div_cash`; the
 cumulative factor is applied in the query. History stays immutable and
 append-only, and a bad adjustment is a fixable bug rather than a re-download.
 
+**A scratch file a loader reads back must not be a shared path.** `publish`
+merged each year partition into a fixed `staging/merged.parquet` and read the
+result back from it, so on a fast POSIX runner every partition after the first
+published and asserted the *previous* year's rows — 2024 got 2023. It passed on
+Windows and in every local run for weeks, and failed the first time the suite
+ran on an Actions runner. The fix is not a flush or a retry: the path is shared
+mutable state between iterations, so each call gets a scratch directory of its
+own, which is what `selftest.py` and `sec_company_tickers.py` already did.
+
+Write scratch to a per-call temp dir, clean it up, and keep a test that the
+staging directory is empty of everything but its chunks afterwards — a shared
+path is visible as the file it leaves behind, on any platform, which is the
+only portable form this check has.
+
 **Volatility screens run in three price bands** — sub-$1, $1–10, $10+ — kept
 separate. One combined list means penny stocks win every day and you never see
 a $40 stock move again. Store tick-count move alongside percent; $0.0002 →

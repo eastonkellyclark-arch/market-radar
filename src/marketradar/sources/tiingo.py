@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import re
+import tempfile
 import time
 import zipfile
 from dataclasses import dataclass, replace
@@ -1034,46 +1035,69 @@ def publish(
         ) WHERE rn = 1
     """
 
-    local = staging / "merged.parquet"
-    if local.exists():
-        local.unlink()
-    con.execute(f"COPY ({merged_sql}) TO '{local.as_posix()}' (FORMAT parquet)")
-
-    merged_rel = con.read_parquet(local.as_posix())
-    merged_rows = int(
+    # A scratch directory of its own, per call. This used to be a fixed
+    # `staging/merged.parquet`, rewritten once per partition, and on a fast
+    # Linux runner that produced the one failure this whole function exists to
+    # prevent: `publish_all` over 2023/2024/2025 wrote year 2024 and then
+    # asserted -- and published -- year *2023*, because the relation read back
+    # from the reused path still had the previous iteration's contents. Every
+    # partition after the first carried the one before it.
+    #
+    # It passed on Windows and in every local run for weeks. It failed the
+    # first time the suite ran on an Actions runner, which is the argument for
+    # tests.yml existing and also the reason this is not fixed by adding a
+    # flush or a sleep: the path is shared mutable state between iterations and
+    # the fix is to not share it. A fresh directory cannot be stale, and
+    # selftest.py and sec_company_tickers.py already stage their uploads this
+    # way.
+    #
+    # Cleanup is best-effort because a DuckDB relation may still hold the file
+    # open on Windows, and a scratch file is not worth failing a published
+    # partition over. It also means a crashed run no longer leaves a
+    # multi-million-row merged.parquet behind in the cached checkpoint tree.
+    with tempfile.TemporaryDirectory(
+        prefix=f"merge_{partition}_", dir=staging, ignore_cleanup_errors=True
+    ) as scratch:
+        local = Path(scratch) / "merged.parquet"
         con.execute(
-            "SELECT count(*) FROM read_parquet(?)", [local.as_posix()]
-        ).fetchone()[0]
-    )
+            f"COPY ({merged_sql}) TO '{local.as_posix()}' (FORMAT parquet)")
 
-    if prior_rows is not None and merged_rows < prior_rows and not restate:
-        raise PartitionShrankError(
-            f"{DATASET}/{partition}: publishing would take the partition from "
-            f"{prior_rows:,} rows to {merged_rows:,}, a loss of "
-            f"{prior_rows - merged_rows:,}. A sweep adds sessions; it does not "
-            "remove them. This is what an overwrite-instead-of-merge looks "
-            "like. If the shrink is deliberate -- a restatement, or purging "
-            "symbols that should never have been swept -- pass restate=True, "
-            "which publishes exactly what is staged and merges nothing."
+        merged_rel = con.read_parquet(local.as_posix())
+        merged_rows = int(
+            con.execute(
+                "SELECT count(*) FROM read_parquet(?)", [local.as_posix()]
+            ).fetchone()[0]
         )
 
-    con.execute(
-        f"COPY (SELECT * FROM read_parquet('{local.as_posix()}')) "
-        f"TO '{_q(ref.location)}' (FORMAT parquet)"
-    )
-    log.info(
-        "%s/%s: %s -> %s rows",
-        DATASET, partition,
-        "first publish" if prior_rows is None else f"{prior_rows:,}",
-        f"{merged_rows:,}",
-    )
+        if prior_rows is not None and merged_rows < prior_rows and not restate:
+            raise PartitionShrankError(
+                f"{DATASET}/{partition}: publishing would take the partition "
+                f"from {prior_rows:,} rows to {merged_rows:,}, a loss of "
+                f"{prior_rows - merged_rows:,}. A sweep adds sessions; it does "
+                "not remove them. This is what an overwrite-instead-of-merge "
+                "looks like. If the shrink is deliberate -- a restatement, or "
+                "purging symbols that should never have been swept -- pass "
+                "restate=True, which publishes exactly what is staged and "
+                "merges nothing."
+            )
 
-    observed = _assert_partition_fresh(
-        merged_rel,
-        partition=partition,
-        min_rows=min_rows,
-        max_staleness_days=max_staleness_days,
-    )
+        con.execute(
+            f"COPY (SELECT * FROM read_parquet('{local.as_posix()}')) "
+            f"TO '{_q(ref.location)}' (FORMAT parquet)"
+        )
+        log.info(
+            "%s/%s: %s -> %s rows",
+            DATASET, partition,
+            "first publish" if prior_rows is None else f"{prior_rows:,}",
+            f"{merged_rows:,}",
+        )
+
+        observed = _assert_partition_fresh(
+            merged_rel,
+            partition=partition,
+            min_rows=min_rows,
+            max_staleness_days=max_staleness_days,
+        )
     manifest.record_stats(observed, con=con)
     return observed
 
