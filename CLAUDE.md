@@ -442,7 +442,24 @@ difference is ten years of delisting, not ten years of growth.
 Do not fix this by widening the ticker map. SEC's `company_tickers.json` is
 also current-only, and even a perfect historical CIK→ticker map would resolve
 to symbols we hold no prices for. It needs a point-in-time universe, which is
-a data purchase, not a query. Until then: state the bias whenever a study
+a data purchase, not a query.
+
+**Refined 2026-09-10: "a point-in-time universe" is two things, and only one of
+them is still a purchase.** A point-in-time *price* universe is, and that half
+stands. A point-in-time *filer* universe is not, and arrived free with the XBRL
+load: the `sub` tables hold 6,431 CIKs over 2019–2026 with name, SIC and period,
+**including the 2,160 that stopped filing** — of which `companies` holds 107.
+That fixes entity coverage and population selection for anything keyed on CIK;
+it does not conjure prices for a delisted symbol, which is why the paragraph
+above is refined rather than retracted.
+
+The distinction has already cost something. The `deals` table was selected
+through a current-only universe, so filers that stopped filing appear in it at
+1.7% against 50.7% for filers still going — and an acquisition target is by
+definition a company that stopped filing. Deal multiples is blocked on that, not
+on the target financials the build order blamed. **Any population selected
+through `companies` inherits the hole**; select through the XBRL filer universe
+instead wherever the question is historical. Until then: state the bias whenever a study
 reports an outcome, and never describe such a result as "returns after a
 deal" when it is "returns after a deal, among companies that survived it".
 

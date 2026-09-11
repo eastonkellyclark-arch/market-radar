@@ -1007,6 +1007,53 @@ no reason attached is the number nobody checks.
 
   Until it exists, a recognisable corporate name in the private list is a
   prompt to check rather than a finding, and the caveat stays in `U8`.
+- **Deal multiples — built, and blocked on the deal population rather than on
+  target financials.** `screens/deal_multiples.py`, 2026-09-10. The build order
+  assumed this waited on target financials, which are disclosed in under 10% of
+  deals. That assumption is wrong in both directions and the correction matters.
+
+  For a *public* target the financials are fully available and **unbiased**:
+  every one of Activision, VMware, Twitter, Seagen, Slack, Xilinx, Arena and
+  Horizon sits in the XBRL partitions with its filing history ending cleanly
+  before its acquisition. XBRL is as-filed and keeps every filer that ever
+  filed, so unlike the price history it has no survivorship hole.
+
+  What is missing is the *deal*. Measured: of 2,160 filers whose 10-K history
+  ends before 2024, **1.7% appear in the `deals` table at all**, against 50.7%
+  of the 4,271 still filing — a thirty-fold gap. An acquisition target is by
+  definition a company that stopped filing, so the deal population is missing
+  almost exactly the rows a multiples screen needs. None of those eight
+  acquisitions is in it. The cause is upstream: `companies` is built from SEC's
+  current-only `company_tickers.json` and holds 107 of those 2,160, so any
+  population selected through it inherits the hole.
+
+  The screen is correct and produces **ten rows** out of 10,762 deal candidates,
+  and its funnel says where they went. Two things it establishes on the way:
+
+  - 84% of filings with a stated value and a pre-deal annual report **filed
+    another 10-K afterwards** — they sold a division, not themselves. Dividing a
+    division's price by the parent's whole revenue gives a small multiple, and a
+    screen ranking cheap deals first would have ranked its own errors first. So
+    the target's identity is confirmed from the filing record, never from prose.
+  - "Has not filed yet" is not "stopped filing", bounded by the edge of loaded
+    history as well as by the calendar. Third outing for that distinction after
+    `pending_years` and the XBRL nil tag.
+
+  **The fix is now a query rather than a purchase, for this half of the
+  problem.** The XBRL `sub` tables are a point-in-time *filer* universe: 6,431
+  CIKs over 2019–2026 including the 2,160 that stopped filing, with name, SIC
+  and period. CLAUDE.md says a point-in-time universe is a data purchase — true
+  of a point-in-time *price* universe, and no longer true of a filer one, which
+  arrived free with the XBRL load. Rebuilding the 8-K deal population against it
+  is the next task and is a real sweep, not a query rewrite.
+
+  Operating income is the other gap: EBITDA is the standard M&A denominator and
+  operating income is the available proxy, measured at 91.3% and deferred out of
+  the tag map's v1. Adding it is a map edit plus a re-resolve of the 30 quarters,
+  which the cached zips make cheap. v1 divides by revenue and net income, names
+  them `value_to_*` rather than `EV/*` because the 8-K states a transaction value
+  with no net-debt adjustment, and says so beside every number.
+
 - DCF / 3-statement engine
 - python-pptx deck generation
 - FMCSA, OSHA, EPA, state licensing, state SoS/UCC as sectors demand

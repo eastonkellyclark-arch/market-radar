@@ -8,15 +8,30 @@ is the whole problem, and it has exactly one honest key.
 "the Buyer", "Parent", "Merger Sub" -- so the target's *name* is the string a
 regular expression pulled out of a legal sentence, and matching that to a filer
 is the 44.2%-precision mistake the Form 5500 work measured. What is exact is the
-filer's own CIK. So this screen reads only the filings where the filer is on the
-selling side, where ``deals.target`` is the filer itself and the CIK is SEC's
-rather than ours. An acquirer's 8-K about buying someone is not usable here and
-is counted out by name.
+filer's own CIK. So this screen reads filings where the filer is *not* the
+acquirer, and then confirms from the filing record that the filer was the thing
+sold. The prose is used only where it is reliable -- a clear "we agreed to
+acquire" excludes a filing -- and never to assert who the target was.
 
-**And the filer being the seller does not make it the target.** Measured
-2026-09-10 and this is the finding the screen is arranged around: of 771 seller
-filings with a stated value and a pre-deal annual report, **482 -- 63% -- filed
-another 10-K afterwards.** They sold a division, not themselves. Dividing a
+**Read the build-spec section before trusting any number this produces.** The
+population is survivor-biased by a factor of thirty, measured 2026-09-10: of
+2,160 filers whose 10-K history ends before 2024, **1.7% appear in the deals
+table at all**, against 50.7% of the 4,271 still filing. An acquisition target is
+by definition a company that stopped filing, so the deals population is missing
+almost exactly the rows this screen exists to find -- none of Activision, VMware,
+Twitter, Seagen, Slack, Xilinx, Arena or Horizon is in it, though all eight sit
+in the XBRL partitions with clean pre-deal histories.
+
+So this screen is correct and its output is ten rows. That is not a bug in the
+screen and the funnel says where it went. The constraint is **not** target
+financials, which is what the build order assumed: those are fully available and
+unbiased. It is the deal population.
+
+**And the filer being on the selling side does not make it the target.**
+Measured 2026-09-10 over all 30 loaded quarters, and this is the finding the
+screen is arranged around: of 2,112 filings with a stated value and a pre-deal
+annual report, **1,778 -- 84% -- filed another 10-K afterwards.** They sold a
+division, not themselves. Dividing a
 division's price by the whole parent's revenue produces a number that is
 present, plausible, and far too small, and nothing about it looks wrong: the
 multiple is just low, and low multiples are what a screen for cheap deals is
@@ -51,9 +66,14 @@ log = logging.getLogger(__name__)
 
 SCREEN: Final[str] = "deal_multiples"
 
-#: Only filings where the filer is on the selling side. ``deals.parties`` sets
-#: ``target = company`` for these, so the target's CIK is the filer's own.
-SELLER_ROLE: Final[str] = "seller"
+#: The one role that disqualifies a filing. A filer that clearly said it was
+#: buying is not the target, and that much the prose gets right; every other
+#: role is admitted and the filing record decides.
+#:
+#: Measured across roles, "stopped filing" fires at about 1% everywhere --
+#: ``party`` 6 of 579, ``seller`` 5 of 505, ``not_stated`` 0 of 228 -- which is
+#: the survivorship problem above rather than a property of the roles.
+ACQUIRER_ROLE: Final[str] = "acquirer"
 
 #: De-SPACs have no operating acquirer, no target financials and no computable
 #: multiple; securitizations are not acquisitions at all. Both are excluded by
@@ -64,8 +84,8 @@ OPERATING_TYPE: Final[str] = "operating"
 #: filing history was loaded afterwards for that to mean something.
 ACQUIRED_WHOLE: Final[str] = "acquired_whole"
 
-#: The filer kept filing, so whatever was sold was not the filer. 63% of the
-#: population. Excluded from every multiple and counted.
+#: The filer kept filing, so whatever was sold was not the filer. 84% of the
+#: population with a pre-deal report. Excluded from every multiple and counted.
 KEPT_FILING: Final[str] = "kept_filing"
 
 #: Not enough post-deal coverage to tell. Not a signal in either direction.
@@ -129,7 +149,7 @@ class Result:
     rows: list[Multiple]
     funnel: funnel_mod.Funnel
     #: ``{identity: count}`` over the population that had a pre-deal report, so
-    #: the 63% is visible rather than inferred from a shrinking list.
+    #: the 84% is visible rather than inferred from a shrinking list.
     identities: dict[str, int]
     #: The newest period end in the loaded XBRL, which is what bounds
     #: :data:`TOO_RECENT`. Reported because the screen's answer moves when more
@@ -180,13 +200,14 @@ def screen(
         return int(con.execute(
             f"select count(*) from dm_deals where {where}").fetchone()[0])
 
-    base = f"filer_role = '{SELLER_ROLE}'"
+    base = f"filer_role <> '{ACQUIRER_ROLE}'"
     priced = f"{base} and value_usd is not null"
     operating = f"{priced} and deal_type = '{OPERATING_TYPE}'"
     stages: list[tuple[str, int, str]] = [
         ("deal candidates", count("true"), "every 8-K the deals loader stored"),
-        ("filer is the target", count(base),
-         "an acquirer's filing names its target in prose, which is not a key"),
+        ("filer may be the target", count(base),
+         "a filing that says it is the buyer is out; the rest are decided by "
+         "the filing record, not by the prose"),
         ("value stated", count(priced),
          "no price, no multiple; the 8-K states one or it does not"),
         ("operating deal", count(operating),
@@ -255,7 +276,10 @@ def screen(
         "target identity confirmed", identities.get(ACQUIRED_WHOLE, 0),
         f"filed nothing after the deal. {identities.get(KEPT_FILING, 0):,} kept "
         "filing, so they sold a division and their own revenue is the wrong "
-        "denominator",
+        f"denominator; {identities.get(TOO_RECENT, 0):,} are too recent to tell. "
+        "This stage collapsing is the survivorship bias in the deal "
+        "population, not a filter that is too strict -- see the module "
+        "docstring",
     ))
 
     # The figures, pivoted off the long table -- one column per concept asked
