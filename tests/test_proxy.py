@@ -343,3 +343,37 @@ def test_the_report_counts_every_reason() -> None:
     text = "\n".join(report.lines())
     assert "1/3" in text
     assert "citation check earning its keep" in text
+
+
+def test_a_cited_but_misattributed_number_is_still_accepted_today() -> None:
+    """The known blind spot, pinned so it is not rediscovered as a surprise.
+
+    A citation proves the number was read rather than invented. It says nothing
+    about *what the number is of*. Measured over 20 real proxies: every wrong
+    figure was genuinely in the text and cited correctly -- a merger sub's share
+    conversion read as target consideration, a different deal's C$2.00, a
+    comparables-table percentile read as this deal's premium.
+
+    This test asserts the current behaviour rather than the desired one, which is
+    the honest way to record a gap: when v2 checks attribution, this test should
+    fail and be rewritten, and that failure is the signal the fix landed.
+    """
+    misattributed = (
+        "each share of common stock of Merger Sub issued and outstanding "
+        "immediately prior to the Effective Time shall automatically be "
+        "converted into one share of the surviving corporation."
+    )
+    text = CASH_DEAL + misattributed + FIGURES
+    model = FakeModel({"present": True, "value": 1.0,
+                       "quote": "converted into one share of the surviving "
+                                "corporation"})
+    figure = proxy.extract_field("acc-mis", text, "exchange_ratio",
+                                 client=model, providers=ONLY_GROQ)
+    assert figure.reason == proxy.STATED, (
+        "if this now rejects the figure, attribution checking has landed and "
+        "this test should be rewritten to assert the rejection"
+    )
+    assert figure.value == 1.0
+    # The provenance is what makes the error *findable* even though it is not
+    # caught: the quote says plainly that it is about Merger Sub.
+    assert "surviving corporation" in (figure.quote or "")

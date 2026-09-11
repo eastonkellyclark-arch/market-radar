@@ -23,9 +23,30 @@ deciding whether to trust it.
 
 **And the quote is verified against the source.** The model is required to return
 the exact text it took the number from; if that text is not in the section it was
-given, the figure is rejected as ``not_parsed``. That is a cheap, mechanical
-check on the one failure mode this tier actually has -- inventing a plausible
-number -- and it is the reason a small local model is an acceptable fallback.
+given, the figure is rejected as ``UNCITED``. It catches real errors -- two of
+nineteen in the hand-check -- and it is the reason a small local model is an
+acceptable fallback at all.
+
+**What it does not catch is misattribution, and that is the dominant failure.**
+Measured over 20 proxies on 2026-09-11: every wrong number was genuinely in the
+text and cited correctly, and answered a different question.
+
+    Farmer Brothers   exchange_ratio 1.0, quoting "each share of common stock of
+                      **Merger Sub** ... shall automatically be converted" --
+                      boilerplate merger mechanics, not what target holders get.
+                      It is an all-cash deal with no ratio at all.
+    Royal Gold        consideration $2.00, quoting "C$2.00 in cash per common
+                      share" -- a *different* deal inside the same document
+                      (Sandstorm buying Horizon), in Canadian dollars, in a proxy
+                      where Royal Gold is the buyer.
+    Comerica          premium 7%, quoting "premium of 7.0% and 75th percentile
+                      premium of 22" -- a percentile from a comparables table.
+
+A citation proves the number was read rather than invented. It says nothing about
+*what the number is of*. So v2 must make the model return the thing the figure is
+attached to -- whose shares, which currency, which reference price -- and either
+check that or store it, because a wrong entity is invisible today and a
+misattributed takeout price is exactly the error this module was built to fix.
 
 **Reason codes, same discipline as deals.** ``not_stated`` and ``not_parsed``
 stay distinct, because a stock-for-stock merger genuinely has no cash price per
