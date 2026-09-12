@@ -154,6 +154,10 @@ class Context:
     #: the coverage report is computed with the rows and is not stored apart
     #: from them.
     xbrl: dict[str, Any] = field(default_factory=dict)
+    #: Peer sets and the ladder's own answer. Built by `mr dashboard` from a
+    #: normalized quarter, like `xbrl` above and for the same reason: the depth
+    #: split is computed with the sets and is not stored apart from them.
+    comps: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -457,6 +461,33 @@ def _probe_xbrl(ctx: Context) -> tuple[str, str]:
     )
 
 
+def _probe_comps(ctx: Context) -> tuple[str, str]:
+    """Live once peer sets are built, and it reports the *ladder*, not coverage.
+
+    Coverage alone would be the misleading headline here. 62% of operating filers
+    get a peer set, which sounds like the answer -- but only 54% of those sets
+    are at the 4-digit SIC that was asked for, and a reader who takes the
+    coverage number and not the depth split has been told the weaker half.
+    """
+    stats = (ctx.comps or {}).get("stats") or {}
+    if not stats:
+        return WAITING, "no peer sets built -- run `mr comps`"
+    depths = stats.get("depths") or {}
+
+    def at(depth: int) -> int:
+        return int(depths.get(str(depth), depths.get(depth, 0)) or 0)
+
+    served = at(4) + at(3) + at(2)
+    if not served:
+        return WAITING, "no filer reached the peer floor"
+    axes = stats.get("axes") or {}
+    both = int(axes.get("both", 0) or 0)
+    return LIVE, (
+        f"{served:,} peer sets; {at(4) / served * 100:.0f}% at the 4-digit SIC "
+        f"asked for, {both:,} degraded on both axes"
+    )
+
+
 def _probe_deals(ctx: Context) -> tuple[str, str]:
     if not ctx.deals:
         return WAITING, "no deal candidates stored -- run `mr deals`"
@@ -548,6 +579,12 @@ PANELS: Final[tuple[Panel, ...]] = (
           "resolved, which fell through, and which of five reasons each miss "
           "had -- only one of them is work.",
           probe=_probe_xbrl),
+    Panel("comps", "Peer sets", "Analysis",
+          "Peers by SIC and size from the six concepts. The depth column is "
+          "the panel: the ladder tries 4-digit SIC, then 3, then 2, and says "
+          "which it settled on -- because the extra digit buys nothing "
+          "measurable and the size band does the work.",
+          probe=_probe_comps),
     Panel("multiples", "Deal multiples", "Analysis",
           "Comparable transactions, filtered before ranked.",
           weekend="Beyond"),
@@ -844,6 +881,11 @@ def render(
         (ctx.xbrl or {}).get("coverage") or [],
         (ctx.xbrl or {}).get("funnel"),
         quarter=(ctx.xbrl or {}).get("quarter") or "",
+    )
+    bodies["comps"] = body_html.comps_html(
+        (ctx.comps or {}).get("rows") or [],
+        (ctx.comps or {}).get("stats") or {},
+        (ctx.comps or {}).get("funnel"),
     )
     bodies["private"] = body_html.private_html(private or [], private_stats or {})
     bodies["mature"] = body_html.mature_html(mature or [], mature_stats or {})

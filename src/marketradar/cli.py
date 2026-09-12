@@ -168,6 +168,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_5500.add_argument("--no-load", action="store_true",
                         help="report only; write no parquet and no queue rows")
 
+    p_comps = sub.add_parser(
+        "comps", help="peer sets by SIC and size, with the depth each settled on")
+    p_comps.add_argument("--out", default=".cache/xbrl/out", metavar="DIR",
+                         help="directory holding the fundamentals partitions")
+    p_comps.set_defaults(func=_cmd_comps)
+
     p_xbrl = sub.add_parser(
         "xbrl",
         help="normalize one quarter of SEC fundamentals and report coverage",
@@ -840,6 +846,140 @@ def _cmd_xbrl(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+#: All the loaded quarters, not just the newest one. A peer set is built from
+#: each filer's *latest* annual observation, so narrowing to one quarter would
+#: silently restrict the universe to the filers whose fiscal year happens to land
+#: there -- q1 carries the December year ends and q2-q4 are a fifth the size.
+COMPS_GLOB: str = "xbrl_fundamentals_*.parquet"
+
+
+def _comps_rows(con: Any, out_dir: Path) -> dict[str, Any]:
+    """Peer sets over every loaded quarter, plus the ladder's own answer.
+
+    Read from the partitions rather than from Postgres for the same reason the
+    XBRL coverage is: the depth split and the degradation counts are computed
+    with the sets and are not a second copy of a number that could drift.
+    """
+    from marketradar.screens import comps as comps_mod
+
+    files = sorted(out_dir.glob(COMPS_GLOB))
+    if not files:
+        return {}
+    glob = (out_dir / COMPS_GLOB).as_posix()
+    con.execute(
+        f"create or replace view _comps_xb as select * from read_parquet('{glob}')"
+    )
+    result = comps_mod.screen(con, fundamentals="_comps_xb")
+    served = [r for r in result.rows if r.outcome == comps_mod.SERVED]
+    widened = [r for r in served if r.depth_fell_back]
+    thinned = [r for r in served if r.thinned]
+    both = [r for r in served if len(r.degraded) > 1]
+    # Worst first: a reader opening this panel is looking for the sets that
+    # cannot be trusted, not the 4-digit ones that can.
+    served.sort(key=lambda r: (-len(r.degraded), -(r.turnover_iqr or 0.0),
+                               r.company))
+    return {
+        "quarters": len(files),
+        "rows": [
+            {
+                "cik": r.cik, "company": r.company, "sic": r.sic,
+                "sic_depth": r.sic_depth,
+                "peers_banded": r.peers_banded,
+                "peers_material": r.peers_material,
+                "turnover_median": r.turnover_median,
+                "turnover_iqr": r.turnover_iqr,
+                "turnover_self": r.turnover_self,
+                "caveat": r.caveat() or "",
+            }
+            for r in served
+        ],
+        "stats": {
+            "outcomes": result.outcomes,
+            "depths": {str(k): v for k, v in result.depths.items()},
+            "axes": {
+                "industry widened": len(widened),
+                "thinned": len(thinned),
+                "both": len(both),
+                "clean": len(served) - len(widened) - len(thinned) + len(both),
+            },
+            "alternatives": {
+                (f"revenue >= "
+                 f"{'none' if not m else f'${m / 1e6:g}M'} and >= {n} peers"): v
+                for (m, n), v in result.alternatives.items()
+            },
+        },
+        "funnel": result.funnel.as_dict() if hasattr(result.funnel, "as_dict")
+        else None,
+    }
+
+
+def _cmd_comps(args: argparse.Namespace) -> int:
+    """Peer sets by SIC and size, with the depth each one settled on.
+
+    **The depth is the output, not a setting.** Measured 2026-09-12 on the 2,441
+    filers that clear eight peers at every depth -- the only population where the
+    three numbers compare -- within-set asset-turnover IQR is 0.432 at 4-digit,
+    0.438 at 3-digit and 0.492 at 2-digit. The extra SIC digit buys nothing
+    measurable, while the size band moves margin IQR from 0.956 to 0.613. So the
+    ladder is a defensible default rather than a validated one, and every row
+    carries which depth it got, exactly as the resolved tag rides on every
+    fundamentals row.
+    """
+    from marketradar import storage
+
+    con = storage.connect()
+    built = _comps_rows(con, Path(args.out))
+    if not built:
+        print(f"mr comps: no partitions under {args.out}; run `mr xbrl` first",
+              file=sys.stderr)
+        return EXIT_ERROR
+    stats = built["stats"]
+    print(f"peer sets over {built['quarters']} loaded quarters")
+    print()
+    for line in _comps_lines(stats, built["rows"]):
+        print(line)
+    return EXIT_OK
+
+
+def _comps_lines(stats: dict[str, Any], rows: list[dict[str, Any]]) -> list[str]:
+    out = []
+    depths = stats["depths"]
+    served = sum(int(v) for v in depths.values()) or 1
+    out.append("why a filer has no peer set")
+    total = sum(int(v) for v in stats["outcomes"].values()) or 1
+    for name, got in stats["outcomes"].items():
+        out.append(f"  {name:<16} {int(got):>6,}  {int(got) / total * 100:5.1f}%")
+    out.append("")
+    out.append("the depth the ladder settled on")
+    for depth in ("4", "3", "2"):
+        got = int(depths.get(depth, 0))
+        mark = "  <- asked for" if depth == "4" else ""
+        out.append(f"  {depth}-digit        {got:>6,}  "
+                   f"{got / served * 100:5.1f}%{mark}")
+    out.append("")
+    out.append("how the served sets are degraded")
+    for name, got in stats["axes"].items():
+        out.append(f"  {name:<18} {int(got):>6,}")
+    out.append("  `both` is the row a clean median hides: a widened industry and")
+    out.append("  a thinned set are different compromises and it carries each")
+    out.append("")
+    out.append("coverage at floors that were not chosen")
+    for label, got in sorted(stats["alternatives"].items()):
+        out.append(f"  {label:<44} {int(got):>6,}")
+    if rows:
+        out.append("")
+        out.append("most-degraded sets first")
+        for row in rows[:10]:
+            out.append(
+                f"  {row['company'][:30]:<32} sic {row['sic']} "
+                f"depth {row['sic_depth']}  "
+                f"{row['peers_material']:>3} of {row['peers_banded']:>3} peers  "
+                f"turnover {row['turnover_median']:.2f} "
+                f"+/- {row['turnover_iqr']:.2f}"
+            )
+    return out
+
+
 def _cmd_dashboard(args: argparse.Namespace) -> int:
     """Render the panel map to a local file and open it.
 
@@ -895,6 +1035,13 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         ctx.xbrl = _xbrl_coverage(con, Path(".cache/xbrl/out"))
     except Exception as exc:
         ctx.notes.append(f"XBRL coverage unavailable: {str(exc)[:140]}")
+
+    # U15. Same contract as U10 above: a panel that cannot be drawn says so in
+    # the shell rather than taking the page down.
+    try:
+        ctx.comps = _comps_rows(con, Path(".cache/xbrl/out"))
+    except Exception as exc:
+        ctx.notes.append(f"Peer sets unavailable: {str(exc)[:140]}")
 
     private, private_stats = _private_rows(series=series)
     try:
@@ -1946,6 +2093,14 @@ def main(argv: list[str] | None = None) -> int:
 
             label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
             print(f"mr xbrl: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "comps":
+        load_dotenv()
+        try:
+            return _cmd_comps(args)
+        except Exception as exc:
+            print(f"mr comps: error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "targets":

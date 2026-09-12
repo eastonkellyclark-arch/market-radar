@@ -1499,3 +1499,203 @@ def xbrl_html(
         and <code>period_mismatch</code> is about the filing rather than the
         map. Summing them into "missing" would describe none of them.</p>
       {stages}"""
+
+
+# --- U15: comps ---------------------------------------------------------
+
+#: How each outcome reads on screen. Spelled out rather than shown as a code,
+#: for the same reason the XBRL statuses are: the whole point of having four
+#: outcomes instead of one "no peers" is that a reader never has to guess.
+_COMPS_OUTCOME_WHY: Final[dict[str, str]] = {
+    "served": "a peer set at the floor or better",
+    "unplaceable": "no SIC to group on, or no assets to band on -- it cannot "
+                   "be placed at all, which is not the same as being alone",
+    "immaterial": "the filer's own revenue is below the floor. Widening the "
+                  "industry cannot fix this, which is why it is said apart",
+    "too_few_peers": "placed, material, and still short at two digits -- the "
+                     "end of the ladder, there is no coarser code",
+}
+
+#: The two axes a set can be compromised on, plus the intersection. All three
+#: are shown because they are different compromises: a fallback means the
+#: industry is broader than asked for, a thinned set means the members are fewer
+#: than the band selected.
+_COMPS_AXES: Final[tuple[tuple[str, str], ...]] = (
+    ("industry widened", "the ladder fell past 4-digit SIC"),
+    ("thinned", "over half the banded peers are below the revenue floor"),
+    ("both", "twice removed from what was asked for"),
+    ("clean", "4-digit SIC, set intact"),
+)
+
+
+def _comps_depth_mark(depth: int | None) -> str:
+    """The SIC depth, marked when it is not the one that was asked for."""
+    if depth is None:
+        return '<span class="note">--</span>'
+    if depth == 4:
+        return "4-digit"
+    return f'<span class="collapsed">{depth}-digit</span>'
+
+
+def _comps_set_mark(row: dict[str, Any]) -> str:
+    """Banded against material, so a thinned set is visible as a fraction.
+
+    Printed as ``8 of 50`` rather than as ``8``, because the count alone reads
+    as a healthy set when it is the remainder of an unhealthy one.
+    """
+    banded = int(row.get("peers_banded") or 0)
+    material = int(row.get("peers_material") or 0)
+    if banded and material < banded:
+        cls = "collapsed" if material < banded * 0.5 else "note"
+        return f'{material:,} <span class="{cls}">of {banded:,} banded</span>'
+    return f"{material:,}"
+
+
+def comps_html(
+    rows: list[dict[str, Any]],
+    stats: dict[str, Any] | None = None,
+    funnel: dict[str, Any] | None = None,
+) -> str:
+    """Peer sets, the depth each one settled on, and what it gave up.
+
+    **The depth column is the panel**, not a detail beside it. Measured
+    2026-09-12: the SIC digit buys nothing measurable on similarity -- within-set
+    asset-turnover IQR is 0.432 at 4-digit and 0.492 at 2-digit on the 2,441
+    filers that clear eight peers at all three depths -- while the size band
+    moves margin IQR from 0.956 to 0.613. So the ladder is a defensible default
+    rather than a validated one, and a reader who disagrees needs to see what
+    they got.
+
+    Spread sits beside every median for the same reason a coverage number sits
+    beside every XBRL concept: a median with no spread is a number that cannot
+    be distrusted.
+    """
+    stats = stats or {}
+    if not rows:
+        return ('<p class="why"><span class="why-k">waiting</span> No peer sets '
+                "built. Run <code>mr comps</code> over a normalized quarter.</p>")
+    body = []
+    for row in rows[:ROWS_PER_LIST]:
+        iqr = row.get("turnover_iqr")
+        med = row.get("turnover_median")
+        own = row.get("turnover_self")
+        caveat = row.get("caveat") or ""
+        body.append(
+            "<tr>"
+            f'<td class="tk">{_esc(str(row.get("company") or ""))}</td>'
+            f'<td class="num">{_esc(str(row.get("sic") or ""))}</td>'
+            f'<td>{_comps_depth_mark(row.get("sic_depth"))}</td>'
+            f'<td class="num">{_comps_set_mark(row)}</td>'
+            f'<td class="num">{"--" if med is None else format(float(med), ".2f")}</td>'
+            f'<td class="num">{"--" if iqr is None else format(float(iqr), ".2f")}</td>'
+            f'<td class="num">{"--" if own is None else format(float(own), ".2f")}</td>'
+            f'<td class="note">{_esc(caveat)}</td>'
+            "</tr>"
+        )
+    outcomes = stats.get("outcomes") or {}
+    total = sum(int(v) for v in outcomes.values()) or 1
+    why_rows = "".join(
+        "<tr>"
+        f'<td class="tk">{_esc(name)}</td>'
+        f'<td class="num">{int(outcomes.get(name, 0)):,}</td>'
+        f'<td class="num">{int(outcomes.get(name, 0)) / total * 100:.1f}%</td>'
+        f'<td class="note">{_esc(why)}</td>'
+        "</tr>"
+        for name, why in _COMPS_OUTCOME_WHY.items()
+    )
+    depths = stats.get("depths") or {}
+
+    def at_depth(depth: int) -> int:
+        return int(depths.get(str(depth), depths.get(depth, 0)) or 0)
+
+    served = sum(at_depth(d) for d in (4, 3, 2)) or 1
+    depth_rows = "".join(
+        "<tr>"
+        f'<td class="tk">{d}-digit</td>'
+        f'<td class="num">{at_depth(d):,}</td>'
+        f'<td class="num">{at_depth(d) / served * 100:.1f}%</td>'
+        f'<td class="note">'
+        f'{"what was asked for" if d == 4 else "a fallback"}</td>'
+        "</tr>"
+        for d in (4, 3, 2)
+    )
+    axes = stats.get("axes") or {}
+    axis_rows = "".join(
+        "<tr>"
+        f'<td class="tk">{_esc(name)}</td>'
+        f'<td class="num">{int(axes.get(name, 0)):,}</td>'
+        f'<td class="note">{_esc(why)}</td>'
+        "</tr>"
+        for name, why in _COMPS_AXES
+    )
+    alts = stats.get("alternatives") or {}
+    alt_rows = "".join(
+        "<tr>"
+        f'<td class="tk">{_esc(str(label))}</td>'
+        f'<td class="num">{int(got):,}</td>'
+        "</tr>"
+        for label, got in sorted(alts.items())
+    )
+    stages = _funnel_html(funnel) if funnel else ""
+    return f"""
+      <p class="why"><span class="why-k">how to read this</span>
+        A peer set is an assertion that these companies are alike enough for
+        one's ratio to say something about another's, and the assertion is
+        usually weaker than it looks. <strong>The depth column is the
+        panel.</strong> Measured 2026-09-12 on the 2,441 filers that clear eight
+        peers at every depth &mdash; the only population where the three numbers
+        compare &mdash; within-set asset-turnover spread is 0.43 at 4-digit and
+        0.49 at 2-digit. The extra SIC digit buys nothing measurable. What does
+        the work is the size band: margin spread runs 0.96 with no band and 0.61
+        inside a 3&times; one.</p>
+      <table class="rows">
+        <thead><tr><th>company</th><th class="num">SIC</th><th>depth</th>
+          <th class="num" title="peers clearing the revenue floor, against the
+            number the industry and size rules selected">peers</th>
+          <th class="num" title="median asset turnover across the peer set">
+            turnover</th>
+          <th class="num" title="interquartile range of the peer set's asset
+            turnover -- how alike the set it just averaged is">spread</th>
+          <th class="num">own</th><th>what it gave up</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+      <p class="note"><strong>Asset turnover, not net margin.</strong> Margin's
+        denominator is the thing half the biggest SIC code does not have: 2834,
+        pharmaceutical preparations, is 793 filers &mdash; 12.3% of the universe
+        &mdash; and 53% of them report under $1M of revenue, giving the code a
+        within-group margin spread of 15.2 around a <em>median of
+        &minus;1.7</em>. Turnover has assets underneath it, and every filer has
+        assets.</p>
+      <h5>why a filer has no peer set</h5>
+      <table class="rows">
+        <thead><tr><th>outcome</th><th class="num">filers</th>
+          <th class="num">share</th><th>what it means</th></tr></thead>
+        <tbody>{why_rows}</tbody>
+      </table>
+      <h5>the depth the ladder settled on</h5>
+      <table class="rows">
+        <thead><tr><th>depth</th><th class="num">served</th>
+          <th class="num">share</th><th></th></tr></thead>
+        <tbody>{depth_rows}</tbody>
+      </table>
+      <h5>how the served sets are degraded</h5>
+      <table class="rows">
+        <thead><tr><th>axis</th><th class="num">sets</th><th>why it matters</th>
+          </tr></thead>
+        <tbody>{axis_rows}</tbody>
+      </table>
+      <p class="note"><strong>The <code>both</code> row is the one a clean
+        median hides.</strong> A widened industry and a thinned set are
+        different compromises, so a set carrying both says both &mdash;
+        reporting only the worse one would make those look singly degraded.</p>
+      <h5>coverage at floors that were not chosen</h5>
+      <p class="note">The default is a choice with a cost. Raising the revenue
+        floor to $50M tightens turnover spread only from 0.44 to 0.35 while
+        dropping coverage from 82.6% to 53.9% of the universe &mdash; so the
+        floor is set low, as a correctness floor against a near-zero
+        denominator, not as a similarity floor.</p>
+      <table class="rows">
+        <thead><tr><th>floor</th><th class="num">served</th></tr></thead>
+        <tbody>{alt_rows}</tbody>
+      </table>
+      {stages}"""

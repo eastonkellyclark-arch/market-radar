@@ -539,6 +539,7 @@ the build goes red naming both.
 | Private | Mature targets | `mature` | live | W4 |
 | Private | Entity review queue | `review` | live | W4 |
 | Analysis | XBRL fundamentals | `xbrl` | live | six concepts with their own coverage figures, the five statuses behind each miss, and the tags to add. U10, shipped with `tag_map.py` rather than after it |
+| Analysis | Peer sets | `comps` | live | U15. Peers by SIC and size from the six concepts. The depth column is the panel: the ladder tries 4-digit SIC, then 3, then 2, and records which it settled on, because the extra digit buys nothing measurable and the size band does the work |
 | Analysis | Deal multiples | `multiples` | not built | beyond |
 | Analysis | Historical outcomes | `outcomes` | live | W3-T3. The survivorship caveat renders beside the number, not in a docstring |
 | Analysis | DCF / 3-statement | `dcf` | not built | beyond |
@@ -1801,6 +1802,147 @@ Also corrected on the way through: `tests/test_repo_invariants.py` globbed
 `sources/*.py` non-recursively, so a source that is a *package* was invisible to
 all three repo rules — no URL check, no freshness check, no ban on
 non-deterministic row picks. Nothing failed, which is the problem.
+
+### Comps — peer sets, measured 2026-09-12
+
+Peers by SIC and size from the six resolved concepts. No prices anywhere: this
+produces peer *sets* and fundamental ratios, and a market multiple needs a market
+cap that XBRL does not carry.
+
+Population: 6,431 operating filers over the 30 loaded quarters, one **latest
+annual observation** each. Financials never enter — they are excluded at load,
+because a bank's top line is interest income.
+
+#### Peer-set size, by SIC depth, inside a 3× asset band
+
+5,190 filers carry revenue, assets and net income — the fixed population.
+
+| peers | 4-digit | 3-digit | 2-digit |
+|---|---|---|---|
+| 0 | 552 (10.6%) | 328 (6.3%) | 86 (1.7%) |
+| 1–2 | 943 (18.2%) | 672 (12.9%) | 198 (3.8%) |
+| 3–4 | 657 (12.7%) | 533 (10.3%) | 169 (3.3%) |
+| 5–7 | 597 (11.5%) | 549 (10.6%) | 288 (5.5%) |
+| 8–14 | 749 (14.4%) | 735 (14.2%) | 534 (10.3%) |
+| 15–29 | 505 (9.7%) | 569 (11.0%) | 759 (14.6%) |
+| 30–99 | 744 (14.3%) | 839 (16.2%) | 1,485 (28.6%) |
+| 100+ | 443 (8.5%) | 965 (18.6%) | 1,671 (32.2%) |
+
+Reaching eight peers: **47.0% at 4-digit, 59.9% at 3-digit, 85.7% at 2-digit.**
+Median set 8 / 14 / 51.
+
+The band keys on **assets, not revenue**: assets is stated on 97.8% of operating
+filers against revenue's 81.1%, and a revenue-keyed band would drop the
+pre-revenue population silently rather than reporting it.
+
+#### The SIC digit buys nothing measurable. The band does the work
+
+On the **2,441 filers that clear eight peers at all three depths** — the only
+population where the three numbers compare:
+
+| depth | mean set | margin IQR | turnover IQR |
+|---|---|---|---|
+| 4-digit | 50.2 | 0.613 | 0.432 |
+| 3-digit | 97.0 | 0.591 | 0.438 |
+| 2-digit | 145.9 | 0.538 | 0.492 |
+
+2-digit sets are **not more dispersed on net margin — slightly less**, and
+turnover moves the other way by a similar amount. Neither is a cliff.
+
+What moves the number is the size band. Same filers, no band: margin IQR **0.956**
+at 4-digit against 0.613 with a 3× band — a 36% tightening from the band, and
+roughly nothing from the digit.
+
+**The first version of this measurement said the opposite**, that 2-digit sets
+were dramatically tighter. Only 2,598 filers qualify at 4-digit against 4,544 at
+2-digit, and the 4-digit survivors cluster in the dense codes, so it was comparing
+different populations — the same mistake that made the XBRL span metric read
+revenue falling 8.1pp. Also: `sic / 100` is *true* division in DuckDB, so the very
+first run grouped all three depths on the raw code and produced three identical
+columns. Identical columns across three depths should have been the tell.
+
+So the depth is a **ladder, not a setting** — narrowest that clears the floor, 4
+then 3 then 2 — and the resolved depth rides on every row, exactly as the resolved
+tag rides on every fundamentals row. The narrowing is a defensible default rather
+than a validated one, and recording it is what lets a consumer disagree.
+
+#### Net margin is unusable where revenue is near zero
+
+SIC **2834**, pharmaceutical preparations, is **793 filers — 12.3% of the
+universe** — and **53% of them report under $1M of revenue**. Its within-code
+margin IQR is **15.2** around a *median of −1.7*. 2836 is 50% under $1M. Those are
+pre-revenue biotechs, and a ratio with a near-zero denominator is arithmetic with
+a valuation's units.
+
+So the similarity diagnostic is **asset turnover**, which has assets underneath it
+and every filer has assets. It is reported as a median **and an IQR**, beside the
+filer's own value: a median with no spread is a number that cannot be distrusted.
+
+The SIC distribution is also violently skewed — 38 of 370 codes hold exactly one
+filer, 176 hold 2–7, and **14.2% of filers sit in a 4-digit code with fewer than
+eight members**, so for them the digit is not a choice.
+
+#### The materiality floor is a correctness floor, not a similarity floor
+
+| materiality | filers with a usable revenue | turnover IQR | margin IQR |
+|---|---|---|---|
+| none | 82.6% of universe | 0.439 | 0.472 |
+| $1M | 73.4% | 0.434 | 0.319 |
+| $10M | 63.5% | 0.410 | 0.247 |
+| $50M | 53.9% | 0.346 | 0.202 |
+
+Raising it to $50M tightens turnover spread only from 0.439 to 0.346 while
+dropping coverage by 29 points. **Similarity does not justify it.** What justifies
+it is that a peer with $200k of revenue and $50M of assets contributes a 250×
+ratio that is a rounding artifact.
+
+So the default is deliberately low — **$1M**, which is nearly free at 0.439 →
+0.434 — and the higher floors are *reported beside it* rather than imposed, the
+way a concept's coverage number sits beside the concept.
+
+Conditional on having revenue, the peer-count floor costs about the same 13 points
+at every materiality level (94.6% → 85.7% at no floor, 95.8% → 86.8% at $1M, 96.2%
+→ 86.8% at $10M), so the two floors are close to independent.
+
+#### What the screen produces, at the chosen floors
+
+$1M revenue, eight material peers, 3× asset band:
+
+| | |
+|---|---|
+| served | **4,004** (62.3%) |
+| unplaceable | 143 (2.2%) — no SIC, or no assets |
+| immaterial | 1,675 (26.0%) — the *filer* is below the floor |
+| too_few_peers | 609 (9.5%) — still short at two digits |
+
+Depth the ladder settled on: **4-digit 2,155 (53.8%), 3-digit 622 (15.5%),
+2-digit 1,227 (30.6%).**
+
+`immaterial` is said apart from `too_few_peers` because widening the industry
+cannot fix being below the floor yourself, and the first draft had them in one
+indistinguishable bucket.
+
+#### A degraded set says so on both axes
+
+| axis | sets |
+|---|---|
+| industry widened | 1,849 |
+| thinned (over half the banded peers below the floor) | 248 |
+| **both** | **82** |
+| clean | 1,989 |
+
+**The `both` row is the one a clean median hides.** A widened industry and a
+thinned set are different compromises — one means the industry is broader than
+asked for, the other that the members are fewer than the band selected — so a set
+carrying both reports both. Reporting only the worse would make those 82 look
+singly degraded.
+
+The panel prints the peer count as a fraction (`11 of 75 banded`) rather than as a
+count, because the survivors read as a healthy set when they are the remainder of
+an unhealthy one, and it sorts most-degraded first: a reader opening the panel is
+looking for the sets that cannot be trusted. The worst of them are exactly what
+you would want flagged — ALLIED ENERGY at turnover 2.18 ± 6.43 over 8 of 19 peers
+is not a comparison.
 
 #### Decisions needed before starting
 

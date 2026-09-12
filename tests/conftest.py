@@ -193,6 +193,39 @@ XBRL_COVERAGE: dict[str, object] = {
 }
 
 
+#: A loaded comps panel. Shaped like what `_comps_rows` returns, including a set
+#: degraded on both axes -- that row is the whole reason the panel exists, so a
+#: fixture without one would leave the interesting branch untested.
+COMPS_SETS: dict = {
+    "quarters": 30,
+    "rows": [
+        {"cik": "0000009", "company": "WIDENED AND THINNED INC", "sic": 7389,
+         "sic_depth": 2, "peers_banded": 75, "peers_material": 11,
+         "turnover_median": 3.40, "turnover_iqr": 3.20, "turnover_self": 0.12,
+         "caveat": "industry widened to 2-digit SIC; 64 of 75 peers below the "
+                   "$1M revenue floor"},
+        {"cik": "0000010", "company": "CLEAN SET CORP", "sic": 3674,
+         "sic_depth": 4, "peers_banded": 14, "peers_material": 14,
+         "turnover_median": 0.62, "turnover_iqr": 0.21, "turnover_self": 0.58,
+         "caveat": ""},
+    ],
+    "stats": {
+        "outcomes": {"served": 4004, "unplaceable": 143, "immaterial": 1675,
+                     "too_few_peers": 609},
+        "depths": {"4": 2155, "3": 622, "2": 1227},
+        "axes": {"industry widened": 1849, "thinned": 248, "both": 82,
+                 "clean": 1989},
+        "alternatives": {
+            "revenue >= none and >= 8 peers": 4454,
+            "revenue >= $1M and >= 8 peers": 4004,
+            "revenue >= $10M and >= 8 peers": 3467,
+            "revenue >= $50M and >= 8 peers": 2913,
+        },
+    },
+    "funnel": None,
+}
+
+
 def loaded_context(**overrides):
     """A dashboard Context with every source present and nothing empty.
 
@@ -259,6 +292,7 @@ def loaded_context(**overrides):
         ],
         review_counts={"pending": 1, "confirmed": 0, "rejected": 0},
         xbrl=XBRL_COVERAGE,
+        comps=COMPS_SETS,
     )
     base.update(overrides)
     ctx = shell.Context(**base)

@@ -16,6 +16,7 @@ import pytest
 from marketradar import digest as digest_mod
 from marketradar.dashboard import panels, shell
 from marketradar.screens import volatility
+from conftest import COMPS_SETS
 
 D3, D4 = date(2026, 9, 3), date(2026, 9, 4)
 
@@ -266,3 +267,68 @@ def test_the_ticker_detail_script_is_scanned_too() -> None:
         details=details)
     assert "createElementNS" in page, "the drawing script is in the page"
     _assert_self_contained(page)
+
+
+# --- U15: peer sets -----------------------------------------------------
+
+
+def test_a_peer_set_degraded_on_both_axes_shows_both_on_the_page() -> None:
+    """The row the panel exists for, rendered rather than merely counted.
+
+    A widened industry and a thinned set are different compromises. The page has
+    to carry each, because a reader scanning a median column would see a
+    perfectly ordinary 3.40 next to a set that is two steps removed from the
+    industry and size that were asked for.
+    """
+    html = panels.comps_html(
+        COMPS_SETS["rows"], COMPS_SETS["stats"], COMPS_SETS["funnel"])
+    assert "WIDENED AND THINNED INC" in html
+    # The depth is marked, not just printed: 2-digit is a fallback and reads as
+    # one.
+    assert "2-digit" in html
+    assert 'class="collapsed">2-digit' in html
+    # The peer count is a fraction, so the survivors cannot read as the set.
+    assert "11 " in html and "of 75 banded" in html
+    # And the caveat names both axes in words.
+    assert "industry widened to 2-digit SIC" in html
+    assert "$1M revenue floor" in html
+
+
+def test_the_clean_set_carries_no_caveat_on_the_page() -> None:
+    """The control. If a clean 4-digit set also rendered a caveat, the marking
+    would mean nothing."""
+    html = panels.comps_html(
+        COMPS_SETS["rows"], COMPS_SETS["stats"], COMPS_SETS["funnel"])
+    clean = html.split("CLEAN SET CORP", 1)[1].split("</tr>", 1)[0]
+    assert "4-digit" in clean
+    assert "collapsed" not in clean, "a clean set was marked as degraded"
+    assert "banded" not in clean, "an intact set was shown as a fraction"
+
+
+def test_the_panel_says_which_axes_and_does_not_lump_them() -> None:
+    html = panels.comps_html(
+        COMPS_SETS["rows"], COMPS_SETS["stats"], COMPS_SETS["funnel"])
+    for axis in ("industry widened", "thinned", "both", "clean"):
+        assert axis in html, f"the {axis!r} axis is not on the page"
+    # Every outcome is named with what it means, so a blank is never guessed at.
+    for outcome in ("served", "unplaceable", "immaterial", "too_few_peers"):
+        assert outcome in html
+    # And the unchosen floors are shown beside the chosen one.
+    assert "coverage at floors that were not chosen" in html
+    assert "$50M" in html
+
+
+def test_the_panel_explains_turnover_rather_than_margin() -> None:
+    """Net margin is unusable where revenue is near zero, and the page says so
+    where a reader would otherwise ask why the obvious ratio is missing."""
+    html = panels.comps_html(
+        COMPS_SETS["rows"], COMPS_SETS["stats"], COMPS_SETS["funnel"])
+    assert "Asset turnover, not net margin" in html
+    assert "2834" in html
+    assert "spread" in html, "a median with no spread cannot be distrusted"
+
+
+def test_an_empty_comps_panel_says_what_to_run() -> None:
+    html = panels.comps_html([], {}, None)
+    assert "mr comps" in html
+    assert "waiting" in html
