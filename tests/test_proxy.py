@@ -719,3 +719,154 @@ def test_section_window_is_case_sensitive_and_that_is_recorded() -> None:
         for pattern in proxy.SECTION_PATTERNS[name]:
             assert not pattern.startswith("(?i:"), (
                 f"{name} gained a case flag; re-measure the 40 windows first")
+
+
+# --- projections, and the self-check that makes them storable -----------
+
+
+def proj_said(years: list[dict], **over) -> dict:
+    base = {"present": True, "units": "millions", "scenario": "Management Case",
+            "years": years, "quote": "Fiscal year 2027E 2028E 2029E",
+            "attributed_to": "Company, Inc."}
+    base.update(over)
+    return base
+
+
+GOOD_YEARS = [
+    {"fiscal_year": 2027, "revenue": 1240, "ebitda": 210},
+    {"fiscal_year": 2028, "revenue": 1390, "ebitda": 244},
+    {"fiscal_year": 2029, "revenue": 1520, "ebitda": 271},
+]
+
+
+def test_a_coherent_table_is_stated_and_yields_a_growth_rate() -> None:
+    """The whole reason to read this field: management projections are the only
+    forward estimate anywhere in this system, and the DCF's weakest input is a flat
+    growth constant that beat every rate fitted from our own 30 quarters."""
+    model = FakeModel(proj_said(GOOD_YEARS))
+    got = proxy.extract_projections("acc-p", PROJECTIONS, client=model,
+                                    providers=ONLY_GROQ, filer="Company Inc",
+                                    filed_year=2026)
+    assert got.reason == proxy.STATED
+    assert got.failures == ()
+    assert got.usable
+    assert [y.fiscal_year for y in got.years] == [2027, 2028, 2029]
+    assert got.scenario == "Management Case"
+    assert got.units == "millions"
+    assert got.measures == ("revenue", "ebitda")
+    # (1520/1240) ** (1/2) - 1
+    assert got.growth("revenue") == pytest.approx(0.1073, abs=5e-4)
+
+
+def test_the_table_checks_its_own_arithmetic_without_knowing_the_truth() -> None:
+    """**The asymmetry the consideration never had.**
+
+    The consideration is one number in prose that can be confused with three others
+    nearby, and nothing about the answer says which one you got -- every wrong
+    figure in the 20-proxy hand-check was correctly quoted. A projections table is a
+    labelled multi-year grid, so a wrong one can be caught by arithmetic alone:
+    years should run consecutively, EBITDA should sit below revenue, a margin
+    should be plausible, a series should not jump a hundredfold.
+
+    Each failure is named rather than collapsed into a boolean, because "the years
+    are not consecutive" and "EBITDA exceeds revenue" send a reader to different
+    fixes.
+    """
+    # Rows transposed: EBITDA above revenue, and a year skipped.
+    model = FakeModel(proj_said([
+        {"fiscal_year": 2027, "revenue": 210, "ebitda": 1240},
+        {"fiscal_year": 2029, "revenue": 1390, "ebitda": 244},
+    ]))
+    got = proxy.extract_projections("acc-p", PROJECTIONS, client=model,
+                                    providers=ONLY_GROQ, filer="Company Inc",
+                                    filed_year=2026)
+    assert got.reason == proxy.INCOHERENT
+    assert "ebitda_above_revenue" in got.failures
+    assert "years_not_consecutive" in got.failures
+    assert not got.usable
+    assert got.growth("revenue") is None, (
+        "an incoherent table produced a growth rate anyway")
+    # The rows are kept, not discarded: a reader fixing the prompt needs to see
+    # what came back, and `incoherent` already says not to use it.
+    assert len(got.years) == 2
+    assert "fails its own arithmetic" in (got.note or "")
+
+
+def test_a_units_error_reads_as_a_discontinuity() -> None:
+    """A thousandfold step between adjacent years is a units slip or a transposed
+    row, not a forecast -- and it is the error that would quietly turn a $1.2B
+    projection into $1.2M."""
+    model = FakeModel(proj_said([
+        {"fiscal_year": 2027, "revenue": 1240},
+        {"fiscal_year": 2028, "revenue": 1390000},
+    ]))
+    got = proxy.extract_projections("acc-p", PROJECTIONS, client=model,
+                                    providers=ONLY_GROQ, filer="Company Inc")
+    assert got.reason == proxy.INCOHERENT
+    assert "discontinuous_revenue" in got.failures
+
+
+def test_a_single_projected_year_is_not_a_series() -> None:
+    model = FakeModel(proj_said([{"fiscal_year": 2027, "revenue": 1240}]))
+    got = proxy.extract_projections("acc-p", PROJECTIONS, client=model,
+                                    providers=ONLY_GROQ, filer="Company Inc")
+    assert got.failures == ("single_year",)
+    assert got.growth("revenue") is None
+
+
+def test_a_historical_column_read_as_a_projection_is_caught() -> None:
+    """A table of actuals sits in the same block as the forecast, and a model that
+    reads the wrong columns returns years that predate the filing."""
+    model = FakeModel(proj_said([
+        {"fiscal_year": 2011, "revenue": 800},
+        {"fiscal_year": 2012, "revenue": 860},
+    ]))
+    got = proxy.extract_projections("acc-p", PROJECTIONS, client=model,
+                                    providers=ONLY_GROQ, filer="Company Inc",
+                                    filed_year=2026)
+    assert got.reason == proxy.INCOHERENT
+    assert "year_outside_horizon" in got.failures
+
+
+def test_the_incoherent_code_is_stronger_than_not_parsed() -> None:
+    """Not "we could not read it" but "we read something and it cannot be right".
+    Only the projections table can earn it, because only it has arithmetic to
+    fail."""
+    assert proxy.INCOHERENT in proxy.REASONS
+    assert proxy.INCOHERENT != proxy.NOT_PARSED
+    model = FakeModel(proj_said([], present=True))
+    got = proxy.extract_projections("acc-p", PROJECTIONS, client=model,
+                                    providers=ONLY_GROQ, filer="Company Inc")
+    assert got.reason == proxy.NOT_PARSED, (
+        "an empty year list is a parse failure, not an incoherent table")
+
+
+def test_two_scenarios_must_not_be_blended() -> None:
+    """Proxies routinely carry a Management Case and a Sensitivity Case. Averaging
+    them or silently taking whichever appeared first is the midpoint mistake again,
+    so the prompt says to pick one and name it, and the name is stored."""
+    assert "never average them" in proxy.PROJECTIONS_PROMPT
+    assert "Never blend" in proxy.PROJECTIONS_PROMPT
+    model = FakeModel(proj_said(GOOD_YEARS, scenario="Sensitivity Case"))
+    got = proxy.extract_projections("acc-p", PROJECTIONS, client=model,
+                                    providers=ONLY_GROQ, filer="Company Inc")
+    assert got.scenario == "Sensitivity Case"
+
+
+def test_the_units_are_reported_and_never_converted() -> None:
+    """A units guess is how a $1.2B projection becomes $1.2M. The filing's own
+    words are carried and the numbers stay as printed."""
+    assert "Do not convert" in proxy.PROJECTIONS_PROMPT
+    model = FakeModel(proj_said(GOOD_YEARS, units="thousands"))
+    got = proxy.extract_projections("acc-p", PROJECTIONS, client=model,
+                                    providers=ONLY_GROQ, filer="Company Inc")
+    assert got.units == "thousands"
+
+
+def test_an_acquirers_projections_are_rejected_by_attribution() -> None:
+    model = FakeModel(proj_said(GOOD_YEARS, attributed_to="Sandstorm Gold Ltd."))
+    got = proxy.extract_projections("acc-p", PROJECTIONS, client=model,
+                                    providers=ONLY_GROQ,
+                                    filer="Royal Gold, Inc.")
+    assert got.reason == proxy.MISATTRIBUTED
+    assert not got.usable

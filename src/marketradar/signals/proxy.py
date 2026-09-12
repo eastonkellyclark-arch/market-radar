@@ -145,9 +145,24 @@ NOT_A_TAKEOUT: Final[str] = "not_a_takeout"
 #: other. See :func:`check_attribution`.
 MISATTRIBUTED: Final[str] = "misattributed"
 
+#: A structured answer came back and **fails its own arithmetic**.
+#:
+#: Only the projections table can earn this, and that is the point. The
+#: consideration is one number in prose with no internal constraint -- nothing
+#: about it says whether you got the right one, which is why every wrong figure in
+#: the hand-check was correctly quoted. A projections table is a labelled
+#: multi-year grid: years should run consecutively, EBITDA should sit below
+#: revenue, a margin should be plausible, a series should not jump a hundredfold
+#: between adjacent years.
+#:
+#: So this is a parse failure **detectable without knowing the truth**, which is
+#: more than the consideration ever had. Stronger than ``not_parsed``: not "we
+#: could not read it" but "we read something and it cannot be right".
+INCOHERENT: Final[str] = "incoherent"
+
 REASONS: Final[tuple[str, ...]] = (
     STATED, NOT_STATED, NOT_PARSED, NO_SECTION, UNCITED, NOT_A_TAKEOUT,
-    MISATTRIBUTED,
+    MISATTRIBUTED, INCOHERENT,
 )
 
 # --- locating -----------------------------------------------------------
@@ -1145,3 +1160,309 @@ class ReadReport:
             out.append(f"  {wrong_of} figure(s) rejected as of something else -- "
                        "present in the text, correctly quoted, wrong question")
         return out
+
+
+# --- management projections ---------------------------------------------
+#
+# **A different extraction problem from the consideration, and a better-posed one.**
+#
+# The consideration is one number in prose that can be confused with three other
+# numbers within a paragraph -- a merger sub's conversion, a comparables
+# percentile, another deal's price in another currency -- and nothing about the
+# answer tells you which one you got. That is why the only defence was a name
+# check, and why the hand-check found every wrong figure correctly quoted.
+#
+# A projections table is a labelled multi-year grid: structured, repeated, and
+# **internally checkable**. Years should run sequentially. EBITDA should sit below
+# revenue. A margin should be inside a plausible band. Capex should not exceed
+# revenue. A series should not jump a hundredfold between adjacent years.
+#
+# None of those checks needs the truth. That is the asymmetry: a projections table
+# that fails arithmetic sanity is a parse failure **detectable without knowing the
+# right answer**, which is more than the consideration ever had. So the reason
+# codes gain one that means "the model returned a table and the table cannot be
+# right", and it is earned rather than assumed.
+
+#: Measures a projections table may carry, in the order a banker presents them.
+#: Measured across the 15 real takeouts in the cached 20: EBITDA 12, revenue 10,
+#: free cash flow 7, capex 7, net income 6, EBIT 2.
+PROJECTION_MEASURES: Final[tuple[str, ...]] = (
+    "revenue", "ebitda", "ebit", "net_income", "free_cash_flow", "capex",
+)
+
+#: A projected fiscal year must be within this many years of the filing. A table
+#: labelled 2019 in a 2026 proxy is a historical comparative, not a projection,
+#: and a model that returns one has read the wrong columns.
+PROJECTION_HORIZON: Final[int] = 12
+
+#: Plausible EBITDA margin band. The floor is negative because a loss-making
+#: company projecting its way to profitability is the ordinary case in a proxy;
+#: the ceiling is where a margin stops being an operating business and starts
+#: being a royalty stream or a parse error.
+MARGIN_BAND: Final[tuple[float, float]] = (-2.0, 0.70)
+
+#: Adjacent years jumping by more than this are a units error or a transposed row,
+#: not a forecast. Measured against nothing -- it is a sanity bound, and it is set
+#: loose enough that a genuine hockey stick survives it.
+MAX_YEAR_STEP: Final[float] = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class Projection:
+    """One projected fiscal year, as the filing presents it."""
+
+    fiscal_year: int
+    #: ``{measure: value}`` in the filing's own units, which the model reports.
+    values: dict[str, float] = dc_field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionSeries:
+    """A filer's projected years, with the self-check that makes them storable."""
+
+    accession: str
+    reason: str
+    years: tuple[Projection, ...] = ()
+    #: Which scenario, where the filing labels one. Proxies routinely carry a
+    #: "Management Case" and a "Sensitivity Case", and averaging them or taking
+    #: whichever appeared first would be the midpoint mistake again.
+    scenario: str | None = None
+    #: Thousands, millions -- as the filing states it. Carried rather than
+    #: normalised: a units guess is how a $1.2B projection becomes $1.2M.
+    units: str | None = None
+    quote: str | None = None
+    section: str | None = None
+    section_heading: str | None = None
+    section_start: int | None = None
+    section_end: int | None = None
+    provider: str | None = None
+    model: str | None = None
+    prompt_version: str = PROMPT_VERSION
+    note: str | None = None
+    #: Every sanity check that failed, named. Empty on a coherent table.
+    failures: tuple[str, ...] = ()
+
+    @property
+    def usable(self) -> bool:
+        return self.reason == STATED and not self.failures and len(self.years) > 1
+
+    @property
+    def measures(self) -> tuple[str, ...]:
+        seen = {m for y in self.years for m in y.values}
+        return tuple(m for m in PROJECTION_MEASURES if m in seen)
+
+    def growth(self, measure: str = "revenue") -> float | None:
+        """Compound growth across the projected years, or None.
+
+        The number a DCF would actually use. Returns None rather than a guess when
+        the series is too short, non-positive at either end, or failed its checks
+        -- a growth rate derived from an incoherent table is worse than the
+        constant it would replace, because it looks filer-specific.
+        """
+        if not self.usable:
+            return None
+        points = [(y.fiscal_year, y.values[measure]) for y in self.years
+                  if measure in y.values and y.values[measure] > 0]
+        if len(points) < 2:
+            return None
+        points.sort()
+        (y0, v0), (y1, v1) = points[0], points[-1]
+        span = y1 - y0
+        if span <= 0:
+            return None
+        return (v1 / v0) ** (1 / span) - 1
+
+
+def check_projections(
+    years: tuple[Projection, ...], *, filed_year: int | None = None,
+) -> tuple[str, ...]:
+    """Every arithmetic sanity check that failed. Empty means coherent.
+
+    **This is the part the consideration never had.** None of these needs the
+    truth: they are properties a projections table must have to be a projections
+    table at all, so a failure is a detectable parse error rather than a silent
+    wrong number.
+
+    Returned as a list of named failures rather than a boolean, for the same reason
+    substitutions are a list: "the years are not sequential" and "EBITDA exceeds
+    revenue" are different defects and a reader fixing a prompt needs to know which.
+    """
+    out: list[str] = []
+    if len(years) < 2:
+        return ("single_year",)
+    labels = [y.fiscal_year for y in years]
+    if len(set(labels)) != len(labels):
+        out.append("repeated_year")
+    if labels != sorted(labels):
+        out.append("years_out_of_order")
+    if any(b - a != 1 for a, b in zip(sorted(labels), sorted(labels)[1:])):
+        out.append("years_not_consecutive")
+    if filed_year is not None:
+        if any(abs(y - filed_year) > PROJECTION_HORIZON for y in labels):
+            out.append("year_outside_horizon")
+
+    for year in years:
+        rev = year.values.get("revenue")
+        ebitda = year.values.get("ebitda")
+        if rev is not None and ebitda is not None:
+            if rev > 0 and ebitda > rev:
+                out.append("ebitda_above_revenue")
+            if rev > 0:
+                margin = ebitda / rev
+                lo, hi = MARGIN_BAND
+                if not (lo <= margin <= hi):
+                    out.append("implausible_margin")
+        capex = year.values.get("capex")
+        if rev is not None and capex is not None and rev > 0 \
+                and abs(capex) > rev:
+            out.append("capex_above_revenue")
+        ebit = year.values.get("ebit")
+        if ebitda is not None and ebit is not None and ebit > ebitda:
+            out.append("ebit_above_ebitda")
+
+    # A hundredfold step between adjacent years is a units error or a transposed
+    # row. Checked per measure, because a table can be right about revenue and
+    # wrong about the row under it.
+    for measure in PROJECTION_MEASURES:
+        series = [(y.fiscal_year, y.values[measure]) for y in years
+                  if measure in y.values and y.values[measure] > 0]
+        series.sort()
+        for (_a, va), (_b, vb) in zip(series, series[1:]):
+            if max(va, vb) / min(va, vb) > MAX_YEAR_STEP:
+                out.append(f"discontinuous_{measure}")
+                break
+    # Deduplicated, order preserved: one "implausible_margin" is the finding, not
+    # five of them.
+    seen: list[str] = []
+    for name in out:
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
+
+
+PROJECTIONS_PROMPT: Final[str] = (
+    "Find the table of management's projected financial results for this "
+    "company.\n"
+    "\n"
+    "Report one entry per projected fiscal year, with whichever of these "
+    "measures the table gives: revenue, ebitda, ebit, net_income, "
+    "free_cash_flow, capex.\n"
+    "\n"
+    "Rules that matter more than completeness:\n"
+    "- Report the numbers **as printed**, and say the units separately. Do not "
+    "convert. A table in millions stays in millions.\n"
+    "- Projected years only. A column of historical or actual results is not a "
+    "projection, even when it sits in the same table.\n"
+    "- If the filing gives more than one case -- a Management Case and a "
+    "Sensitivity Case, say -- report **one** of them and name it. Never blend "
+    "two cases into one series and never average them.\n"
+    "- If the table is for the *acquirer* rather than this company, report "
+    "present=false.\n"
+    "\n"
+    "Reply with exactly this JSON shape:\n"
+    '{"present": true|false, "units": "<millions|thousands|as printed>",'
+    ' "scenario": "<the case name, or null>",'
+    ' "years": [{"fiscal_year": <4-digit year>, "revenue": <number|null>,'
+    ' "ebitda": <number|null>, "ebit": <number|null>,'
+    ' "net_income": <number|null>, "free_cash_flow": <number|null>,'
+    ' "capex": <number|null>}],'
+    ' "quote": "<verbatim substring containing part of the table>",'
+    ' "attributed_to": "<the company these projections are for>",'
+    ' "why_absent": "<short reason or null>"}\n'
+    "\n"
+    "Numbers must be plain: no currency symbol, no commas, no parentheses for "
+    "negatives -- use a minus sign.\n"
+    "\n"
+    "--- TEXT ---\n"
+)
+
+
+def extract_projections(
+    accession: str,
+    text: str,
+    *,
+    client: Any = None,
+    providers: tuple[router.Provider, ...] = router.PROVIDERS,
+    filer: str | None = None,
+    filed_year: int | None = None,
+) -> ProjectionSeries:
+    """Management's projected years, with the table's own arithmetic checked.
+
+    The locator is the reliable half here, unusually: measured 2026-09-12, **all 15
+    real takeouts** in the cached 20 carry a named projections heading with a
+    multi-year table under it and at least one usable measure. 100%, against 27%
+    for the Premiums Paid Analysis.
+
+    What makes this worth doing at all: management projections are the only forward
+    estimate anywhere in this system. Every other number is as-filed history, and
+    the DCF's weakest input is a flat growth constant that beat every rate fitted
+    from our own 30 quarters out of sample.
+    """
+    section = section_window(text, "prospective_financial")
+    base = dict(accession=accession)
+    if section is None:
+        return ProjectionSeries(reason=NO_SECTION,
+                                note="no projections heading located", **base)
+    try:
+        answer = router.ask(_SYSTEM, PROJECTIONS_PROMPT + section.text,
+                            prompt_version=PROMPT_VERSION, client=client,
+                            providers=providers)
+    except router.LlmError as exc:
+        return ProjectionSeries(reason=NOT_PARSED,
+                                note=f"no provider: {exc}"[:200], **base)
+
+    prov = dict(base, section=section.name, section_heading=section.heading,
+                section_start=section.start, section_end=section.end,
+                provider=answer.provider, model=answer.model)
+    said = answer.data
+    if not said.get("present"):
+        return ProjectionSeries(
+            reason=NOT_STATED,
+            note=str(said.get("why_absent") or "")[:200] or None, **prov)
+
+    quote = said.get("quote")
+    attributed = str(said.get("attributed_to") or "")[:120] or None
+    if not quote or not isinstance(quote, str) or (
+            _normalise_quote(quote) not in _normalise_quote(section.text)):
+        return ProjectionSeries(
+            reason=UNCITED, quote=(quote or "")[:400] or None,
+            note="the quote is not in the section it was given", **prov)
+    ok, why = check_attribution(attributed, filer)
+    if not ok:
+        return ProjectionSeries(reason=MISATTRIBUTED, quote=quote[:400],
+                                note=why, **prov)
+
+    rows: list[Projection] = []
+    for entry in said.get("years") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            fy = int(entry["fiscal_year"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        values: dict[str, float] = {}
+        for measure in PROJECTION_MEASURES:
+            raw = entry.get(measure)
+            if raw is None:
+                continue
+            try:
+                values[measure] = float(raw)
+            except (TypeError, ValueError):
+                continue
+        if values:
+            rows.append(Projection(fiscal_year=fy, values=values))
+    if not rows:
+        return ProjectionSeries(reason=NOT_PARSED, quote=quote[:400],
+                                note="present=true with no usable year",
+                                **prov)
+    rows.sort(key=lambda r: r.fiscal_year)
+    failures = check_projections(tuple(rows), filed_year=filed_year)
+    return ProjectionSeries(
+        reason=INCOHERENT if failures else STATED,
+        years=tuple(rows),
+        scenario=str(said.get("scenario") or "")[:80] or None,
+        units=str(said.get("units") or "")[:40] or None,
+        quote=quote[:400], failures=failures,
+        note=("the table fails its own arithmetic: " + ", ".join(failures))
+        if failures else None,
+        **prov)
