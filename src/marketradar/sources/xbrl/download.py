@@ -28,6 +28,7 @@ from typing import Final
 import httpx
 
 from marketradar import manifest
+from marketradar.sources.xbrl import tag_map
 
 log = logging.getLogger(__name__)
 
@@ -255,6 +256,24 @@ def prune(
             freed += path.stat().st_size
             path.unlink()
     if drop_zip:
+        if quarter == tag_map.REFERENCE_QUARTER:
+            # **Refused, loudly, rather than done quietly.** Every
+            # `coverage_2024q1` figure in the tag map is re-measured against this
+            # quarter by `test_the_map_reproduces_its_own_measurement`, and that
+            # test skips when the zip is gone. On 2026-09-12 a `--drop-zips` run
+            # deleted it and the test went from passing to skipped in the same
+            # commit that added a concept -- having caught a real 0.9-point error
+            # in that concept's figure minutes earlier.
+            #
+            # A flag that removes a guard has to say so. This is ~110 MB kept
+            # deliberately, which is the cheapest part of the whole cache.
+            raise XbrlFetchError(
+                f"refusing to drop {quarter}.zip: it is the reference quarter "
+                f"every coverage figure in tag_map is measured against, and "
+                f"dropping it downgrades test_the_map_reproduces_its_own_"
+                f"measurement from a check to a skip. Keep the 110 MB, or change "
+                f"tag_map.REFERENCE_QUARTER first and re-measure the map."
+            )
         zip_path = root / f"{quarter}.zip"
         if zip_path.exists():
             freed += zip_path.stat().st_size

@@ -455,6 +455,89 @@ ALTERNATIVE_FLOORS: Final[tuple[tuple[int, int], ...]] = (
 )
 
 
+def peer_median(
+    con: duckdb.DuckDBPyConnection,
+    values: dict[str, float],
+    *,
+    fundamentals: str = "xb",
+    material_revenue: int = MATERIAL_REVENUE,
+    min_peers: int = MIN_PEERS,
+    band: float = SIZE_BAND,
+) -> dict[str, tuple[float, int, int]]:
+    """``{cik: (median of values over its peers, sic_depth, n)}``.
+
+    The composition point. A caller with a per-filer number that some filers lack
+    -- a beta, a margin, anything -- gets the peer-set median of it, through the
+    **same** depth ladder :func:`screen` uses, rather than a second
+    implementation. Re-deriving peers for each consumer would be two answers to
+    one question, and they would drift.
+
+    The depth comes back with the number because it is the thing the consumer has
+    to record: a beta from a 2-digit peer set is of a broader group than the label
+    suggests, and the row carrying it must say so.
+
+    Note which ladder this is: the depth is chosen by the **peer count that has a
+    value**, not by the count that merely exists. A 4-digit set of twelve peers of
+    which two have a beta is not a 4-digit beta, and picking the depth on the
+    wrong count is how a median of two would end up labelled as the precise one.
+    """
+    if not values:
+        return {}
+    con.execute("drop table if exists _comps_value")
+    con.execute("create temp table _comps_value (cik varchar, val double)")
+    # Unpadded, to match the XBRL partitions. The caller's keys may be
+    # zero-padded -- Postgres stores them that way and the parquet does not -- and
+    # a mismatch here returns an empty dict rather than an error, which is how a
+    # first run produced 0 peer betas from 5,499 real ones.
+    con.executemany("insert into _comps_value values (?, ?)",
+                    [(str(k).strip().lstrip("0"), float(v))
+                     for k, v in values.items()])
+    con.execute("drop table if exists _comps_base")
+    con.execute(f"""
+    create temp table _comps_base as
+    select cik, company, sic, revenue, {SIZE_CONCEPT}
+    from ({_latest_sql(fundamentals)})
+    """)
+    for depth in SIC_DEPTHS:
+        div = 10 ** (SIC_DEPTHS[0] - depth)
+        con.execute(f"drop table if exists _comps_pm_{depth}")
+        con.execute(f"""
+        create temp table _comps_pm_{depth} as
+        select a.cik,
+               count(v.val)       as n,
+               median(v.val)      as med
+        from _comps_base a
+        join _comps_base p
+          on p.sic // {div} = a.sic // {div}
+         and p.cik <> a.cik
+         and p.revenue > {material_revenue}
+         and p.{SIZE_CONCEPT} between a.{SIZE_CONCEPT} / {band}
+                                  and a.{SIZE_CONCEPT} * {band}
+        join _comps_value v on v.cik = p.cik
+        where a.sic is not null and a.{SIZE_CONCEPT} > 0
+        group by a.cik
+        """)
+    arms_depth = " ".join(
+        f"when coalesce(p{d}.n, 0) >= {min_peers} then {d}" for d in SIC_DEPTHS)
+    arms_med = " ".join(
+        f"when coalesce(p{d}.n, 0) >= {min_peers} then p{d}.med"
+        for d in SIC_DEPTHS)
+    arms_n = " ".join(
+        f"when coalesce(p{d}.n, 0) >= {min_peers} then p{d}.n"
+        for d in SIC_DEPTHS)
+    joins = "\n".join(f"left join _comps_pm_{d} p{d} on p{d}.cik = b.cik"
+                      for d in SIC_DEPTHS)
+    rows = con.execute(f"""
+    select b.cik, case {arms_depth} end as depth,
+           case {arms_med} end as med, case {arms_n} end as n
+    from _comps_base b
+    {joins}
+    """).fetchall()
+    return {cik: (float(med), int(depth), int(n))
+            for cik, depth, med, n in rows
+            if depth is not None and med is not None}
+
+
 def _alternatives(con: duckdb.DuckDBPyConnection, *, band: float,
                   chosen: tuple[int, int]) -> dict[tuple[int, int], int]:
     """How many filers each unchosen floor would serve.

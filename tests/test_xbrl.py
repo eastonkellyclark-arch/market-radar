@@ -991,20 +991,28 @@ def test_pruning_keeps_the_submissions_table_and_drops_the_bulk(tmp_path) -> Non
 def test_dropping_the_zip_is_asked_for_and_not_assumed(tmp_path) -> None:
     """4.3 GB of zips for 8 MB of partitions is a bad trade on a full disk, and
     the zip buys one thing: a re-resolve without a re-download, which is ~30
-    requests and twenty minutes. Worth a flag, not worth a default -- the
-    reference quarter's zip is wanted, because a test re-measures the map's own
-    coverage figures against it.
+    requests and twenty minutes. Worth a flag, not worth a default.
+
+    **This test used to use the reference quarter, and that was the bug.** The
+    sentence "the reference quarter's zip is wanted, because a test re-measures
+    the map's own coverage figures against it" was in this docstring and enforced
+    by nothing, so a ``--drop-zips`` run deleted it and the drift test silently
+    became a skip. The knowledge was written down; only the prose was load-bearing.
+    It is now a refusal in ``prune`` -- see the test below -- and this test
+    deliberately uses a quarter that is *not* the reference one.
     """
+    other = "2019q1"
+    assert other != tag_map.REFERENCE_QUARTER
     cache = tmp_path / "cache"
-    write_quarter(cache / "work", "2024q1")
-    zip_path = cache / "2024q1.zip"
+    write_quarter(cache / "work", other)
+    zip_path = cache / f"{other}.zip"
     zip_path.write_bytes(b"x" * 2048)
 
-    freed = fetch_mod.prune("2024q1", cache=cache, drop_zip=True)
+    freed = fetch_mod.prune(other, cache=cache, drop_zip=True)
 
     assert not zip_path.exists()
     assert freed >= 2048
-    assert (cache / "work" / "2024q1_sub.txt").exists(), (
+    assert (cache / "work" / f"{other}_sub.txt").exists(), (
         "dropping the zip must not also drop the one table worth keeping"
     )
 
@@ -1126,3 +1134,58 @@ def test_a_missing_table_still_needs_the_zip(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(fetch_mod.XbrlFetchError, match="contact address"):
         fetch_mod.fetch("2024q1", cache=cache, tables=("sub", "num"))
+
+
+# --- the flag that removed a guard --------------------------------------
+
+
+def test_dropping_the_reference_quarters_zip_is_refused(tmp_path) -> None:
+    """**A flag that removes a guard has to say so.**
+
+    Every ``coverage_2024q1`` figure in the tag map is re-measured against that
+    quarter by ``test_the_map_reproduces_its_own_measurement``, which *skips* when
+    the zip is absent. On 2026-09-12 a ``--drop-zips`` run deleted it and that test
+    went from passing to skipped inside the same commit that added a concept --
+    having caught a real 0.9-point error in that concept's coverage figure minutes
+    earlier. Nothing failed. Nothing said anything.
+
+    This is the fourth instance of the shape the codebase keeps finding: a
+    convenience that silently widens what is allowed. The others were
+    ``upsert_corporate_actions`` returning ``len(rows)`` regardless of outcome, the
+    FRED publish path that a later edit could widen over the ICE series, and the
+    shared staging path that published the previous year's rows.
+    """
+    cache = tmp_path / "xbrl"
+    (cache / "work").mkdir(parents=True)
+    zip_path = cache / f"{tag_map.REFERENCE_QUARTER}.zip"
+    zip_path.write_bytes(b"x" * 2_000_000)
+
+    with pytest.raises(fetch_mod.XbrlFetchError, match="reference quarter"):
+        fetch_mod.prune(tag_map.REFERENCE_QUARTER, cache=cache, drop_zip=True)
+    assert zip_path.exists(), "the reference zip was deleted anyway"
+    # And the refusal says what to do instead rather than only saying no.
+    try:
+        fetch_mod.prune(tag_map.REFERENCE_QUARTER, cache=cache, drop_zip=True)
+    except fetch_mod.XbrlFetchError as exc:
+        assert "REFERENCE_QUARTER" in str(exc)
+
+
+def test_every_other_quarters_zip_still_drops(tmp_path) -> None:
+    """The guard is one quarter wide, not a retreat from pruning. 30 quarters of
+    zips is 3.2 GB against 8 MB of partitions."""
+    cache = tmp_path / "xbrl"
+    (cache / "work").mkdir(parents=True)
+    other = "2019q1"
+    assert other != tag_map.REFERENCE_QUARTER
+    zip_path = cache / f"{other}.zip"
+    zip_path.write_bytes(b"x" * 2_000_000)
+    freed = fetch_mod.prune(other, cache=cache, drop_zip=True)
+    assert freed == 2_000_000
+    assert not zip_path.exists()
+
+
+def test_the_reference_quarter_is_the_one_the_map_was_measured_on() -> None:
+    """If these drift apart, the drift test measures a quarter the coverage
+    figures were never taken from -- which would pass and mean nothing."""
+    assert tag_map.REFERENCE_QUARTER == "2024q1"
+    assert all(c.coverage_2024q1 > 0 for c in tag_map.CONCEPTS.values())

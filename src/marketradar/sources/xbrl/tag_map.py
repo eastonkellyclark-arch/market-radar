@@ -394,6 +394,17 @@ CONCEPTS: Final[dict[str, Concept]] = {
     ),
 }
 
+#: The quarter every ``coverage_2024q1`` figure above was measured on, and the
+#: one ``tests/test_xbrl.py`` re-measures them against.
+#:
+#: Named here rather than hard-coded in the test because the download cache has to
+#: know it too: ``--drop-zips`` deleted this quarter's zip on 2026-09-12 and the
+#: drift test went from passing to **skipped**, silently, having just caught a
+#: real 0.9-point error in the capex figure. A flag that removes a guard without
+#: saying so is the pattern this codebase keeps finding, so :func:`download.prune`
+#: now refuses this quarter.
+REFERENCE_QUARTER: Final[str] = "2024q1"
+
 #: Concepts measured and deliberately left out of v1, with their 2024q1
 #: coverage. Kept here rather than deleted because each comes back when a
 #: question needs it, carrying its own number -- not as a speculative column
