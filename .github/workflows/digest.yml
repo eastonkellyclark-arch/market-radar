@@ -80,6 +80,24 @@ jobs:
       # screens is the failure this project exists to prevent, and it is
       # worse here than in the sweep because it *looks* like a normal morning.
 
+      # Drift, as against the write. `assert_fresh(published=...)` catches a
+      # publish that wrote to the wrong place at the moment it happens; this
+      # catches a location that stopped resolving afterwards -- a deleted
+      # Release, a renamed tag, a partition declared for data nobody built.
+      #
+      # Both are needed because they fail at different times. 35 declared
+      # locations held nothing for weeks: the write-time check did not exist,
+      # and nothing ran a drift check either. Non-zero exit, so this is a gate.
+      - name: Verify every declared location
+        id: manifest
+        env:
+          MR_R2_ACCOUNT_ID: ${{ secrets.MR_R2_ACCOUNT_ID }}
+          MR_R2_ACCESS_KEY_ID: ${{ secrets.MR_R2_ACCESS_KEY_ID }}
+          MR_R2_SECRET_ACCESS_KEY: ${{ secrets.MR_R2_SECRET_ACCESS_KEY }}
+          MR_R2_BUCKET: ${{ vars.MR_R2_BUCKET || 'market-radar' }}
+          MR_POSTGRES_DSN: ${{ secrets.MR_POSTGRES_DSN }}
+        run: uv run mr manifest --verify
+
       - name: Summary
         if: success() || failure()
         run: |
@@ -90,4 +108,5 @@ jobs:
             echo "- trigger: \`${{ github.event_name }}\`"
             echo "- upstream sweep: \`${{ github.event.workflow_run.conclusion || 'n/a' }}\`"
             echo "- dry run: \`${{ inputs.dry_run || false }}\`"
+            echo "- manifest verify: \`${{ steps.manifest.outcome }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, timezone
+import logging
 from typing import Any, Final
 
 from marketradar.manifest import Freshness
@@ -48,6 +49,9 @@ def utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+log = logging.getLogger(__name__)
+
+
 def assert_fresh(
     dataset: str,
     relation: Any,
@@ -58,6 +62,7 @@ def assert_fresh(
     max_staleness_days: int = DEFAULT_MAX_STALENESS_DAYS,
     expect_cols: Iterable[str] = (),
     today: date | None = None,
+    published: Any = None,
 ) -> Freshness:
     """Assert a relation is populated, complete, and current.
 
@@ -75,6 +80,10 @@ def assert_fresh(
         expect_cols: columns that must be present. Checked before anything
             else so a schema change reports as a schema change.
         today: injectable for tests. Defaults to :func:`utc_today`.
+        published: a :class:`~marketradar.manifest.DatasetRef` this load has
+            just written to. When given, the declared location is verified and
+            a location holding nothing raises -- see the note at the end of the
+            body for why this belongs here rather than in a separate command.
 
     Returns:
         The :class:`~marketradar.manifest.Freshness` observation, ready to
@@ -129,6 +138,34 @@ def assert_fresh(
                 f"{where}: newest {date_column} is {newest.isoformat()}, which is "
                 f"after {today.isoformat()}. Check the source's timezone handling."
             )
+
+    if published is not None:
+        # **The declared location, checked at the moment it was written.**
+        #
+        # This is the last check rather than the first on purpose: a publish that
+        # produced an empty or stale file should report *that*, not "the URL is
+        # fine". But it is inside the assertion rather than in a separate command,
+        # because a separate command only runs when somebody remembers -- which is
+        # how 35 declared locations stayed broken for weeks while every local run
+        # passed. 30 xbrl partitions, three Form 5500 years and sec_filers/all all
+        # returned 404 with nothing failing anywhere.
+        from marketradar import manifest as manifest_mod
+
+        seen = manifest_mod.verify(published)
+        if seen.broken:
+            raise StaleDataError(
+                f"{where}: the data is good and its declared location is not. "
+                f"{published.backend} at {published.location} holds nothing "
+                f"({seen.detail}). The publish wrote a correct file somewhere the "
+                "manifest does not point at, which every local run will mask "
+                "because it reads the cache."
+            )
+        if seen.status == manifest_mod.UNVERIFIABLE:
+            # Not an error and not silence: "could not look" is a third answer and
+            # the one that must never read as success.
+            log.warning(
+                "%s: could not verify the declared location (%s). This is not the "
+                "same as verified -- %s", where, seen.detail, published.location)
 
     return Freshness(
         dataset=dataset, partition=partition, row_count=row_count, max_date=newest

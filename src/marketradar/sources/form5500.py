@@ -1264,12 +1264,19 @@ def publish(
     *,
     table: str = "f5500_resolved",
     min_rows: int = 100_000,
+    upload: bool = False,
 ) -> Any:
     """Write one plan year's sponsors to Parquet and assert freshness.
 
     Government data, so this is the GitHub Releases side of the licensing
-    boundary. The file is written locally; uploading it to a Release is a
-    separate, deliberate step.
+    boundary.
+
+    ``upload`` moves the Release upload inside this function and makes the
+    freshness assertion verify the declared location. It used to be a ``gh``
+    command typed by hand, outside the codebase and therefore outside every
+    check -- which is why 2022, 2023 and 2024 sat declared and unpublished for
+    weeks while every local run passed. Off by default so a local build stays
+    local; the CLI turns it on.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     dest = out_dir / f"form5500_sponsors_{plan_year}.parquet"
@@ -1277,8 +1284,19 @@ def publish(
         copy ({published_sql(table)}) to '{dest.as_posix()}' (format parquet)
     """)
     rel = con.read_parquet(dest.as_posix())
+    ref = manifest.get(DATASET, str(plan_year))
+    if upload:
+        from marketradar import storage
+
+        storage.publish_release_asset(
+            ref, dest,
+            notes="DOL Form 5500 sponsor records, keyed on EIN. Public domain "
+                  "and ours to republish.")
     observed = assert_fresh(
         DATASET, rel, partition=str(plan_year), min_rows=min_rows,
+        # Verified only when this call published it. Asserting the location on a
+        # local-only build would fail every developer machine by construction.
+        published=ref if upload else None,
         # A plan year has no observation date of its own; the freshness that
         # matters is row count and the partial-year check in completeness().
         date_column=None,

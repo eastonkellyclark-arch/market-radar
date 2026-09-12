@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Final
 
 import duckdb
@@ -236,3 +237,110 @@ def describe_connection(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
             for name in (ENV_R2_ACCOUNT, ENV_R2_KEY_ID, ENV_R2_SECRET)
         ),
     }
+
+
+# --- publishing a public asset ------------------------------------------
+
+
+class PublishError(RuntimeError):
+    """An asset could not be uploaded to its declared location."""
+
+
+#: Environment variable naming the repo to publish to, e.g. ``owner/name``.
+ENV_REPO: Final[str] = "MR_GITHUB_REPO"
+
+
+def release_tag(location: str) -> str:
+    """The Release tag a ``github_release`` location downloads from.
+
+    Parsed from the manifest rather than configured separately: the location is
+    already the single source of truth for where the asset lives, and a second
+    copy of the tag is a second thing to get wrong.
+    """
+    marker = "/releases/download/"
+    if marker not in location:
+        raise PublishError(
+            f"{location!r} is not a GitHub Release download URL, so there is no "
+            "tag to infer. Check the manifest backend."
+        )
+    rest = location.split(marker, 1)[1]
+    tag, _, _asset = rest.partition("/")
+    if not tag:
+        raise PublishError(f"{location!r} has no release tag in it")
+    return tag
+
+
+def publish_release_asset(
+    ref: Any,
+    local: Path,
+    *,
+    notes: str = "",
+    runner: Any = None,
+) -> str:
+    """Upload ``local`` to the Release that ``ref.location`` points at.
+
+    **This exists because the upload used to be a `gh` command typed by hand**,
+    outside the codebase and therefore outside every check. 35 declared locations
+    held nothing for weeks as a direct result: the files were built correctly,
+    written locally, and never uploaded, and no code path could tell.
+
+    Refuses a private backend outright. Publishing an ``r2`` or ``supabase``
+    partition to a public Release would cross the licensing boundary in the one
+    direction that matters -- the manifest's ``backend`` column exists to make
+    that visible and this is the place it has to be enforced rather than
+    remembered.
+    """
+    import shutil
+    import subprocess
+
+    if getattr(ref, "is_private", False):
+        raise PublishError(
+            f"{ref.dataset}/{ref.partition} has backend {ref.backend!r}, which is "
+            "private. Publishing it to a public GitHub Release would be "
+            "redistribution of vendor data -- see the licensing rule in "
+            "CLAUDE.md. The backend column exists to stop exactly this."
+        )
+    if ref.backend != "github_release":
+        raise PublishError(
+            f"{ref.dataset}/{ref.partition} has backend {ref.backend!r}; only "
+            "github_release is published this way."
+        )
+    if not local.is_file() or local.stat().st_size == 0:
+        raise PublishError(f"{local} is missing or empty; nothing to upload")
+
+    repo = os.environ.get(ENV_REPO, "").strip()
+    if not repo:
+        raise PublishError(f"{ENV_REPO} is not set, so there is no repo to "
+                           "publish to")
+    gh = shutil.which("gh")
+    if gh is None:
+        raise PublishError(
+            "the GitHub CLI (`gh`) is not on PATH. It is the upload path for "
+            "public Release assets; install it or upload by hand and re-run with "
+            "the verification."
+        )
+    run = runner or subprocess.run
+    tag = release_tag(ref.location)
+
+    seen = run([gh, "release", "view", tag, "--repo", repo],
+               capture_output=True, text=True)
+    if seen.returncode != 0:
+        made = run(
+            [gh, "release", "create", tag, "--repo", repo,
+             "--title", tag,
+             "--notes", notes or ("Public-domain data republished from a "
+                                  "government source.")],
+            capture_output=True, text=True,
+        )
+        if made.returncode != 0:
+            raise PublishError(
+                f"could not create release {tag}: {made.stderr.strip()[:300]}")
+
+    up = run([gh, "release", "upload", tag, str(local), "--repo", repo,
+              "--clobber"], capture_output=True, text=True)
+    if up.returncode != 0:
+        raise PublishError(
+            f"could not upload {local.name} to {tag}: "
+            f"{up.stderr.strip()[:300]}")
+    log.info("published %s to release %s", local.name, tag)
+    return tag

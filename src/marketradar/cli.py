@@ -201,6 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "inclusive. 2019q1 through 2026q2 is 30 quarters")
     p_xbrl.add_argument("--no-load", action="store_true",
                         help="report coverage only; write no parquet")
+    p_xbrl.add_argument("--publish", action="store_true",
+                        help="upload each partition to its declared GitHub "
+                             "Release and make the freshness assertion verify "
+                             "that location. Off by default so a local build "
+                             "stays local")
     p_xbrl.add_argument("--restart", action="store_true",
                         help="re-resolve quarters whose partition already "
                              "exists (default: skip them)")
@@ -858,7 +863,7 @@ def _cmd_xbrl(args: argparse.Namespace) -> int:
                                    concepts=concepts)
         else:
             result = xbrl.load(quarter, out, con=con, cache=cache,
-                               concepts=concepts)
+                               concepts=concepts, upload=args.publish)
         for line in result.lines():
             print(line)
         if result.target:

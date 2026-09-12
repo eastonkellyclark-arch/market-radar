@@ -548,13 +548,18 @@ def load(
     concepts: tuple[str, ...] | None = None,
     tables: dict[str, Path] | None = None,
     min_rows: int = MIN_ROWS,
+    upload: bool = False,
 ) -> LoadResult:
     """Resolve a quarter, write its parquet, and assert the result is real.
 
-    Written locally and left for a separate, deliberate upload, the same as
-    ``form5500.publish``: the partition is a GitHub Release asset because SEC
-    data is public domain and ours to republish -- unlike anything Tiingo
-    touched. See the licensing boundary in CLAUDE.md.
+    The partition is a GitHub Release asset because SEC data is public domain and
+    ours to republish -- unlike anything Tiingo touched. See the licensing
+    boundary in CLAUDE.md.
+
+    ``upload`` publishes it and makes the assertion verify the declared location.
+    Left as a separate hand-typed ``gh`` command until 2026-09-12, which is
+    exactly how all 30 of these partitions came to be declared and unpublished
+    with nothing failing: every consumer read ``.cache/xbrl/out`` instead.
     """
     con = con or duckdb.connect()
     _, result = build(quarter, con=con, cache=cache, concepts=concepts,
@@ -597,6 +602,13 @@ def load(
         "create or replace view published_values as "
         f"select * from published where status = '{tag_map.STATED}'"
     )
+    if upload:
+        from marketradar import storage
+
+        storage.publish_release_asset(
+            ref, dest,
+            notes="Normalised SEC Financial Statement Data Sets: one row per "
+                  "(accession, concept). Public domain and ours to republish.")
     observed = assert_fresh(
         DATASET,
         con.table("published_values"),
@@ -609,6 +621,9 @@ def load(
         date_column=None,
         expect_cols=("adsh", "cik", "concept", "value", "tag", "status",
                      "period_end", "era"),
+        # Verified only when this call published it: asserting the declared
+        # location on a local-only resolve would fail every developer machine.
+        published=ref if upload else None,
     )
     newest = con.execute(
         "select max(period_end) from published_values").fetchone()[0]
