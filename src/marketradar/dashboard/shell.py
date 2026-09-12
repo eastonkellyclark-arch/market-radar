@@ -158,6 +158,9 @@ class Context:
     #: normalized quarter, like `xbrl` above and for the same reason: the depth
     #: split is computed with the sets and is not stored apart from them.
     comps: dict[str, Any] = field(default_factory=dict)
+    #: Valuations and their substitution counts. Same contract as `xbrl` and
+    #: `comps`: computed with the rows, never a stored second copy of a number.
+    dcf: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -488,6 +491,29 @@ def _probe_comps(ctx: Context) -> tuple[str, str]:
     )
 
 
+def _probe_dcf(ctx: Context) -> tuple[str, str]:
+    """Live once valuations exist, and it reports the **cohort**, not the count.
+
+    2,564 valuations sounds like the answer and is not: no row has zero
+    substitutions, because the equity risk premium and the growth rate are
+    constants on every one of them. The number a reader should see first is how
+    many rows are clean apart from those two, which is the population where the
+    valuation means something.
+    """
+    stats = (ctx.dcf or {}).get("stats") or {}
+    if not stats:
+        return WAITING, "no valuations built -- run `mr dcf`"
+    depths = stats.get("depths") or {}
+    valued = sum(int(v) for v in depths.values())
+    if not valued:
+        return WAITING, "no filer reached a usable discount rate"
+    cohort = int(stats.get("cohort") or 0)
+    return LIVE, (
+        f"{valued:,} valuations, {cohort:,} on best evidence "
+        f"({cohort / valued * 100:.0f}%); zero have no substitutions at all"
+    )
+
+
 def _probe_deals(ctx: Context) -> tuple[str, str]:
     if not ctx.deals:
         return WAITING, "no deal candidates stored -- run `mr deals`"
@@ -594,8 +620,11 @@ PANELS: Final[tuple[Panel, ...]] = (
           "rather than justifying one afterwards.",
           probe=_probe_outcomes),
     Panel("dcf", "DCF / 3-statement", "Analysis",
-          "Model output against the normalised statements.",
-          weekend="Beyond"),
+          "Enterprise values with every substitution on the row. No row has "
+          "zero: the equity risk premium and the growth rate are constants on "
+          "all of them, so the page opens at the cohort that is clean apart "
+          "from those two.",
+          probe=_probe_dcf),
     Panel("decks", "Pitch decks", "Analysis",
           "Generated deck preview, before it is a file.",
           weekend="Beyond"),
@@ -887,6 +916,11 @@ def render(
         (ctx.comps or {}).get("stats") or {},
         (ctx.comps or {}).get("funnel"),
     )
+    bodies["dcf"] = body_html.dcf_html(
+        (ctx.dcf or {}).get("rows") or [],
+        (ctx.dcf or {}).get("stats") or {},
+        (ctx.dcf or {}).get("funnel"),
+    )
     bodies["private"] = body_html.private_html(private or [], private_stats or {})
     bodies["mature"] = body_html.mature_html(mature or [], mature_stats or {})
 
@@ -914,6 +948,7 @@ def render(
         parts.append(body_html.FEED_SCRIPT)
     if ctx.deals:
         parts.append(body_html.DEALS_SCRIPT)
+        parts.append(body_html.DCF_SCRIPT)
     if private or mature or ctx.review:
         parts.append(body_html.PRIVATE_SCRIPT)
     if details:

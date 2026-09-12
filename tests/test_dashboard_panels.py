@@ -16,7 +16,7 @@ import pytest
 from marketradar import digest as digest_mod
 from marketradar.dashboard import panels, shell
 from marketradar.screens import volatility
-from conftest import COMPS_SETS
+from conftest import COMPS_SETS, DCF_ROWS
 
 D3, D4 = date(2026, 9, 3), date(2026, 9, 4)
 
@@ -331,4 +331,74 @@ def test_the_panel_explains_turnover_rather_than_margin() -> None:
 def test_an_empty_comps_panel_says_what_to_run() -> None:
     html = panels.comps_html([], {}, None)
     assert "mr comps" in html
+    assert "waiting" in html
+
+
+# --- U13: DCF -----------------------------------------------------------
+
+
+def test_the_dcf_panel_opens_at_the_readable_cohort() -> None:
+    """**The thing a reader should not have to construct.** No row has zero
+    substitutions, so "the good rows" is a cohort, and the panel opens filtered to
+    it rather than leaving someone to compose a column filter every time.
+
+    Note what the cohort already excludes: ``clean_but_constants`` means the
+    substitutions are a subset of the two unavoidable constants, and
+    ``growth_mismatch`` is deliberately not one of them -- so a cohort row cannot
+    carry the mismatch flag. One filter, not two.
+    """
+    html = panels.dcf_html(DCF_ROWS["rows"], DCF_ROWS["stats"],
+                           DCF_ROWS["funnel"])
+    assert 'data-cohort="1"' in html
+    assert 'data-cohort="0"' in html
+    # The toggle is present and starts selected, so the page opens at the cohort.
+    assert 'class="f sel" data-f="dcohort"' in html
+    assert "best evidence only" in html
+    assert "1,192" in html
+
+
+def test_the_dcf_panel_shows_substitutions_in_the_row_not_a_footnote() -> None:
+    """A deck or a screen built on this is the easiest place for the discipline to
+    get laundered into something authoritative."""
+    html = panels.dcf_html(DCF_ROWS["rows"], DCF_ROWS["stats"],
+                           DCF_ROWS["funnel"])
+    for name in ("peer_beta", "comp_depth_fallback", "absent_capex",
+                 "growth_mismatch"):
+        assert name in html, f"{name} is not on the page"
+    # And each one says which direction it pushes the answer.
+    assert "Understates" in html
+    assert "Overstates" in html
+
+
+def test_the_dcf_panel_says_no_row_is_clean_and_why() -> None:
+    html = panels.dcf_html(DCF_ROWS["rows"], DCF_ROWS["stats"],
+                           DCF_ROWS["funnel"])
+    assert "No row has zero substitutions" in html
+    assert "structural" in html
+    # The rejected fitted rate is on the page, not just in the module.
+    assert "loses" in html and "out of sample" in html
+
+
+def test_the_dcf_panel_states_the_growth_bound_on_the_answer() -> None:
+    """A lower bound for a growth company is not a valuation of one, and the page
+    has to say that where the number is, not in an appendix."""
+    html = panels.dcf_html(DCF_ROWS["rows"], DCF_ROWS["stats"],
+                           DCF_ROWS["funnel"])
+    assert "lower bound" in html
+    assert "0.03" in html          # Amazon
+    assert "0.96" in html          # Johnson & Johnson
+
+
+def test_the_dcf_panel_reports_the_terminal_share() -> None:
+    """A row whose answer is 90% terminal value is resting on one growth number
+    however clean its other inputs are."""
+    html = panels.dcf_html(DCF_ROWS["rows"], DCF_ROWS["stats"],
+                           DCF_ROWS["funnel"])
+    assert "terminal" in html
+    assert "78%" in html
+
+
+def test_an_empty_dcf_panel_says_what_to_run() -> None:
+    html = panels.dcf_html([], {}, None)
+    assert "mr dcf" in html
     assert "waiting" in html

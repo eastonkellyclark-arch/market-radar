@@ -226,6 +226,39 @@ COMPS_SETS: dict = {
 }
 
 
+#: A loaded DCF panel. Two rows on purpose: one in the readable cohort and one
+#: four substitutions deep, because the panel exists to keep those apart and a
+#: fixture with only clean rows would leave that untested.
+DCF_ROWS: dict = {
+    "rows": [
+        {"cik": "0000320193", "company": "CLEAN MATURE CORP",
+         "enterprise_value": "801100000000", "wacc": 0.051,
+         "terminal_share": 0.78, "beta": 0.62,
+         "substitutions": ["erp_constant", "growth_constant"],
+         "clean_but_constants": True, "source": {}},
+        {"cik": "0001018724", "company": "HEAVILY SUBSTITUTED INC",
+         "enterprise_value": "90500000000", "wacc": 0.115,
+         "terminal_share": 0.44, "beta": 1.31,
+         "substitutions": ["peer_beta", "comp_depth_fallback", "absent_capex",
+                           "erp_constant", "growth_constant",
+                           "growth_mismatch"],
+         "clean_but_constants": False, "source": {}},
+    ],
+    "stats": {
+        "outcomes": {"valued": 2564, "no_cash_flow": 87,
+                     "negative_fcf": 3677, "no_discount_rate": 103},
+        "substitutions": {"erp_constant": 2564, "growth_constant": 2564,
+                          "peer_beta": 667, "comp_depth_fallback": 370,
+                          "growth_mismatch": 512, "absent_capex": 197,
+                          "no_beta": 233},
+        "depths": {"2": 1192, "3": 821, "4": 463, "5": 82, "6": 6},
+        "cohort": 1192,
+        "betas": 5499,
+    },
+    "funnel": None,
+}
+
+
 def loaded_context(**overrides):
     """A dashboard Context with every source present and nothing empty.
 
@@ -293,6 +326,7 @@ def loaded_context(**overrides):
         review_counts={"pending": 1, "confirmed": 0, "rejected": 0},
         xbrl=XBRL_COVERAGE,
         comps=COMPS_SETS,
+        dcf=DCF_ROWS,
     )
     base.update(overrides)
     ctx = shell.Context(**base)

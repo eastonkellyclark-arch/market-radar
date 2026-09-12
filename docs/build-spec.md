@@ -542,7 +542,7 @@ the build goes red naming both.
 | Analysis | Peer sets | `comps` | live | U15. Peers by SIC and size from the six concepts. The depth column is the panel: the ladder tries 4-digit SIC, then 3, then 2, and records which it settled on, because the extra digit buys nothing measurable and the size band does the work |
 | Analysis | Deal multiples | `multiples` | not built | beyond |
 | Analysis | Historical outcomes | `outcomes` | live | W3-T3. The survivorship caveat renders beside the number, not in a docstring |
-| Analysis | DCF / 3-statement | `dcf` | not built | beyond |
+| Analysis | DCF / 3-statement | `dcf` | live | U13. Enterprise values with every substitution on the row. No row has zero: the ERP and the growth rate are constants on all of them, so the page opens at the cohort clean apart from those two |
 | Analysis | Pitch decks | `decks` | not built | beyond |
 
 #### Blocking issue, ahead of the backfill

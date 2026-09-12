@@ -168,6 +168,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_5500.add_argument("--no-load", action="store_true",
                         help="report only; write no parquet and no queue rows")
 
+    p_dcf = sub.add_parser(
+        "dcf", help="enterprise values with every substitution on the row")
+    p_dcf.add_argument("--out", default=".cache/xbrl/out", metavar="DIR",
+                       help="directory holding the fundamentals partitions")
+    p_dcf.set_defaults(func=_cmd_dcf)
+
     p_comps = sub.add_parser(
         "comps", help="peer sets by SIC and size, with the depth each settled on")
     p_comps.add_argument("--out", default=".cache/xbrl/out", metavar="DIR",
@@ -980,6 +986,104 @@ def _comps_lines(stats: dict[str, Any], rows: list[dict[str, Any]]) -> list[str]
     return out
 
 
+def _dcf_rows(con: Any, out_dir: Path) -> dict[str, Any]:
+    """Valuations, sorted best-evidence first.
+
+    The sort is part of the contract, not a presentation detail. No row has zero
+    substitutions, so "the good rows" is a cohort a reader would otherwise have to
+    construct from a column every time they opened the panel; the depth ascending,
+    then terminal share ascending, puts it at the top instead.
+    """
+    import json as _json
+
+    from marketradar import storage
+    from marketradar.screens import dcf as dcf_mod
+
+    files = sorted(out_dir.glob(COMPS_GLOB))
+    if not files:
+        return {}
+    glob = (out_dir / COMPS_GLOB).as_posix()
+    con.execute(
+        f"create or replace view _dcf_xb as select * from read_parquet('{glob}')"
+    )
+    betas: dict[str, float] = {}
+    path = Path(".cache/dcf/betas.json")
+    if path.is_file():
+        betas = _json.loads(path.read_text(encoding="utf-8"))
+    growths: dict[str, float] = {}
+    gpath = Path(".cache/dcf/growths.json")
+    if gpath.is_file():
+        growths = _json.loads(gpath.read_text(encoding="utf-8"))
+    peers = dcf_mod.peer_betas(con, betas, fundamentals="_dcf_xb") if betas else {}
+    rf = dcf_mod.read_risk_free(con, alias=storage.PG_ALIAS)
+    result = dcf_mod.screen(con, fundamentals="_dcf_xb", betas=betas,
+                            peer_betas=peers, risk_free=rf,
+                            historical_growth=growths)
+    valued = [r for r in result.rows if r.outcome == dcf_mod.VALUED]
+    valued.sort(key=lambda r: (r.depth, r.terminal_share or 1.0,
+                               r.inputs.company))
+    return {
+        "rows": [
+            {
+                "cik": r.inputs.cik, "company": r.inputs.company,
+                "enterprise_value": (None if r.enterprise_value is None
+                                     else f"{r.enterprise_value:.0f}"),
+                "wacc": r.wacc, "terminal_share": r.terminal_share,
+                "beta": r.inputs.beta,
+                "substitutions": list(r.substitutions),
+                "clean_but_constants": r.clean_but_constants,
+                "source": r.inputs.source,
+            }
+            for r in valued
+        ],
+        "stats": {
+            "outcomes": result.outcomes,
+            "substitutions": result.substitutions,
+            "depths": {str(k): v for k, v in result.depths.items()},
+            "cohort": sum(1 for r in valued if r.clean_but_constants),
+            "betas": len(betas),
+        },
+        "funnel": result.funnel.as_dict(),
+    }
+
+
+def _cmd_dcf(args: argparse.Namespace) -> int:
+    """Enterprise values with every substitution on the row.
+
+    **No row has zero substitutions and that is structural**: the equity risk
+    premium and the near-term growth rate are constants on every one, because
+    neither has a free source. A growth rate fitted from our own 30 quarters loses
+    to the flat 3% out of sample, so the constant stays and `growth_mismatch`
+    warns where it is least likely to hold.
+    """
+    from marketradar import storage
+
+    con = storage.connect()
+    built = _dcf_rows(con, Path(args.out))
+    if not built:
+        print(f"mr dcf: no partitions under {args.out}; run `mr xbrl` first",
+              file=sys.stderr)
+        return EXIT_ERROR
+    stats = built["stats"]
+    rows = built["rows"]
+    print(f"{len(rows):,} valuations, {stats['cohort']:,} on best evidence; "
+          f"{stats['betas']:,} own betas supplied")
+    print()
+    print("how many substitutions deep")
+    valued = sum(int(v) for v in stats["depths"].values()) or 1
+    for n, c in sorted(stats["depths"].items(), key=lambda kv: int(kv[0])):
+        print(f"  {n} {int(c):>6,}  {int(c) / valued * 100:5.1f}%")
+    print()
+    print("best-evidence rows first")
+    for row in rows[:15]:
+        print(f"  {row['company'][:30]:<32} "
+              f"{(row['enterprise_value'] or '-'):>16}  "
+              f"wacc {(row['wacc'] or 0) * 100:5.1f}%  "
+              f"term {(row['terminal_share'] or 0) * 100:3.0f}%  "
+              f"{','.join(row['substitutions'])}")
+    return EXIT_OK
+
+
 def _cmd_dashboard(args: argparse.Namespace) -> int:
     """Render the panel map to a local file and open it.
 
@@ -1042,6 +1146,12 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         ctx.comps = _comps_rows(con, Path(".cache/xbrl/out"))
     except Exception as exc:
         ctx.notes.append(f"Peer sets unavailable: {str(exc)[:140]}")
+
+    # U13. Same contract as the two above.
+    try:
+        ctx.dcf = _dcf_rows(con, Path(".cache/xbrl/out"))
+    except Exception as exc:
+        ctx.notes.append(f"Valuations unavailable: {str(exc)[:140]}")
 
     private, private_stats = _private_rows(series=series)
     try:
@@ -2093,6 +2203,14 @@ def main(argv: list[str] | None = None) -> int:
 
             label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
             print(f"mr xbrl: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "dcf":
+        load_dotenv()
+        try:
+            return _cmd_dcf(args)
+        except Exception as exc:
+            print(f"mr dcf: error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "comps":

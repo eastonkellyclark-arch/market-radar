@@ -1699,3 +1699,228 @@ def comps_html(
         <tbody>{alt_rows}</tbody>
       </table>
       {stages}"""
+
+
+# --- U13: DCF / 3-statement ----------------------------------------------
+
+#: Each substitution, and the direction it pushes the answer. Shown as a legend
+#: rather than a tooltip: the whole argument of this panel is that the inputs are
+#: not the thing the method asks for, and a reader who has to hover to find that
+#: out will not.
+_DCF_SUBSTITUTION_WHY: Final[dict[str, str]] = {
+    "erp_constant": "the equity risk premium is a dated constant, not a measured "
+                    "figure. On every row &mdash; there is no free source",
+    "growth_constant": "near-term growth is a flat 3%, not a forecast for this "
+                       "filer. <strong>Understates</strong> anything growing "
+                       "faster",
+    "growth_mismatch": "this filer's own history is over 10 points from that "
+                       "constant, so 3% is unlikely to be its centre. A warning, "
+                       "not a rate",
+    "peer_beta": "beta is the peer set's median, not this filer's own returns",
+    "comp_depth_fallback": "that peer set is a widened industry, so the beta is "
+                           "of a broader group than the label implies",
+    "absent_capex": "no capex line, so FCF is operating cash flow undiminished. "
+                    "<strong>Overstates</strong> it by anything folded into an "
+                    "aggregated investing total",
+    "no_beta": "no beta, own or peer. A flat equity cost with no "
+               "company-specific risk at all",
+}
+
+#: The cohort worth reading first, and the one a reader should not have to build.
+#:
+#: Note what it already excludes. ``clean_but_constants`` means the row's
+#: substitutions are a subset of the two unavoidable constants, and
+#: ``growth_mismatch`` is deliberately not one of them -- so a row in this cohort
+#: cannot carry the mismatch flag. "Clean apart from the constants, and no
+#: mismatch" is one filter, not two, and saying so here is cheaper than letting
+#: someone discover it by composing them.
+_DCF_COHORT: Final[str] = (
+    "own beta, 4-digit comp depth, a real capex line, and a history that does "
+    "not contradict the growth constant"
+)
+
+
+def _dcf_subs_html(subs: list[str]) -> str:
+    """Substitution chips, worst-first, never a count."""
+    if not subs:
+        return '<span class="note">none</span>'
+    out = []
+    for name in subs:
+        # The two unavoidable constants are muted; everything else is a choice
+        # that went a particular way for this filer and reads as one.
+        cls = "note" if name in ("erp_constant", "growth_constant") else "collapsed"
+        out.append(f'<span class="{cls}">{_esc(name)}</span>')
+    return " ".join(out)
+
+
+def dcf_html(
+    rows: list[dict[str, Any]],
+    stats: dict[str, Any] | None = None,
+    funnel: dict[str, Any] | None = None,
+) -> str:
+    """Enterprise values, best-evidence first, with every substitution on the row.
+
+    **Sorted so the readable cohort is the top of the page**, because the
+    alternative is a reader reconstructing it from a substitution column every
+    time. Depth ascending, then terminal share ascending -- a row whose answer is
+    90% terminal value is resting on one growth number however clean its inputs
+    are.
+
+    A deck or a screen built on this is the easiest place for the discipline to get
+    laundered into something authoritative, so the legend is on the page and the
+    substitutions are in the row rather than in a footnote.
+    """
+    stats = stats or {}
+    if not rows:
+        return ('<p class="why"><span class="why-k">waiting</span> No valuations '
+                "built. Run <code>mr dcf</code> over a normalized quarter.</p>")
+    body = []
+    for row in rows[:ROWS_PER_LIST]:
+        subs = list(row.get("substitutions") or [])
+        cohort = "1" if row.get("clean_but_constants") else "0"
+        ev = row.get("enterprise_value")
+        body.append(
+            f'<tr class="dcfr" data-cohort="{cohort}" '
+            f'data-depth="{len(subs)}">'
+            f'<td class="tk">{_esc(str(row.get("company") or ""))}</td>'
+            f'<td class="num">{_money(str(ev)) if ev else "--"}</td>'
+            f'<td class="num">'
+            f'{"--" if row.get("wacc") is None else f"{float(row["wacc"]) * 100:.1f}%"}'
+            "</td>"
+            f'<td class="num">'
+            f'{"--" if row.get("terminal_share") is None else f"{float(row["terminal_share"]) * 100:.0f}%"}'
+            "</td>"
+            f'<td class="num">'
+            f'{"--" if row.get("beta") is None else f"{float(row["beta"]):.2f}"}'
+            "</td>"
+            f'<td class="num">{len(subs)}</td>'
+            f"<td>{_dcf_subs_html(subs)}</td>"
+            "</tr>"
+        )
+    depths = stats.get("depths") or {}
+    valued = sum(int(v) for v in depths.values()) or 1
+    depth_rows = "".join(
+        "<tr>"
+        f'<td class="tk">{_esc(str(n))}</td>'
+        f'<td class="num">{int(c):,}</td>'
+        f'<td class="num">{int(c) / valued * 100:.1f}%</td>'
+        "</tr>"
+        for n, c in sorted(depths.items(), key=lambda kv: int(kv[0]))
+    )
+    counts = stats.get("substitutions") or {}
+    sub_rows = "".join(
+        "<tr>"
+        f'<td class="tk">{_esc(name)}</td>'
+        f'<td class="num">{int(counts.get(name, 0)):,}</td>'
+        f'<td class="num">{int(counts.get(name, 0)) / valued * 100:.1f}%</td>'
+        f"<td class=\"note\">{why}</td>"
+        "</tr>"
+        for name, why in _DCF_SUBSTITUTION_WHY.items()
+        if counts.get(name)
+    )
+    outcomes = stats.get("outcomes") or {}
+    total = sum(int(v) for v in outcomes.values()) or 1
+    outcome_rows = "".join(
+        "<tr>"
+        f'<td class="tk">{_esc(name)}</td>'
+        f'<td class="num">{int(got):,}</td>'
+        f'<td class="num">{int(got) / total * 100:.1f}%</td>'
+        "</tr>"
+        for name, got in outcomes.items()
+    )
+    cohort_n = int(stats.get("cohort") or 0)
+    stages = _funnel_html(funnel) if funnel else ""
+    return f"""
+      <p class="why"><span class="why-k">how to read this</span>
+        <strong>No row has zero substitutions, and that is structural.</strong>
+        Two constants sit on every valuation because neither has a free source:
+        the equity risk premium and the near-term growth rate. So the cohort worth
+        reading is the one below &mdash; {_esc(_DCF_COHORT)} &mdash; and the page
+        opens sorted to it rather than leaving you to build it from a column.</p>
+      <p class="note">A growth rate fitted from our own 30 quarters
+        <em>loses</em> to the flat 3% out of sample, on revenue and on free cash
+        flow, by CAGR and by log-linear fit &mdash; the correlation between a
+        filer's past and future growth runs &minus;0.035 to +0.079. So the
+        constant stays and <code>growth_mismatch</code> warns where it is least
+        likely to hold. Measured against rough market caps on 20 large caps, the
+        mature cohort lands near parity (AbbVie 1.75&times;, Mastercard
+        1.08&times;, J&amp;J 0.96&times;) and heavy reinvestors do not (Amazon
+        0.03&times;, Tesla 0.07&times;). <strong>This is a lower bound for a
+        growth company, not a valuation of one.</strong></p>
+      <p class="filters">
+        <button class="f sel" data-f="dcohort">best evidence only
+          ({cohort_n:,})</button>
+        <span class="dcf-count note"></span>
+      </p>
+      <table class="rows">
+        <thead><tr><th>company</th><th class="num">enterprise value</th>
+          <th class="num">WACC</th>
+          <th class="num" title="share of the enterprise value coming from the
+            terminal value. A row at 90% is resting on one growth number however
+            clean its other inputs are.">terminal</th>
+          <th class="num">beta</th><th class="num">subs</th>
+          <th>substitutions</th></tr></thead>
+        <tbody id="dcf-rows">{''.join(body)}</tbody>
+      </table>
+      <h5>how many substitutions deep</h5>
+      <table class="rows">
+        <thead><tr><th>depth</th><th class="num">rows</th>
+          <th class="num">share</th></tr></thead>
+        <tbody>{depth_rows}</tbody>
+      </table>
+      <h5>which substitutions, and which direction each one pushes</h5>
+      <table class="rows">
+        <thead><tr><th>substitution</th><th class="num">rows</th>
+          <th class="num">share</th><th>what it does to the answer</th></tr>
+        </thead>
+        <tbody>{sub_rows}</tbody>
+      </table>
+      <h5>why a filer has no valuation</h5>
+      <table class="rows">
+        <thead><tr><th>outcome</th><th class="num">filers</th>
+          <th class="num">share</th></tr></thead>
+        <tbody>{outcome_rows}</tbody>
+      </table>
+      <p class="note">Negative free cash flow is the big exclusion and it is
+        real: 3,299 of 6,344 filers have negative <em>operating</em> cash flow,
+        dominated by companies with no revenue or under $100M. A growing
+        perpetuity of a negative number is a confident-looking negative value, so
+        the method does not apply rather than the row being wrong.</p>
+      {stages}"""
+
+
+#: DCF filtering. Same inline-script rule as the rest: one file, no build step.
+DCF_SCRIPT: Final[str] = """
+(window.__MR_BINDERS__ = window.__MR_BINDERS__ || []).push(
+  function (root) {
+  var table = document.getElementById('dcf-rows');
+  if (!table) { return; }
+  /* Starts on, not off. The cohort is the readable population and the page
+     should open at it; a reader who wants the degraded rows can ask. */
+  var cohortOnly = true;
+  function apply() {
+    var shown = 0, total = 0;
+    table.querySelectorAll('tr.dcfr').forEach(function (r) {
+      var ok = !cohortOnly || r.dataset.cohort === '1';
+      r.hidden = !ok;
+      total++;
+      if (ok) { shown++; }
+    });
+    var c = root.querySelector('.dcf-count');
+    if (c) {
+      c.textContent = shown + ' of ' + total + ' shown' +
+        (cohortOnly ? ' \\u2014 best evidence: own beta, 4-digit comps, a real' +
+                      ' capex line, no growth mismatch' : ' \\u2014 all rows');
+    }
+  }
+  var b = root.querySelector('button.f[data-f="dcohort"]');
+  if (b) {
+    b.addEventListener('click', function () {
+      cohortOnly = !cohortOnly;
+      b.classList.toggle('sel', cohortOnly);
+      apply();
+    });
+  }
+  apply();
+});
+"""
