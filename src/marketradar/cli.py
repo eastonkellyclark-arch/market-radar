@@ -1219,6 +1219,70 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _multiples_rows(con: Any, out_dir: Path) -> dict[str, Any]:
+    """Deal multiples, with the identity verdicts that make the list short."""
+    from marketradar import storage
+    from marketradar.screens import deal_multiples
+
+    glob = (out_dir / COMPS_GLOB).as_posix()
+    con.execute(
+        f"create or replace view _mult_xb as select * from read_parquet('{glob}')"
+    )
+    result = deal_multiples.screen(
+        con, deals=f"{storage.PG_ALIAS}.deals", fundamentals="_mult_xb")
+    usable = [r for r in result.rows if r.usable]
+    usable.sort(key=lambda r: r.filed_date, reverse=True)
+    return {
+        "rows": [
+            {"company": r.company, "cik": r.cik,
+             "filed_date": str(r.filed_date),
+             "value_usd": None if r.value_usd is None else f"{r.value_usd:.0f}",
+             "revenue": None if r.revenue is None else f"{r.revenue:.0f}",
+             "value_to_revenue": r.value_to_revenue,
+             "value_to_net_income": r.value_to_net_income,
+             "period_end": str(r.period_end) if r.period_end else ""}
+            for r in usable
+        ],
+        "stats": {"rows": len(usable), "identities": result.identities,
+                  "coverage_to": str(result.coverage_to or "")},
+        "funnel": result.funnel.as_dict(),
+    }
+
+
+def _deck_rows(con: Any, out_dir: Path) -> dict[str, Any]:
+    """Deck subjects: what a deck would say, without rendering a file."""
+    from marketradar import decks as decks_mod
+
+    built = _dcf_rows(con, out_dir)
+    rows = built.get("rows") or []
+    subjects = []
+    for row in rows[:40]:
+        subject = decks_mod.Subject(
+            cik=row["cik"], company=row["company"],
+            valuation={"substitutions": row.get("substitutions") or []})
+        subjects.append({
+            "company": row["company"], "cik": row["cik"],
+            "enterprise_value": row.get("enterprise_value"),
+            "substitutions": row.get("substitutions") or [],
+            "weakest": subject.weakest,
+            # Asked of the Subject rather than recomputed here, so the panel and
+            # the deck cannot disagree about which rows are clean.
+            "clean": subject.clean_but_constants_like,
+            "pages": len(decks_mod.PAGES),
+        })
+    # Worst first: a reader opening this wants the decks that need reading, not
+    # the ones that do not.
+    subjects.sort(key=lambda s: (-len(s["substitutions"]), s["company"]))
+    return {
+        "rows": subjects,
+        "stats": {
+            "subjects": len(subjects),
+            "clean": sum(1 for s in subjects if s["clean"]),
+            "pages": list(decks_mod.PAGES),
+        },
+    }
+
+
 def _cmd_dashboard(args: argparse.Namespace) -> int:
     """Render the panel map to a local file and open it.
 
@@ -1287,6 +1351,17 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         ctx.dcf = _dcf_rows(con, Path(".cache/xbrl/out"))
     except Exception as exc:
         ctx.notes.append(f"Valuations unavailable: {str(exc)[:140]}")
+
+    # U12 and U14. Same contract as the rest: a panel that cannot be drawn says
+    # so in the shell rather than taking the page down.
+    try:
+        ctx.multiples = _multiples_rows(con, Path(".cache/xbrl/out"))
+    except Exception as exc:
+        ctx.notes.append(f"Deal multiples unavailable: {str(exc)[:140]}")
+    try:
+        ctx.decks = _deck_rows(con, Path(".cache/xbrl/out"))
+    except Exception as exc:
+        ctx.notes.append(f"Deck subjects unavailable: {str(exc)[:140]}")
 
     private, private_stats = _private_rows(series=series)
     try:

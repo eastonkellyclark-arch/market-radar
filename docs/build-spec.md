@@ -541,10 +541,10 @@ the build goes red naming both.
 | Private | Entity review queue | `review` | live | W4 |
 | Analysis | XBRL fundamentals | `xbrl` | live | six concepts with their own coverage figures, the five statuses behind each miss, and the tags to add. U10, shipped with `tag_map.py` rather than after it |
 | Analysis | Peer sets | `comps` | live | U15. Peers by SIC and size from the six concepts. The depth column is the panel: the ladder tries 4-digit SIC, then 3, then 2, and records which it settled on, because the extra digit buys nothing measurable and the size band does the work |
-| Analysis | Deal multiples | `multiples` | not built | beyond |
+| Analysis | Deal multiples | `multiples` | live | U12. What a target sold for over what it last reported. The list is short because the population is &mdash; 1.7% of filers whose 10-K history ended appear in the deals table at all |
 | Analysis | Historical outcomes | `outcomes` | live | W3-T3. The survivorship caveat renders beside the number, not in a docstring |
 | Analysis | DCF / 3-statement | `dcf` | live | U13. Enterprise values with every substitution on the row. No row has zero: the ERP and the growth rate are constants on all of them, so the page opens at the cohort clean apart from those two |
-| Analysis | Pitch decks | `decks` | not built | beyond |
+| Analysis | Pitch decks | `decks` | live | U14. What a deck would say before it is a file. Ten pages; the provenance footer runs on every one from a single code path |
 
 #### Blocking issue, ahead of the backfill
 

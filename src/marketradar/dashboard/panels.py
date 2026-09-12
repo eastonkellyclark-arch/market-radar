@@ -2065,3 +2065,193 @@ def proxy_html(
       <p class="note">Every stored row carries <code>source = 'extracted'</code>.
         A consumer joining these to XBRL is joining a <em>forecast</em> to a
         <em>fact</em>, and the column exists so that cannot happen by accident.</p>"""
+
+
+# --- U12: deal multiples -------------------------------------------------
+
+#: What each identity verdict means. The screen confirms the target from the
+#: filing record rather than from prose, because a company acquired whole stops
+#: filing and a company that sold a division does not.
+_MULT_IDENTITY_WHY: Final[dict[str, str]] = {
+    "acquired_whole": "stopped filing after the deal &mdash; the filer was the "
+                      "thing sold",
+    "kept_filing": "filed another 10-K afterwards, so it sold a division rather "
+                   "than itself. <strong>84% of priced filings</strong>",
+    "too_recent": "inside the confirmation lag; the record cannot say either way "
+                  "yet",
+}
+
+
+def multiples_html(
+    rows: list[dict[str, Any]],
+    stats: dict[str, Any] | None = None,
+    funnel: dict[str, Any] | None = None,
+) -> str:
+    """Deal multiples, and the bias that makes the list ten rows long.
+
+    **The short list is correct and the funnel says where the rest went.** This
+    panel leads with that because a ten-row output invites the assumption that the
+    screen is broken. It is not: the deals population is missing almost exactly the
+    rows this screen exists to find, because an acquisition target is by definition
+    a company that stopped being listed.
+
+    Measured: of 2,160 filers whose 10-K history ends before 2024, **1.7% appear in
+    the deals table at all**, against 50.7% of those still filing. None of
+    Activision, VMware, Twitter, Seagen, Slack, Xilinx, Arena or Horizon is in it,
+    though all eight sit in the XBRL partitions with clean pre-deal histories.
+    """
+    stats = stats or {}
+    identities = stats.get("identities") or {}
+    coverage_to = stats.get("coverage_to") or ""
+    body = []
+    for row in rows[:ROWS_PER_LIST]:
+        v2r = row.get("value_to_revenue")
+        v2n = row.get("value_to_net_income")
+        body.append(
+            "<tr>"
+            f'<td class="tk">{_esc(str(row.get("company") or ""))}</td>'
+            f'<td class="note">{_esc(str(row.get("filed_date") or ""))}</td>'
+            f'<td class="num">{_money(str(row.get("value_usd") or "") or None)}</td>'
+            f'<td class="num">{_money(str(row.get("revenue") or "") or None)}</td>'
+            f'<td class="num">'
+            f'{"--" if v2r is None else f"{float(v2r):.2f}x"}</td>'
+            f'<td class="num">'
+            f'{"--" if v2n is None else f"{float(v2n):.1f}x"}</td>'
+            f'<td class="note">{_esc(str(row.get("period_end") or ""))}</td>'
+            "</tr>"
+        )
+    ident_rows = "".join(
+        "<tr>"
+        f'<td class="tk">{_esc(name)}</td>'
+        f'<td class="num">{int(identities.get(name, 0)):,}</td>'
+        f"<td class=\"note\">{why}</td>"
+        "</tr>"
+        for name, why in _MULT_IDENTITY_WHY.items()
+    )
+    stages = _funnel_html(funnel) if funnel else ""
+    if not rows:
+        listing = ('<p class="empty">No priced deal has a confirmable target and '
+                   "a pre-deal annual report yet. That is the survivorship hole, "
+                   "not an empty screen &mdash; see the funnel below.</p>")
+    else:
+        listing = f"""
+      <table class="rows">
+        <thead><tr><th>target</th><th>filed</th><th class="num">stated value</th>
+          <th class="num">revenue</th><th class="num">value / revenue</th>
+          <th class="num">value / net income</th>
+          <th title="fiscal period end of the annual report the figures come
+            from. Always before the deal -- point-in-time, which is why these
+            come from the Financial Statement Data Sets and not companyfacts.">
+            as of</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>"""
+    return f"""
+      <p class="why"><span class="why-k">read this first</span>
+        <strong>This list is short because the population is, and the funnel says
+        where the rest went.</strong> An acquisition target is by definition a
+        company that stopped being listed, so the deals table is missing almost
+        exactly the rows this screen exists to find. Measured: of 2,160 filers
+        whose 10-K history ends before 2024, <strong>1.7% appear in the deals table
+        at all</strong> &mdash; against 50.7% of those still filing. Activision,
+        VMware, Twitter, Seagen, Slack, Xilinx, Arena and Horizon are all absent,
+        and all eight sit in the XBRL partitions with clean pre-deal histories.</p>
+      <p class="note">The constraint is <em>not</em> target financials, which is
+        what the build order assumed: those are fully available and unbiased. It is
+        the deal population. Widening the ticker map does not fix it either &mdash;
+        SEC's own <code>company_tickers.json</code> is current-only, and a perfect
+        historical CIK&rarr;ticker map would resolve to symbols we hold no prices
+        for.</p>
+      {listing}
+      <h5>target identity, among deals with a pre-deal annual report</h5>
+      <p class="note"><strong>Confirmed from the filing record, never from
+        prose.</strong> An 8-K names its parties by defined term &mdash; "the
+        Buyer", "Parent", "Merger Sub" &mdash; so matching a target's name to a
+        filer is the 44.2%-precision mistake the Form 5500 work measured. What is
+        exact is the filer's own CIK, and a company acquired whole stops filing.</p>
+      <table class="rows">
+        <thead><tr><th>verdict</th><th class="num">deals</th>
+          <th>what it means</th></tr></thead>
+        <tbody>{ident_rows}</tbody>
+      </table>
+      <p class="note">Dividing a division's price by its parent's whole revenue is
+        a category error, and it fails in the direction that hides: the multiple
+        comes out small, and a screen ranking cheap deals first would rank its own
+        mistakes first. <code>division_sale</code> is therefore a
+        <code>deal_type</code> rather than a caveat.
+        {f"Filing history is loaded to {_esc(str(coverage_to))}; a deal within the confirmation lag of that cannot be confirmed either way." if coverage_to else ""}</p>
+      {stages}"""
+
+
+# --- U14: deck preview ---------------------------------------------------
+
+
+def decks_html(
+    rows: list[dict[str, Any]],
+    stats: dict[str, Any] | None = None,
+) -> str:
+    """What a deck would say about each filer, before it is a file.
+
+    **The preview exists so the provenance is visible without opening PowerPoint.**
+    A deck is the easiest artifact in this system to mistake for an authoritative
+    one: every other surface carries its caveats structurally, and a slide is a
+    rectangle with a big number on it. So this panel shows the substitution depth
+    and the worst input *per subject*, which is exactly what the deck's own cover
+    and footers carry.
+    """
+    stats = stats or {}
+    if not rows:
+        return ('<p class="why"><span class="why-k">waiting</span> No deck '
+                "subjects assembled. Run <code>mr dcf</code> first &mdash; a deck "
+                "is rendered from rows that already exist, never fetched.</p>")
+    body = []
+    for row in rows[:ROWS_PER_LIST]:
+        subs = list(row.get("substitutions") or [])
+        worst = str(row.get("weakest") or "")
+        cls = "note" if len(subs) <= 2 else "collapsed"
+        body.append(
+            "<tr>"
+            f'<td class="tk">{_esc(str(row.get("company") or ""))}</td>'
+            f'<td class="num">{_money(str(row.get("enterprise_value") or "") or None)}</td>'
+            f'<td class="num">{len(subs)}</td>'
+            f'<td class="{cls}">{_esc(worst)}</td>'
+            f'<td class="num">{int(row.get("pages") or 0)}</td>'
+            "</tr>"
+        )
+    pages = "".join(
+        f"<tr><td class=\"num\">{i + 1}</td>"
+        f'<td class="tk">{_esc(name)}</td>'
+        f'<td class="note">{_esc(what)}</td></tr>'
+        for i, (name, what) in enumerate(stats.get("pages") or [])
+    )
+    return f"""
+      <p class="why"><span class="why-k">how to read this</span>
+        A deck is the easiest artifact here to mistake for an authoritative one.
+        Every other surface carries its caveats structurally; a slide is a rectangle
+        with a big number on it. So <strong>the provenance footer runs on every page
+        from a single code path</strong> &mdash; <code>add_page</code> is the only
+        function that creates a slide and it calls the footer itself, which means
+        there is no way to render a page without its caveats.</p>
+      <table class="rows">
+        <thead><tr><th>subject</th><th class="num">enterprise value</th>
+          <th class="num">subs</th><th>weakest input, as the cover states it</th>
+          <th class="num">pages</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+      <p class="note">The cover leads with the <em>worst</em> input rather than the
+        number, ordered by what most changes the answer: an absent capex line beats
+        a missing beta beats a peer beta, because it moves free cash flow rather
+        than the discount rate. <strong>No market capitalisation appears anywhere in
+        a deck</strong> &mdash; the 20-name check put EV/market-cap at 0.03&times;
+        for Amazon and 0.96&times; for Johnson &amp; Johnson on the same growth
+        constant, and a slide placing the two side by side would be the most
+        authoritative-looking wrong thing this project could produce.</p>
+      <h5>the ten pages, in the order a reader needs them</h5>
+      <table class="rows">
+        <thead><tr><th class="num">#</th><th>page</th><th>what it carries</th></tr>
+        </thead>
+        <tbody>{pages}</tbody>
+      </table>
+      <p class="note">The sensitivity page <em>reads</em> a stored flex rather than
+        computing one. A page that computes is a page that can disagree with this
+        dashboard about the same filer, and the deck is the artifact that leaves the
+        room.</p>"""

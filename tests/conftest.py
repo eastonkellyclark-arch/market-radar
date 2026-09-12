@@ -294,6 +294,64 @@ PROXY_ROWS: dict = {
 }
 
 
+#: A loaded deal-multiples panel. Ten rows and a large `kept_filing` count,
+#: because that is the real shape: 84% of priced filings sold a division rather
+#: than themselves, and a fixture with only clean takeouts would leave the
+#: identity machinery untested.
+MULTIPLES_ROWS: dict = {
+    "rows": [
+        {"company": "ANIXTER INTERNATIONAL INC", "filed_date": "2019-10-30",
+         "value_usd": "4500000000", "revenue": "8400000000",
+         "value_to_revenue": 0.54, "value_to_net_income": 40.9,
+         "period_end": "2018-12-28"},
+        {"company": "DEAN FOODS CO", "filed_date": "2020-05-01",
+         "value_usd": "433000000", "revenue": "7755000000",
+         "value_to_revenue": 0.06, "value_to_net_income": None,
+         "period_end": "2018-12-31"},
+    ],
+    "stats": {
+        "rows": 10,
+        "identities": {"acquired_whole": 10, "kept_filing": 1778,
+                       "too_recent": 94},
+        "coverage_to": "2026-05-31",
+    },
+    "funnel": None,
+}
+
+#: A loaded deck-preview panel: one clean subject and one six-substitution
+#: subject, plus the page list. The worst case is the reason the panel exists.
+DECK_ROWS: dict = {
+    "rows": [
+        {"company": "WALMART INC.", "enterprise_value": "353400000000",
+         "substitutions": ["erp_constant", "growth_constant"],
+         "weakest": "clean apart from two constants with no free source",
+         "pages": 10},
+        {"company": "ADAMS RESOURCES & ENERGY, INC.",
+         "enterprise_value": "890770388",
+         "substitutions": ["peer_beta", "comp_depth_fallback", "absent_capex",
+                           "erp_constant", "growth_constant",
+                           "growth_mismatch"],
+         "weakest": "no capex line -- free cash flow is overstated",
+         "pages": 10},
+    ],
+    "stats": {
+        "subjects": 2, "clean": 1,
+        "pages": [
+            ("cover", "Company, ticker, SIC, filing window"),
+            ("identity", "What the filer universe knows"),
+            ("fundamentals", "The seven concepts, each with its own coverage"),
+            ("cash_flow", "Operating cash flow, capex and free cash flow"),
+            ("peers", "The peer set and the SIC depth it settled for"),
+            ("valuation", "Enterprise value and every substitution behind it"),
+            ("sensitivity", "What the answer does when the constants move"),
+            ("insiders", "Form 4 clusters"),
+            ("deals", "8-K deal history, by form type"),
+            ("prices", "Split-adjusted history and unexplained moves"),
+        ],
+    },
+}
+
+
 def loaded_context(**overrides):
     """A dashboard Context with every source present and nothing empty.
 
@@ -363,6 +421,8 @@ def loaded_context(**overrides):
         comps=COMPS_SETS,
         dcf=DCF_ROWS,
         proxy=PROXY_ROWS,
+        multiples=MULTIPLES_ROWS,
+        decks=DECK_ROWS,
     )
     base.update(overrides)
     ctx = shell.Context(**base)

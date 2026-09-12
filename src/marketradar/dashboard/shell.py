@@ -109,6 +109,18 @@ class Panel:
     #: probe: a declined panel may well have data behind it, and chipping it
     #: live would say it is being used.
     declined: str = ""
+    #: Dotted path of the module that implements this panel, where one exists.
+    #:
+    #: **Declared so a test can catch the third kind of drift.** The spec-table
+    #: test compares the doc to this map; the probes compare this map to the data.
+    #: Neither can see a panel that says "not built" while its engine is built and
+    #: running -- which is exactly what happened to `multiples` and `decks`:
+    #: `screens/deal_multiples.py` was returning rows and `decks.py` had rendered
+    #: three decks while the dashboard advertised both as Beyond.
+    #:
+    #: So: a panel that resolves NOT_BUILT must not have an importable engine. See
+    #: tests/test_dashboard_spec.py.
+    engine: str = ""
     probe: Callable[["Context"], tuple[str, str]] | None = None
 
     def resolve(self, ctx: "Context") -> tuple[str, str]:
@@ -164,6 +176,10 @@ class Context:
     #: Located proxy sections. The shipped half of the proxy reader -- extraction
     #: was measured and declined; see docs/build-spec.md.
     proxy: dict[str, Any] = field(default_factory=dict)
+    #: Deal multiples and the identity verdicts behind them.
+    multiples: dict[str, Any] = field(default_factory=dict)
+    #: Deck subjects, their substitution depth and the page list.
+    decks: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -517,6 +533,51 @@ def _probe_dcf(ctx: Context) -> tuple[str, str]:
     )
 
 
+def _probe_multiples(ctx: Context) -> tuple[str, str]:
+    """Live once the screen has run, and it leads with the bias, not the count.
+
+    Ten rows invites the assumption that the screen is broken. It is not: an
+    acquisition target is by definition a company that stopped being listed, so the
+    deals population is missing almost exactly the rows this screen exists to find.
+    A headline that said "10 multiples" would hide that; one that says the share
+    confirmed does not.
+    """
+    stats = (ctx.multiples or {}).get("stats") or {}
+    if not stats:
+        return WAITING, "screen has not run -- `mr multiples`"
+    rows = int(stats.get("rows") or 0)
+    identities = stats.get("identities") or {}
+    whole = int(identities.get("acquired_whole") or 0)
+    kept = int(identities.get("kept_filing") or 0)
+    if not rows:
+        return WAITING, (
+            f"no confirmable target with a pre-deal report; {kept:,} sold a "
+            "division rather than themselves")
+    return LIVE, (
+        f"{rows:,} multiples from {whole:,} confirmed targets; {kept:,} priced "
+        "filings were division sales"
+    )
+
+
+def _probe_decks(ctx: Context) -> tuple[str, str]:
+    """Live once deck subjects exist, and it reports substitution depth.
+
+    Not the number of decks. A deck is the easiest artifact here to mistake for an
+    authoritative one, so the headline is how much of it rests on a substituted
+    input.
+    """
+    stats = (ctx.decks or {}).get("stats") or {}
+    subjects = int(stats.get("subjects") or 0)
+    if not subjects:
+        return WAITING, "no subjects assembled -- run `mr dcf` first"
+    clean = int(stats.get("clean") or 0)
+    pages = len(stats.get("pages") or ())
+    return LIVE, (
+        f"{subjects:,} subjects, {pages} pages each; {clean:,} rest on nothing "
+        "beyond the two unavoidable constants"
+    )
+
+
 def _probe_proxy(ctx: Context) -> tuple[str, str]:
     """Live once proxies are located. Reports sections, never figures.
 
@@ -551,48 +612,59 @@ def _probe_deals(ctx: Context) -> tuple[str, str]:
 PANELS: Final[tuple[Panel, ...]] = (
     Panel("health", "Health", "Markets",
           "Sweep coverage, staleness per source, entity counts.",
+          engine="marketradar.digest",
           probe=_probe_health),
     Panel("macro", "Macro", "Markets",
           "10-year Treasury and ICE BofA credit spreads, with 30-day and "
           "1-year changes in basis points.",
+          engine="marketradar.sources.fred",
           probe=_probe_macro),
     Panel("screens", "Volatility screens", "Markets",
           "24 lists: gainers and losers, three price bands, stocks apart from "
           "ETFs, a parallel >$5M ADV set. Two tab axes; gainers and losers "
           "are read together and the ADV gate is a toggle.",
+          engine="marketradar.screens.volatility",
           probe=_probe_screens),
     Panel("names", "Company names", "Markets",
           "Issuer names joined onto screen rows; ambiguous tickers marked "
           "rather than silently resolved.",
+          engine="marketradar.sources.sec_company_tickers",
           probe=_probe_names),
     Panel("liquidity", "Liquidity gate", "Markets",
           "The >$5M average-dollar-volume gate behind half the screen lists.",
+          engine="marketradar.screens.volatility",
           probe=_probe_liquidity),
     Panel("ticker", "Ticker detail", "Markets",
           "Recent bars for one name, split-adjusted at read time.",
+          engine="marketradar.dashboard.tickers",
           probe=_probe_ticker_detail),
     Panel("dod", "Day-over-day", "Markets",
           "NEW markers: names absent from the same list on the prior session.",
+          engine="marketradar.screens.volatility",
           probe=_probe_day_over_day),
 
     Panel("filings", "EDGAR filing feed", "Filings",
           "The seven watched form types: 4, 8-K, S-4, DEFM14A, SC 13D, "
           "SC TO-T, SC 13E-3.",
+          engine="marketradar.signals.edgar_rss",
           probe=_probe_filings),
     Panel("clusters_insider", "Form 4 clusters -- officers & directors",
           "Filings",
           "2+ distinct open-market buyers at one issuer inside 72 hours. "
           "Dollar floor adjustable here, not only in the CLI.",
+          engine="marketradar.signals.form4",
           probe=_probe_clusters_insider),
     Panel("clusters_tenpct", "Form 4 clusters -- 10% holders", "Filings",
           "The same rule for holders with no officer or director role. Kept "
           "apart because the medians are 78x apart, so one floor cannot "
           "serve both.",
+          engine="marketradar.signals.form4",
           probe=_probe_clusters_tenpct),
     Panel("deals", "8-K deals", "Filings",
           "Items 1.01 and 2.01, classified. Item 1.01 is only ~16% M&A, so "
           "both classifiers are shown and disagreements are a review queue "
           "rather than a hidden judgement call.",
+          engine="marketradar.signals.deals",
           probe=_probe_deals),
     # Not `weekend="Weekend 3"`, which is what this said for a day after the
     # decision. A panel promising a weekend that is never coming is the shell
@@ -602,6 +674,7 @@ PANELS: Final[tuple[Panel, ...]] = (
           "part worth reading is a few thousand; the locator finds it every "
           "time, free. Extraction was measured at 62% per figure and declined "
           "-- this panel reports sections, not figures.",
+          engine="marketradar.signals.proxy",
           probe=_probe_proxy),
     Panel("news", "News", "Filings",
           "Headlines against watched issuers. Measured against real 8-K deal "
@@ -616,47 +689,60 @@ PANELS: Final[tuple[Panel, ...]] = (
           "Form 5500 sponsors with no SEC match -- 94.8% of them, which is "
           "the source working rather than failing. NAICS, headcount range, "
           "DFE trustees filterable as their own category.",
+          engine="marketradar.sources.form5500",
           probe=_probe_private),
     Panel("mature", "Mature targets", "Private",
           "Old private employers whose headcount has stopped growing. Age is "
           "a floor from the oldest plan still filed, headcount is a range, "
           "and a sponsor that stopped filing is excluded rather than read as "
           "a decline.",
+          engine="marketradar.screens.mature_target",
           probe=_probe_mature),
     Panel("review", "Entity review queue", "Private",
           "Sponsors whose name matched an SEC filer while their EIN did not. "
           "~23k rows, not 800k: EIN is on 100% of filings, so everything "
           "else resolves exactly or is private.",
+          engine="marketradar.entities.reconcile",
           probe=_probe_review),
 
     Panel("xbrl", "XBRL fundamentals", "Analysis",
           "Six concepts, post-606, operating companies only. Which tags "
           "resolved, which fell through, and which of five reasons each miss "
           "had -- only one of them is work.",
+          engine="marketradar.sources.xbrl.resolve",
           probe=_probe_xbrl),
     Panel("comps", "Peer sets", "Analysis",
           "Peers by SIC and size from the six concepts. The depth column is "
           "the panel: the ladder tries 4-digit SIC, then 3, then 2, and says "
           "which it settled on -- because the extra digit buys nothing "
           "measurable and the size band does the work.",
+          engine="marketradar.screens.comps",
           probe=_probe_comps),
     Panel("multiples", "Deal multiples", "Analysis",
-          "Comparable transactions, filtered before ranked.",
-          weekend="Beyond"),
+          "What a target sold for over what it last reported. The list is short "
+          "because the population is: an acquisition target is a company that "
+          "stopped being listed, and the funnel says where the rest went.",
+          engine="marketradar.screens.deal_multiples",
+          probe=_probe_multiples),
     Panel("outcomes", "Historical outcomes", "Analysis",
           "Forward returns at +1/+5/+30 trading sessions, against a "
           "benchmark. Pure SQL, no LLM -- so it precedes every embedding "
           "rather than justifying one afterwards.",
+          engine="marketradar.screens.outcomes",
           probe=_probe_outcomes),
     Panel("dcf", "DCF / 3-statement", "Analysis",
           "Enterprise values with every substitution on the row. No row has "
           "zero: the equity risk premium and the growth rate are constants on "
           "all of them, so the page opens at the cohort that is clean apart "
           "from those two.",
+          engine="marketradar.screens.dcf",
           probe=_probe_dcf),
     Panel("decks", "Pitch decks", "Analysis",
-          "Generated deck preview, before it is a file.",
-          weekend="Beyond"),
+          "What a deck would say, before it is a file. Ten pages, and the "
+          "provenance footer runs on every one from a single code path -- there "
+          "is no way to render a page without its caveats.",
+          engine="marketradar.decks",
+          probe=_probe_decks),
 )
 
 SECTIONS: Final[tuple[str, ...]] = ("Markets", "Filings", "Private", "Analysis")
@@ -681,6 +767,12 @@ def _panel_html(panel: Panel, state: str, detail: str, body: str = "") -> str:
             f'<p class="why"><span class="why-k">{labels[state]}</span> '
             f'{_esc(detail)}</p>'
         )
+    # `engine` rendered rather than merely declared. A field nothing consumes is a
+    # comment that looks like code -- which is how `waiting_on` held three stale
+    # strings for a month -- and this one also backs the panel-map-against-code
+    # drift check, so it has to be real.
+    engine = (f'<p class="engine">backed by <code>{_esc(panel.engine)}</code></p>'
+              if panel.engine else "")
     return f"""
       <article class="panel" id="panel-{_esc(panel.id)}"
                data-state="{_esc(state)}" data-panel="{_esc(panel.id)}">
@@ -691,6 +783,7 @@ def _panel_html(panel: Panel, state: str, detail: str, body: str = "") -> str:
           </span>
         </header>
         <p class="what">{_esc(panel.what)}</p>
+        {engine}
         {waiting}
         <div class="slot">{body}</div>
       </article>"""
@@ -945,6 +1038,15 @@ def render(
         (ctx.comps or {}).get("stats") or {},
         (ctx.comps or {}).get("funnel"),
     )
+    bodies["multiples"] = body_html.multiples_html(
+        (ctx.multiples or {}).get("rows") or [],
+        (ctx.multiples or {}).get("stats") or {},
+        (ctx.multiples or {}).get("funnel"),
+    )
+    bodies["decks"] = body_html.decks_html(
+        (ctx.decks or {}).get("rows") or [],
+        (ctx.decks or {}).get("stats") or {},
+    )
     bodies["proxy"] = body_html.proxy_html(
         (ctx.proxy or {}).get("rows") or [],
         (ctx.proxy or {}).get("stats") or {},
@@ -1084,6 +1186,8 @@ h3 {{ font-size:14px; margin:0; font-weight:600; }}
 }}
 .panel header {{ display:flex; align-items:center; justify-content:space-between; gap:10px; }}
 .what {{ color:var(--ink-2); margin:8px 0 0; font-size:12.5px; }}
+.engine {{ color:var(--ink-3); margin:4px 0 0; font-size:11.5px; }}
+.engine code {{ font-size:11px; }}
 .why {{ margin:9px 0 0; font-size:12px; color:var(--muted); }}
 .why-k {{
   text-transform:uppercase; letter-spacing:.06em; font-size:10px;

@@ -275,3 +275,61 @@ def test_no_panel_declares_a_state_reason_nothing_reads() -> None:
         "already decides both the state and the reason -- see the module "
         "docstring."
     )
+
+
+# --- the third kind of drift ---------------------------------------------
+
+
+def test_a_panel_cannot_say_not_built_while_its_engine_runs() -> None:
+    """**The drift neither existing check can see.**
+
+    ``test_the_spec_table_and_the_panel_map_agree`` compares the doc to the panel
+    map. The probes compare the panel map to the data. Nothing compared the panel
+    map to the *code* -- so ``multiples`` and ``decks`` advertised "not built --
+    Beyond" while ``screens/deal_multiples.py`` was returning rows and
+    ``decks.py`` had rendered three decks that were read and commented on.
+
+    An engine that runs while its panel says "not built" is worse than a missing
+    panel: a reader looking at the shell concludes the work does not exist, which
+    is the precise failure the four-state map was built to prevent.
+    """
+    import importlib.util
+
+    drift = []
+    for panel in shell.PANELS:
+        state, _detail = panel.resolve(loaded_context())
+        if state != shell.NOT_BUILT or not panel.engine:
+            continue
+        if importlib.util.find_spec(panel.engine) is not None:
+            drift.append(f"{panel.id}: resolves {state!r} but {panel.engine} "
+                         "imports")
+    assert not drift, (
+        "a panel claims not to exist while its engine does:\n  "
+        + "\n  ".join(drift)
+        + "\n\nEither wire a probe so the panel reports its real state, or drop "
+        "the engine declaration if the module is not what backs it."
+    )
+
+
+def test_every_live_panel_declares_the_module_that_backs_it() -> None:
+    """Otherwise the check above passes vacuously.
+
+    A panel with no ``engine`` is exempt from the drift check, so an undeclared
+    engine is a hole in it rather than a neutral omission. ``declined`` panels are
+    genuinely exempt: news has no module by decision.
+    """
+    missing = [p.id for p in shell.PANELS if not p.engine and not p.declined]
+    assert not missing, (
+        f"these panels declare no engine, so the drift check cannot see them: "
+        f"{missing}"
+    )
+
+
+def test_every_declared_engine_actually_imports() -> None:
+    """A typo in an engine path would silently exempt that panel from the drift
+    check -- the declaration would be there and never resolve."""
+    import importlib.util
+
+    broken = [(p.id, p.engine) for p in shell.PANELS
+              if p.engine and importlib.util.find_spec(p.engine) is None]
+    assert not broken, f"engine paths that do not resolve: {broken}"
