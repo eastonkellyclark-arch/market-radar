@@ -22,6 +22,9 @@ Three tiers. Each narrows the funnel before expensive work runs.
   decks. This is the only tier allowed to be expensive.
 
 Full data source inventory and build order live in `docs/build-spec.md`.
+Day-to-day operation -- what runs unattended, what to run by hand, what to
+check each morning, what to do when something is red -- is
+`docs/operating.md`.
 
 ---
 
