@@ -55,7 +55,15 @@ def subject(**over) -> decks.Subject:
                    "flex": {0.0: 2.6e11, 0.03: 3.53e11, 0.06: 4.9e11,
                             0.10: 7.8e11},
                    "substitutions": ["erp_constant", "growth_constant"]},
-        insiders=[], deals=[], prices=[(date(2026, 9, 10), 104.5)],
+        insiders=[], deals=[],
+        # OHLCV now, because the chart draws candles. Three months so the monthly
+        # aggregation has something to aggregate -- a single bar would let a
+        # sampling bug through, and the deck's chart is the dashboard's function.
+        prices=[
+            (date(2026, m, d), 100.0 + m, 106.0 + m, 97.0 + m, 104.5 + m,
+             1_000_000 + d)
+            for m in (7, 8, 9) for d in (2, 9, 16, 23)
+        ],
     )
     base.update(over)
     return decks.Subject(**base)
@@ -96,8 +104,10 @@ def test_every_page_carries_the_provenance_footer(tmp_path) -> None:
     pages = slide_text(dest)
     assert len(pages) == len(decks.PAGES) == 10
     for i, text in enumerate(pages):
-        assert "inputs carry:" in text, (
-            f"page {i + 1} ({decks.PAGES[i][0]}) has no provenance footer")
+        assert "INPUTS CARRY" in text, (
+            f"page {i + 1} ({decks.PAGES[i][0]}) has no footnote band")
+        # Numbered in the band, so a page with six caveats is still readable.
+        assert "1.  " in text, f"page {i + 1} has a band with no caveats in it"
 
 
 def test_the_footer_names_every_substitution(tmp_path) -> None:
@@ -144,7 +154,7 @@ def test_a_clean_subject_still_says_what_it_rests_on(tmp_path) -> None:
     assert clean.clean_but_constants_like, "fixture is not the clean case"
     pages = slide_text(decks.build(clean, tmp_path / "d.pptx"))
     for i, text in enumerate(pages):
-        assert "inputs carry:" in text, f"page {i + 1} lost its footer"
+        assert "INPUTS CARRY" in text, f"page {i + 1} lost its band"
         assert "equity risk premium is a dated constant" in text
         assert "flat 3%" in text
     # And the cover says it positively rather than leaving the reader to infer it.
@@ -164,9 +174,42 @@ def test_the_cover_leads_with_the_worst_input_not_the_number(tmp_path) -> None:
         "substitutions": ["peer_beta", "comp_depth_fallback", "absent_capex",
                           "erp_constant", "growth_constant",
                           "growth_mismatch"]})
-    cover = slide_text(decks.build(heavy, tmp_path / "d.pptx"))[0]
-    assert "weakest input: no capex line" in cover
+    dest = decks.build(heavy, tmp_path / "d.pptx")
+    cover = slide_text(dest)[0]
+    assert "no capex line" in cover
     assert heavy.weakest == decks.SUBSTITUTION_WORDS["absent_capex"]
+
+    # **And it is set at display weight, not tucked under the figure.** The prose
+    # prefix this used to match ("weakest input: ") went away when the cover became
+    # two halves -- the number on the left, a data-quality panel on the right. The
+    # property is that the caveat is *typographically equal* to the number, which is
+    # what "leads with" was reaching for, so that is what is asserted now: a test
+    # pinned to the old sentence would have passed on a panel set in 6pt grey.
+    from pptx import Presentation
+    from pptx.util import Emu
+
+    slide = Presentation(str(dest)).slides[0]
+    # A list of pairs, not a dict keyed by text: the caveat appears twice on the
+    # cover -- once as the panel's headline and once in the substitution list -- and
+    # keying by text collapsed them so the smaller one won. The first version of
+    # this assertion failed for that reason and the design was fine.
+    sized = [
+        ((sh.text_frame.text or "").strip(),
+         max((r.font.size.pt for para in sh.text_frame.paragraphs
+              for r in para.runs if r.font.size is not None), default=0))
+        for sh in slide.shapes if sh.has_text_frame
+    ]
+    weakest_pt = max((pt for text, pt in sized if "no capex line" in text),
+                     default=0)
+    assert weakest_pt >= decks.H2, (
+        f"the worst input is set at {weakest_pt}pt, below the page's own "
+        f"secondary size ({decks.H2}pt) -- that is a footnote, not a lead")
+    # Both halves are inside the top two-thirds, so neither is below the fold of a
+    # slide somebody crops.
+    panel_tops = [Emu(sh.top).inches for sh in slide.shapes
+                  if sh.has_text_frame and "no capex line" in (
+                      sh.text_frame.text or "")]
+    assert panel_tops and min(panel_tops) < decks.SLIDE_H / 2
 
     # Without the capex problem, the next worst is the missing beta.
     no_beta = subject(valuation={

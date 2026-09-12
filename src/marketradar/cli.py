@@ -210,6 +210,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="discard the checkpoint and sweep from the beginning")
     p_symbols.set_defaults(func=_cmd_symbols)
 
+    p_decks = sub.add_parser(
+        "decks",
+        help="render a pitch deck for one filer, or for a named archetype")
+    p_decks.add_argument(
+        "--cik", nargs="*", default=[], metavar="CIK",
+        help="one or more CIKs to render")
+    p_decks.add_argument(
+        "--archetype", nargs="*", default=[], metavar="NAME",
+        choices=["clean", "growth_mismatch", "heavy"],
+        help="pick a filer by evidence quality instead of naming one: "
+             "clean (nothing beyond the two constants), growth_mismatch, "
+             "heavy (the deepest substitution stack)")
+    p_decks.add_argument(
+        "--out", default=".decks", metavar="DIR",
+        help="where the .pptx files are written")
+    p_decks.add_argument(
+        "--data", default=".cache/xbrl/out", metavar="DIR",
+        help="directory holding the fundamentals partitions")
+    p_decks.set_defaults(func=_cmd_decks)
+
     p_xbrl = sub.add_parser(
         "xbrl",
         help="normalize one quarter of SEC fundamentals and report coverage",
@@ -1419,6 +1439,215 @@ def _deck_rows(con: Any, out_dir: Path) -> dict[str, Any]:
     }
 
 
+#: Which substitution stack each archetype names. A deck of a clean filer and a deck
+#: of one resting on four substitutions are different artifacts, and the second is
+#: the one worth reading -- so they are selectable by name rather than by hunting a
+#: CIK out of the panel.
+ARCHETYPES: Final[dict[str, str]] = {
+    "clean": "nothing beyond the two unavoidable constants",
+    "growth_mismatch": "the flat growth rate is least likely to hold here",
+    "heavy": "the deepest substitution stack in the population",
+}
+
+
+def _deck_subject(row: dict[str, Any], con: Any, out_dir: Path) -> Any:
+    """One fully-populated Subject from a stored DCF row.
+
+    **Assembled here, not in `decks.py`.** A deck must be reproducible -- given the
+    same Subject, the same file -- so the renderer takes a dataclass and never a live
+    connection. This is the function that does the querying, once, before any slide
+    is laid out.
+    """
+    from datetime import date as _date
+
+    from marketradar import decks as decks_mod
+    from marketradar import storage
+    from marketradar.entities.cik import cik_sql
+    from marketradar.screens import volatility as vol_mod
+
+    cik = row["cik"]
+    glob = (out_dir / COMPS_GLOB).as_posix()
+    con.execute(
+        f"create or replace view _deck_xb as select * from read_parquet('{glob}')")
+
+    facts: dict[str, dict[str, Any]] = {}
+    ident: dict[str, Any] = {}
+    try:
+        for concept, value, status, tag, period in con.execute("""
+            select concept, value, status, tag, period_end from _deck_xb
+            where lpad(cast(cik as varchar), 10, '0') = ?
+            -- Newest period per concept, with an explicit tiebreak: two rows at
+            -- the same period_end would otherwise be separated by row order.
+            qualify row_number() over (partition by concept
+                                       order by period_end desc, tag) = 1
+        """, [cik]).fetchall():
+            facts[concept] = {"value": value, "status": status, "tag": tag,
+                              "period_end": period}
+        got = con.execute("""
+            -- max_by on an explicit key, never any_value: which spelling of a
+            -- name wins decided a join once already, and three loads of
+            -- identical input produced three different review counts.
+            select max_by(company, period_end), max(sic),
+                   min(period_end), max(period_end)
+            from _deck_xb where lpad(cast(cik as varchar), 10, '0') = ?
+        """, [cik]).fetchone()
+        if got:
+            ident = {"sic": got[1], "first_period": got[2], "last_period": got[3]}
+    except Exception as exc:                               # a missing column, say
+        log.warning("deck fundamentals unavailable for %s: %s", cik, exc)
+
+    # **Two sources, in this order, and the order is the whole point.**
+    # `company_ticker_history` only covers filers that have *stopped* -- it was built
+    # from the cover pages of delisted companies -- so asking it alone returned
+    # nothing for every active filer, and the price chart silently drew empty for
+    # 3M. Current listings live in `company_tickers`; the recovered map is the
+    # fallback for the delisted half, which is exactly the population `companies`
+    # has a 97% hole in.
+    ticker = None
+    A = storage.PG_ALIAS
+    for sql in (
+        f"select t.ticker from {A}.company_tickers t join {A}.companies c "
+        f"on c.id = t.company_id where {cik_sql('c.cik')} = {cik_sql('?')} "
+        "order by t.last_seen desc nulls last, t.ticker limit 1",
+        f"select ticker from {A}.company_ticker_history "
+        f"where {cik_sql('cik')} = {cik_sql('?')} "
+        "order by last_seen desc, ticker limit 1",
+    ):
+        try:
+            hit = con.execute(sql, [cik]).fetchone()
+        except Exception as exc:
+            log.warning("ticker lookup failed for %s: %s", cik, exc)
+            continue
+        if hit and hit[0]:
+            ticker = hit[0]
+            break
+
+    prices: list[tuple[_date, float]] = []
+    if ticker:
+        try:
+            rel = vol_mod.read_all_prices(con)
+            con.register("_deck_px", rel)
+            # `distinct`, for the same reason tickers.build needs it: the price
+            # staging holds 2,042 (ticker, date) pairs twice, identical in OHLCV,
+            # and a candle aggregate would double their volume.
+            prices = [
+                (d, float(o), float(h), float(lo), float(c), int(v))
+                for d, o, h, lo, c, v in con.execute(
+                    "select distinct date, open, high, low, close, volume "
+                    "from _deck_px where ticker = ? order by date",
+                    [ticker]).fetchall()
+            ]
+        except Exception as exc:
+            log.warning("deck prices unavailable for %s: %s", ticker, exc)
+
+    return decks_mod.Subject(
+        cik=cik, company=row["company"], ticker=ticker,
+        sic=ident.get("sic"), first_period=ident.get("first_period"),
+        last_period=ident.get("last_period"),
+        fundamentals=facts,
+        valuation={
+            "enterprise_value": row.get("enterprise_value"),
+            "wacc": row.get("wacc"), "terminal_share": row.get("terminal_share"),
+            "beta": row.get("beta"), "growth": row.get("growth"),
+            "free_cash_flow": row.get("free_cash_flow"),
+            "flex": row.get("flex") or {},
+            "substitutions": row.get("substitutions") or [],
+            "source": row.get("source") or {},
+        },
+        prices=prices,
+    )
+
+
+def _pick_archetypes(rows: list[dict[str, Any]], names: list[str]) -> list[dict]:
+    """One row per named archetype, chosen deterministically.
+
+    `max`/`min` on an explicit key rather than "the first one that matches": which
+    filer stands for an archetype must not depend on row order, or two runs of the
+    same command would render different decks and both would look right.
+    """
+    out: list[dict[str, Any]] = []
+    for name in names:
+        if name == "clean":
+            pool = [r for r in rows if r.get("clean_but_constants")]
+            pick = min(pool, key=lambda r: (r["company"], r["cik"])) if pool else None
+        elif name == "growth_mismatch":
+            pool = [r for r in rows
+                    if "growth_mismatch" in (r.get("substitutions") or [])]
+            pick = min(pool, key=lambda r: (r["company"], r["cik"])) if pool else None
+        else:
+            pool = rows
+            pick = max(pool, key=lambda r: (len(r.get("substitutions") or []),
+                                            r["company"])) if pool else None
+        if pick is None:
+            print(f"mr decks: no filer matches archetype {name!r}", file=sys.stderr)
+            continue
+        out.append(pick)
+    return out
+
+
+def _cmd_decks(args: argparse.Namespace) -> int:
+    """Render a deck per filer, **on demand and never on a schedule**.
+
+    2,564 valuations is 2,564 files nobody opens, and a directory of decks generated
+    nightly is indistinguishable from one where the generator broke last Tuesday. So
+    there is no workflow step for this and no `--all`: a deck is produced because
+    somebody asked for that filer.
+    """
+    from marketradar import storage
+
+    con = storage.connect()
+    built = _dcf_rows(con, Path(args.data))
+    rows = built.get("rows") or []
+    if not rows:
+        print(f"mr decks: no valuations under {args.data}; run `mr xbrl` then "
+              "`mr dcf` first", file=sys.stderr)
+        return EXIT_ERROR
+
+    by_cik = {r["cik"]: r for r in rows}
+    wanted: list[dict[str, Any]] = []
+    for cik in args.cik:
+        key = cik.strip().lstrip("0").rjust(10, "0")
+        if key not in by_cik:
+            print(f"mr decks: {cik} has no valuation, so there is nothing to draw. "
+                  "A deck of a filer the DCF could not value would be a deck of "
+                  "blanks.", file=sys.stderr)
+            return EXIT_ERROR
+        wanted.append(by_cik[key])
+    wanted.extend(_pick_archetypes(rows, args.archetype))
+    if not wanted:
+        print("mr decks: name a --cik or an --archetype. Nothing is rendered by "
+              "default, because a deck per filer is 2,564 files nobody opens.",
+              file=sys.stderr)
+        return EXIT_ERROR
+
+    from marketradar import decks as decks_mod
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    made: list[Path] = []
+    for row in wanted:
+        subject = _deck_subject(row, con, Path(args.data))
+        dest = out_dir / f"{subject.cik}_{_slug(subject.company)}.pptx"
+        try:
+            made.append(decks_mod.build(subject, dest))
+        except decks_mod.DeckError as exc:
+            print(f"mr decks: {subject.company}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        subs = subject.substitutions
+        print(f"  {dest.name}")
+        print(f"    {len(decks_mod.PAGES)} pages; {len(subs)} substitution(s): "
+              f"{', '.join(subs) or 'none'}")
+        print(f"    weakest: {subject.weakest}")
+    print()
+    print(f"{len(made)} deck(s) in {out_dir}")
+    return EXIT_OK
+
+
+def _slug(name: str) -> str:
+    keep = [c if c.isalnum() else "-" for c in name.lower()]
+    return "".join(keep).strip("-")[:40] or "filer"
+
+
 def _cmd_dashboard(args: argparse.Namespace) -> int:
     """Render the panel map to a local file and open it.
 
@@ -2584,6 +2813,14 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_comps(args)
         except Exception as exc:
             print(f"mr comps: error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "decks":
+        load_dotenv()
+        try:
+            return _cmd_decks(args)
+        except Exception as exc:
+            print(f"mr decks: error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "symbols":

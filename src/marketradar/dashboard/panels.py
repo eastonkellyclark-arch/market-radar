@@ -1747,6 +1747,26 @@ def _dcf_subs_html(subs: list[str]) -> str:
     return " ".join(out)
 
 
+#: The command a deck button copies. One definition, so the button and the docs
+#: cannot drift -- and it names `uv run` because that is how every other command in
+#: this project is invoked.
+DECK_COMMAND: Final[str] = "uv run mr decks --cik {cik}"
+
+
+def deck_button(cik: str) -> str:
+    """A small button that copies the deck command for one filer.
+
+    **Copies rather than generates, and says so on hover.** The dashboard is a static
+    file with no server, so there is nothing here that could run a renderer; a button
+    labelled "generate" would be claiming to have done something it cannot. Rendering
+    is on demand by design anyway -- 2,564 decks nightly is 2,564 files nobody opens.
+    """
+    if not cik:
+        return ""
+    return (f'<button class="deckbtn" type="button" data-deck-cik="{_esc(cik)}" '
+            f'title="Copy: {_esc(DECK_COMMAND.format(cik=cik))}">deck</button>')
+
+
 def dcf_html(
     rows: list[dict[str, Any]],
     stats: dict[str, Any] | None = None,
@@ -1775,8 +1795,10 @@ def dcf_html(
         ev = row.get("enterprise_value")
         body.append(
             f'<tr class="dcfr" data-cohort="{cohort}" '
-            f'data-depth="{len(subs)}">'
-            f'<td class="tk">{_esc(str(row.get("company") or ""))}</td>'
+            f'data-depth="{len(subs)}" '
+            f'data-cik="{_esc(str(row.get("cik") or ""))}">'
+            f'<td class="tk">{_esc(str(row.get("company") or ""))}'
+            f'{deck_button(str(row.get("cik") or ""))}</td>'
             f'<td class="num">{_money(str(ev)) if ev else "--"}</td>'
             f'<td class="num">'
             f'{"--" if row.get("wacc") is None else f"{float(row["wacc"]) * 100:.1f}%"}'

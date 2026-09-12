@@ -61,12 +61,84 @@ PAGES: Final[tuple[tuple[str, str], ...]] = (
 SLIDE_W: Final[float] = 13.333
 SLIDE_H: Final[float] = 7.5
 
+# --- the design system -------------------------------------------------
+#
+# **One scale, one grid, one palette, and every page built from them.** The first
+# version positioned each textbox by hand and chose a font size per call, which is
+# why nothing lined up between pages: there was no shared answer to "where does a
+# table start" or "how big is a label". These constants are that answer.
+#
+# Written without the pptx skill, which is not present in this environment, so the
+# rendering constraints here are the ones python-pptx imposes that I know of rather
+# than the ones a skill would have listed: no reliable text autofit (boxes are sized
+# generously and the text is kept short), shapes arrive with a default fill and
+# outline that must both be cleared, and numeric alignment comes from paragraph
+# alignment rather than from trusting a font's tabular figures.
+
+#: Page margin. Everything lives inside it, including the footnote band.
+MARGIN: Final[float] = 0.65
+#: Twelve columns and a gutter, so a table's column edges are a choice rather than
+#: an arithmetic accident. `col()` and `span()` are the only way to get an x.
+COLUMNS: Final[int] = 12
+GUTTER: Final[float] = 0.12
+
+#: Type scale. Named sizes, because "size=13" at one call site and "size=12" at the
+#: next is how a deck ends up with four heading sizes nobody chose.
+DISPLAY: Final[int] = 40
+COVER_NAME: Final[int] = 30
+H1: Final[int] = 22
+#: A callout. The one step between a heading and body text, for the sentence on a
+#: page that has to be read before the table under it.
+LEAD: Final[int] = 14
+H2: Final[int] = 12
+BODY: Final[int] = 10
+SMALL: Final[int] = 9
+MICRO: Final[int] = 8
+
+#: Two faces. A serif for the display figure and the page titles, a humanist sans
+#: for everything that has to be read in a row. Both ship with Office on Windows and
+#: macOS, which is the whole test -- a deck is the artifact that leaves the room, and
+#: a missing font is resolved by the reader's machine, not ours.
+FONT_DISPLAY: Final[str] = "Georgia"
+FONT_BODY: Final[str] = "Calibri"
+
 #: Ink. Muted rather than branded: this is a working document and a deck that
-#: looks like a pitch invites being read like one.
-INK: Final[str] = "1A1A1A"
-MUTED: Final[str] = "6B6B6B"
+#: looks like a pitch invites being read like one. The accent is a single restrained
+#: navy used for rules and the cover band, never for data.
+INK: Final[str] = "14161A"
+INK_2: Final[str] = "3F4450"
+MUTED: Final[str] = "767B86"
+RULE: Final[str] = "DDE0E4"
+PANEL: Final[str] = "F5F6F7"
+ACCENT: Final[str] = "1F3A5F"
 WARN: Final[str] = "B45309"
 GOOD: Final[str] = "15803D"
+
+#: Candle direction, **the same two hues the dashboard uses**. Shared by value so a
+#: deck and the panel cannot show the same month in different colours.
+CANDLE_UP: Final[str] = "1D7A4C"
+CANDLE_DOWN: Final[str] = "B1402F"
+
+#: Where the footnote band starts. Every page's content has to end above this.
+BAND_TOP: Final[float] = 6.35
+#: First baseline below the page title, for page bodies.
+CONTENT_TOP: Final[float] = 1.72
+
+
+def content_width() -> float:
+    return SLIDE_W - 2 * MARGIN
+
+
+def col(n: int) -> float:
+    """Left edge of column ``n`` (0-based), in inches."""
+    unit = (content_width() - GUTTER * (COLUMNS - 1)) / COLUMNS
+    return MARGIN + n * (unit + GUTTER)
+
+
+def span(n: int) -> float:
+    """Width of ``n`` columns including the gutters between them."""
+    unit = (content_width() - GUTTER * (COLUMNS - 1)) / COLUMNS
+    return n * unit + GUTTER * (n - 1)
 
 #: Every substitution, in the words a reader needs on the page rather than the
 #: identifier a column needs. Shared with the dashboard panel's legend by
@@ -112,10 +184,16 @@ class Subject:
     valuation: dict[str, Any] = field(default_factory=dict)
     insiders: list[dict[str, Any]] = field(default_factory=list)
     deals: list[dict[str, Any]] = field(default_factory=list)
-    #: ``[(date, adjusted close)]`` -- already adjusted by the caller, because
-    #: percent moves must always use adjusted prices and a renderer is the wrong
-    #: place to be deciding that.
-    prices: list[tuple[date, float]] = field(default_factory=list)
+    #: ``[(date, open, high, low, close, volume)]`` -- OHLCV, because the chart
+    #: draws candles and a close alone discards three quarters of every bar.
+    #:
+    #: **Raw, not back-adjusted**, which matches what the dashboard draws and is
+    #: therefore the only basis on which the two can agree. It also means a split
+    #: reads as a step on both, and the page says so. Cumulative back-adjustment is
+    #: owed work; a renderer is the wrong place to invent it, and inferring a ratio
+    #: from a price jump is the fabrication `corporate_actions` refuses outright.
+    prices: list[tuple[date, float, float, float, float, int]] = field(
+        default_factory=list)
     unexplained_moves: int = 0
 
     @property
@@ -186,6 +264,8 @@ def _pptx():
     try:
         from pptx import Presentation
         from pptx.dml.color import RGBColor
+        from pptx.enum.shapes import MSO_SHAPE
+        from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
         from pptx.util import Emu, Inches, Pt
     except ImportError as exc:   # pragma: no cover - exercised by the skip
         raise DeckError(
@@ -193,17 +273,20 @@ def _pptx():
             "group, which is deliberately not installed by default: "
             "`uv sync --group decks`."
         ) from exc
-    return Presentation, RGBColor, Inches, Pt, Emu
+    return (Presentation, RGBColor, Inches, Pt, Emu, MSO_SHAPE, PP_ALIGN,
+            MSO_ANCHOR)
 
 
 def build(subject: Subject, dest: Path) -> Path:
     """Render one deck. Ten pages, every one carrying its provenance."""
-    Presentation, RGBColor, Inches, Pt, _Emu = _pptx()
+    (Presentation, RGBColor, Inches, Pt, _Emu, MSO_SHAPE, PP_ALIGN,
+     MSO_ANCHOR) = _pptx()
     prs = Presentation()
     prs.slide_width = Inches(SLIDE_W)
     prs.slide_height = Inches(SLIDE_H)
     ctx = _Ctx(prs=prs, RGBColor=RGBColor, Inches=Inches, Pt=Pt,
-               subject=subject)
+               subject=subject, shape=MSO_SHAPE, align=PP_ALIGN,
+               anchor=MSO_ANCHOR)
 
     for name, _what in PAGES:
         renderer = globals().get(f"_page_{name}")
@@ -226,114 +309,422 @@ class _Ctx:
     Inches: Any
     Pt: Any
     subject: Subject
+    shape: Any = None
+    align: Any = None
+    anchor: Any = None
     pages: int = 0
 
 
-def add_page(ctx: _Ctx, title: str, subtitle: str = "") -> Any:
-    """A blank slide with a title and **the provenance footer already on it**.
+def add_page(ctx: _Ctx, title: str, subtitle: str = "", *,
+             chrome: bool = True) -> Any:
+    """A page with its title, its rule, and **the footnote band already on it**.
 
-    The only way to make a slide in this module, which is the point: a page
-    cannot be rendered without its caveats because there is no code path that
-    produces one. A renderer that called `add_slide` directly could forget, and a
-    forgotten footer is exactly how a deck becomes more confident than its inputs.
+    The only way to make a slide in this module, which is the point: a page cannot
+    be rendered without its caveats because there is no code path that produces one.
+    A renderer that called `add_slide` directly could forget, and a forgotten band is
+    exactly how a deck becomes more confident than its inputs.
     """
     ctx.pages += 1
     slide = ctx.prs.slides.add_slide(ctx.prs.slide_layouts[6])   # blank
-    _text(ctx, slide, title, 0.6, 0.4, SLIDE_W - 1.2, 0.6, size=26, bold=True)
+    if not chrome:
+        # The cover lays out its own two halves, so it takes the slide without the
+        # title bar -- but it still comes through here, because this is the only
+        # place `add_slide` is called and therefore the only place the band cannot
+        # be skipped. A cover that made its own slide would be a page that could
+        # forget its provenance, which is the whole reason this gate exists.
+        footnote_band(ctx, slide)
+        return slide
+    _text(ctx, slide, title, MARGIN, 0.45, span(9), 0.52,
+          size=H1, font=FONT_DISPLAY, colour=INK)
     if subtitle:
-        _text(ctx, slide, subtitle, 0.6, 1.0, SLIDE_W - 1.2, 0.4, size=12,
-              colour=MUTED)
-    provenance_footer(ctx, slide)
+        _text(ctx, slide, subtitle, MARGIN, 1.02, span(9), 0.46,
+              size=H2, colour=MUTED)
+    # The rule under the title is the grid made visible: every page's content
+    # starts at the same line, which is what makes ten pages read as one document.
+    _rule(ctx, slide, CONTENT_TOP - 0.16, colour=RULE)
+    _page_number(ctx, slide)
+    footnote_band(ctx, slide)
     return slide
 
 
-def provenance_footer(ctx: _Ctx, slide: Any) -> None:
-    """Every caveat that applies to this subject, at the foot of this page.
+def _page_number(ctx: _Ctx, slide: Any) -> None:
+    _text(ctx, slide, f"{ctx.pages:02d}", SLIDE_W - MARGIN - 0.6, 0.5, 0.6, 0.3,
+          size=SMALL, colour=MUTED, align="right")
 
-    Not an appendix and not a cover disclaimer. A reader looking at the valuation
-    page has to see, on that page, that the beta came from peers -- because the
-    page they screenshot is the page they send on.
+
+def _rect(ctx: _Ctx, slide: Any, left: float, top: float, width: float,
+          height: float, *, fill: str, line: str | None = None) -> Any:
+    """A filled rectangle with its default outline removed.
+
+    The removal is not optional: a shape arrives from python-pptx with both a theme
+    fill and a theme outline, so a "hairline rule" drawn without clearing the line
+    comes out as a 1pt box in the template's accent colour.
+    """
+    box = slide.shapes.add_shape(
+        ctx.shape.RECTANGLE, ctx.Inches(left), ctx.Inches(top),
+        ctx.Inches(max(width, 0.004)), ctx.Inches(max(height, 0.004)))
+    box.fill.solid()
+    box.fill.fore_color.rgb = ctx.RGBColor.from_string(fill)
+    if line is None:
+        box.line.fill.background()
+    else:
+        box.line.color.rgb = ctx.RGBColor.from_string(line)
+        box.line.width = ctx.Pt(0.5)
+    box.shadow.inherit = False
+    if box.has_text_frame:
+        box.text_frame.text = ""
+    return box
+
+
+def _rule(ctx: _Ctx, slide: Any, top: float, *, colour: str = RULE,
+          left: float | None = None, width: float | None = None,
+          weight: float = 0.01) -> None:
+    """A hairline. A thin rectangle rather than a connector: a connector's width is
+    a line weight in points and does not scale with the slide, so a 0.5pt rule looks
+    different on a 13.3in slide than the 0.01in one asked for here."""
+    _rect(ctx, slide, MARGIN if left is None else left, top,
+          content_width() if width is None else width, weight, fill=colour)
+
+
+def footnote_band(ctx: _Ctx, slide: Any) -> None:
+    """Every caveat that applies to this subject, in a designed band at the foot.
+
+    **Not an appendix and not a cover disclaimer.** A reader looking at the valuation
+    page has to see, on that page, that the beta came from peers -- because the page
+    they screenshot is the page they send on.
+
+    A band rather than a loose textbox, and that is the change this rebuild was
+    allowed to make: the caveats used to sit in whatever space was left above the
+    bottom edge, which read as bolted on and invited being cropped. Now they have a
+    panel, a top rule and a standing label, so the page is *designed around* them --
+    and a page with nothing to declare still carries the band, saying so. The band's
+    presence is therefore not evidence of a problem, which is what stops a reader
+    learning to skip it.
     """
     lines = ctx.subject.provenance
+    _rect(ctx, slide, 0, BAND_TOP, SLIDE_W, SLIDE_H - BAND_TOP, fill=PANEL)
+    _rule(ctx, slide, BAND_TOP, colour=RULE, left=0, width=SLIDE_W, weight=0.012)
     if not lines:
-        _text(ctx, slide, "inputs: clean apart from two constants with no free "
-                          "source (equity risk premium, near-term growth)",
-              0.6, SLIDE_H - 0.75, SLIDE_W - 1.2, 0.5, size=9, colour=GOOD)
+        _text(ctx, slide, "INPUTS", MARGIN, BAND_TOP + 0.14, span(2), 0.22,
+              size=MICRO, bold=True, colour=GOOD, spacing=True)
+        _text(ctx, slide,
+              "Clean apart from the two constants on every valuation here: the "
+              "equity risk premium (no free source) and the 3% near-term growth "
+              "rate (an assumption, not a forecast).",
+              col(2), BAND_TOP + 0.12, span(10), 0.6, size=MICRO, colour=INK_2)
         return
-    body = "inputs carry: " + "; ".join(lines)
-    _text(ctx, slide, body, 0.6, SLIDE_H - 0.95, SLIDE_W - 1.2, 0.7, size=9,
-          colour=WARN)
+    _text(ctx, slide, f"INPUTS CARRY ({len(lines)})", MARGIN, BAND_TOP + 0.14,
+          span(2), 0.22, size=MICRO, bold=True, colour=WARN, spacing=True)
+    # Numbered, two columns, so eight caveats stay readable rather than becoming a
+    # paragraph nobody finishes.
+    half = (len(lines) + 1) // 2
+    for which, chunk in enumerate((lines[:half], lines[half:])):
+        if not chunk:
+            continue
+        body = "\n".join(f"{i + 1 + which * half}.  {t}"
+                         for i, t in enumerate(chunk))
+        _text(ctx, slide, body, col(2 + which * 5), BAND_TOP + 0.12,
+              span(5), SLIDE_H - BAND_TOP - 0.18, size=MICRO, colour=INK_2)
 
 
 def _text(ctx: _Ctx, slide: Any, text: str, left: float, top: float,
-          width: float, height: float, *, size: int = 12, bold: bool = False,
-          colour: str = INK) -> Any:
+          width: float, height: float, *, size: int = BODY, bold: bool = False,
+          colour: str = INK, font: str = FONT_BODY, align: str = "left",
+          spacing: bool = False) -> Any:
+    """One textbox, fully specified.
+
+    Margins are zeroed because the grid already decides where text starts; pptx's
+    default 0.1in inset would put every cell a tenth of an inch off its column.
+    """
     box = slide.shapes.add_textbox(ctx.Inches(left), ctx.Inches(top),
                                    ctx.Inches(width), ctx.Inches(height))
     frame = box.text_frame
     frame.word_wrap = True
-    para = frame.paragraphs[0]
-    run = para.add_run()
-    run.text = text
-    run.font.size = ctx.Pt(size)
-    run.font.bold = bold
-    run.font.color.rgb = ctx.RGBColor.from_string(colour)
+    frame.margin_left = frame.margin_right = 0
+    frame.margin_top = frame.margin_bottom = 0
+    lines = str(text).split("\n")
+    for i, line in enumerate(lines):
+        para = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
+        if align == "right":
+            para.alignment = ctx.align.RIGHT
+        elif align == "center":
+            para.alignment = ctx.align.CENTER
+        para.line_spacing = 1.18
+        run = para.add_run()
+        run.text = line
+        run.font.size = ctx.Pt(size)
+        run.font.bold = bold
+        run.font.name = font
+        run.font.color.rgb = ctx.RGBColor.from_string(colour)
+        if spacing:
+            # Letter-spaced small caps for a standing label. `spc` is in hundredths
+            # of a point and there is no python-pptx property for it.
+            run.font._rPr.set("spc", "80")
     return box
 
 
+#: Which columns in a `_rows` table hold numbers. Right-aligned, because a column of
+#: figures that is not aligned on its last digit cannot be scanned -- and alignment
+#: by paragraph is reliable where trusting a font's tabular figures is not.
 def _rows(ctx: _Ctx, slide: Any, rows: list[tuple[str, ...]], *,
-          top: float = 1.6, size: int = 11,
-          widths: tuple[float, ...] = ()) -> None:
-    """A plain aligned table. No pptx table object: a textbox grid is smaller,
-    renders identically everywhere, and cannot inherit a theme."""
+          top: float = CONTENT_TOP, size: int = BODY,
+          widths: tuple[float, ...] = (), numeric: tuple[int, ...] = (1,),
+          pitch: float = 0.3, left: float = MARGIN,
+          width: float | None = None) -> float:
+    """A table on the grid: a header in small caps, a rule under it, zebra-free rows.
+
+    No pptx table object, which was the right call and stays: a textbox grid is
+    smaller, renders identically everywhere, and cannot inherit a theme. What it
+    lacked was alignment and a header that reads as one.
+
+    Returns the y the table ended at, so a caller can place the next element relative
+    to it rather than guessing a constant -- which is how the old pages ended up with
+    text overlapping a table whenever a row count changed.
+    """
     if not rows:
-        return
+        return top
+    avail = content_width() if width is None else width
     cols = max(len(r) for r in rows)
-    widths = widths or tuple([(SLIDE_W - 1.2) / cols] * cols)
-    for i, row in enumerate(rows):
-        left = 0.6
+    widths = widths or tuple([avail / cols] * cols)
+    # **Normalised here, not at every call site.** The column tuples were written by
+    # hand against the old margin and sum to 12.1in against a content width of
+    # 12.03in, so every table overhung the grid by a different amount. Scaling them
+    # to the content width keeps each column's *proportion* -- which is the part that
+    # was a design decision -- while making all ten pages end on the same line.
+    total = sum(widths)
+    if total > 0:
+        widths = tuple(w * avail / total for w in widths)
+    head, body = rows[0], rows[1:]
+
+    x = left
+    for j in range(cols):
+        cell = head[j] if j < len(head) else ""
+        _text(ctx, slide, str(cell).upper(), x, top, widths[j], 0.24,
+              size=MICRO, bold=True, colour=MUTED, spacing=True,
+              align="right" if j in numeric else "left")
+        x += widths[j]
+    _rule(ctx, slide, top + 0.26, colour=RULE, left=left, width=sum(widths))
+
+    y = top + 0.38
+    for row in body:
+        x = left
         for j in range(cols):
             cell = row[j] if j < len(row) else ""
-            _text(ctx, slide, str(cell), left, top + i * 0.32, widths[j], 0.3,
-                  size=size, bold=(i == 0),
-                  colour=MUTED if i == 0 else INK)
-            left += widths[j]
+            _text(ctx, slide, str(cell), x, y, widths[j], pitch - 0.02,
+                  size=size, colour=INK if j == 0 else INK_2,
+                  bold=(j == 0),
+                  align="right" if j in numeric else "left",
+                  font=FONT_BODY)
+            x += widths[j]
+        y += pitch
+    return y
 
 
 def _money(value: Any) -> str:
+    """One unit, two decimals, and a dash for absent.
+
+    `--` rather than `0` or an empty cell: a zero is a measurement and an empty cell
+    is ambiguous between "not read" and "nothing there", which is the distinction
+    every status column in this system exists to keep.
+    """
     if value in (None, ""):
         return "--"
     try:
         n = float(value)
     except (TypeError, ValueError):
         return str(value)
-    for cut, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+    for cut, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
         if abs(n) >= cut:
             return f"${n / cut:,.2f}{suffix}"
     return f"${n:,.0f}"
+
+
+def _pct(value: Any, places: int = 1) -> str:
+    if value in (None, ""):
+        return "--"
+    try:
+        return f"{float(value) * 100:.{places}f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _num(value: Any, places: int = 2) -> str:
+    if value in (None, ""):
+        return "--"
+    try:
+        return f"{float(value):,.{places}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def candles(ctx: _Ctx, slide: Any, bars: list[tuple[Any, ...]], *,
+            left: float, top: float, width: float, height: float,
+            vol_share: float = 0.26) -> None:
+    """Monthly candles and a volume strip, drawn as shapes.
+
+    **The same marks the dashboard draws, from the same aggregation.** `bars` comes
+    from `dashboard.tickers.aggregate`, so a month on a slide and a month on the
+    panel are the same bar by construction rather than by two renderers agreeing.
+    Body from open to close, wick from low to high, coloured by direction, volume
+    beneath sharing the x-axis.
+
+    Monthly rather than daily, and that is a rendering constraint rather than a
+    preference: a candle is three shapes, so eleven years of sessions would be ~8,000
+    shapes on one slide. Monthly is ~130. The resolution is stated on the page for
+    the same reason the dashboard states it -- a monthly candle read as a daily one
+    is a wrong answer about what a day did.
+
+    The x-axis is **bar ordinal here, not time**, which is the one place this departs
+    from the dashboard: a slide has no hover to explain an empty stretch, and at
+    monthly resolution a gap is visible as a flat run rather than being hidden. The
+    gap count travels in the footnote band instead.
+    """
+    if not bars:
+        _text(ctx, slide, "No price history. A delisted company has none -- which "
+                          "is what an acquisition looks like from inside a "
+                          "survivor-only universe.",
+              left, top, width, 0.5, size=BODY, colour=WARN)
+        return
+    price_h = height * (1 - vol_share) - 0.08
+    vol_top = top + price_h + 0.08
+    vol_h = height * vol_share
+
+    lo = min(b[3] for b in bars)
+    hi = max(b[2] for b in bars)
+    if hi <= lo:
+        hi, lo = lo * 1.02 or 1.0, lo * 0.98
+    vmax = max((b[5] for b in bars), default=0) or 1
+    pad = (hi - lo) * 0.06
+    lo, hi = lo - pad, hi + pad
+
+    def y(v: float) -> float:
+        return top + (hi - v) / (hi - lo) * price_h
+
+    slot = width / len(bars)
+    body_w = max(0.012, slot * 0.62)
+
+    # Gridlines behind, four of them, labelled at the left.
+    for i in range(5):
+        val = lo + (hi - lo) * i / 4
+        gy = y(val)
+        _rule(ctx, slide, gy, colour=RULE, left=left, width=width, weight=0.006)
+        _text(ctx, slide, _num(val, 2 if val >= 1 else 4),
+              left - 0.78, gy - 0.08, 0.72, 0.18, size=MICRO, colour=MUTED,
+              align="right")
+
+    for i, bar in enumerate(bars):
+        cx = left + slot * (i + 0.5)
+        up = bar[4] >= bar[1]
+        hue = CANDLE_UP if up else CANDLE_DOWN
+        _rect(ctx, slide, cx - 0.006, y(bar[2]), 0.012,
+              max(0.006, y(bar[3]) - y(bar[2])), fill=hue)
+        y_o, y_c = y(bar[1]), y(bar[4])
+        _rect(ctx, slide, cx - body_w / 2, min(y_o, y_c), body_w,
+              max(0.014, abs(y_c - y_o)), fill=hue)
+        vh = (bar[5] / vmax) * vol_h
+        _rect(ctx, slide, cx - body_w / 2, vol_top + vol_h - vh, body_w,
+              max(0.006, vh), fill=hue)
+
+    _rule(ctx, slide, vol_top + vol_h, colour=MUTED, left=left, width=width,
+          weight=0.008)
+    _text(ctx, slide, f"volume, peak {_compact(vmax)}", left, vol_top + vol_h + 0.05,
+          span(4), 0.2, size=MICRO, colour=MUTED)
+
+
+def _compact(n: float) -> str:
+    for cut, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(n) >= cut:
+            return f"{n / cut:,.1f}{suffix}"
+    return f"{n:,.0f}"
 
 
 # --- the ten pages ------------------------------------------------------
 
 
 def _page_cover(ctx: _Ctx) -> None:
+    """The figure on the left, **the data-quality panel on the right.**
+
+    Two halves of equal weight, which is the layout decision that carries the
+    constraint: a cover that is all number invites the number being taken at face
+    value, and a cover that is all caveat does not get read. Side by side, the panel
+    reads as part of the answer rather than as a retraction of it.
+    """
     s = ctx.subject
-    slide = add_page(ctx, s.company, f"CIK {s.cik}"
-                     + (f"  ·  {s.ticker}" if s.ticker else "")
-                     + (f"  ·  SIC {s.sic}" if s.sic else ""))
+    slide = add_page(ctx, "", chrome=False)
+
+    # A narrow accent rule at the very top, the only decoration in the deck.
+    _rect(ctx, slide, 0, 0, SLIDE_W, 0.085, fill=ACCENT)
+
+    _text(ctx, slide, s.company, MARGIN, 0.75, span(7), 0.9,
+          size=COVER_NAME, font=FONT_DISPLAY, colour=INK)
+    meta = "  ·  ".join(x for x in (
+        f"CIK {s.cik}", s.ticker or None,
+        f"SIC {s.sic}" if s.sic else None) if x)
+    _text(ctx, slide, meta, MARGIN, 1.62, span(7), 0.3, size=H2, colour=MUTED)
+    _rule(ctx, slide, 2.05, colour=RULE, left=MARGIN, width=span(7))
+
     ev = s.valuation.get("enterprise_value")
+    _text(ctx, slide, "ENTERPRISE VALUE", MARGIN, 2.3, span(7), 0.22,
+          size=MICRO, bold=True, colour=MUTED, spacing=True)
     _text(ctx, slide, _money(ev) if ev else "no valuation",
-          0.6, 2.4, 6.0, 1.2, size=44, bold=True)
-    _text(ctx, slide, "enterprise value, discounted free cash flow",
-          0.6, 3.6, 6.0, 0.4, size=11, colour=MUTED)
-    # The cover carries the single worst caveat, in words, next to the number.
-    # A cover that shows only the number is the page that gets screenshotted.
-    _text(ctx, slide, f"weakest input: {s.weakest}", 0.6, 4.2, SLIDE_W - 1.2,
-          0.5, size=13, colour=WARN if s.substitutions else GOOD)
-    _text(ctx, slide,
-          "Not a market valuation. This is an enterprise value from reported "
-          "cash flows; no market capitalisation appears anywhere in this deck.",
-          0.6, 5.0, SLIDE_W - 1.2, 0.6, size=10, colour=MUTED)
+          MARGIN, 2.58, span(7), 1.0, size=DISPLAY, bold=True,
+          font=FONT_DISPLAY, colour=INK)
+    _text(ctx, slide, "discounted free cash flow, perpetuity terminal value",
+          MARGIN, 3.62, span(7), 0.3, size=SMALL, colour=MUTED)
+
+    wacc, term = s.valuation.get("wacc"), s.valuation.get("terminal_share")
+    _rows(ctx, slide, [
+        ("input", "value"),
+        ("WACC", _pct(wacc)),
+        ("terminal share of value", _pct(term, 0)),
+        ("beta", _num(s.valuation.get("beta"))),
+        ("near-term growth", _pct(s.valuation.get("growth"), 0)),
+    ], top=4.05, widths=(span(4), span(2)), numeric=(1,), pitch=0.27,
+        width=span(6))
+
+    # --- the data-quality panel -----------------------------------------
+    px, pw = col(7), span(5)
+    _rect(ctx, slide, px, 0.75, pw, BAND_TOP - 1.1, fill=PANEL)
+    clean = s.clean_but_constants_like
+    _text(ctx, slide, "DATA QUALITY", px + 0.22, 0.98, pw - 0.44, 0.22,
+          size=MICRO, bold=True, colour=GOOD if clean else WARN, spacing=True)
+    _text(ctx, slide, s.weakest, px + 0.22, 1.26, pw - 0.44, 0.62,
+          size=LEAD, font=FONT_DISPLAY, colour=INK)
+    _rule(ctx, slide, 1.98, colour=RULE, left=px + 0.22, width=pw - 0.44)
+
+    _text(ctx, slide, f"{len(s.substitutions)} SUBSTITUTED INPUT"
+                      f"{'' if len(s.substitutions) == 1 else 'S'}",
+          px + 0.22, 2.14, pw - 0.44, 0.22, size=MICRO, bold=True,
+          colour=MUTED, spacing=True)
+    y = 2.44
+    for name in s.substitutions:
+        unavoidable = name in ("erp_constant", "growth_constant")
+        _rect(ctx, slide, px + 0.22, y + 0.04, 0.055, 0.12,
+              fill=MUTED if unavoidable else WARN)
+        _text(ctx, slide, SUBSTITUTION_WORDS.get(name, name),
+              px + 0.38, y, pw - MARGIN, 0.34, size=SMALL,
+              colour=INK_2 if unavoidable else INK)
+        y += 0.38
+    if not s.substitutions:
+        _text(ctx, slide, "None. Unusual -- every valuation here carries at least "
+                          "the two constants.", px + 0.22, y, pw - 0.44, 0.4,
+              size=SMALL, colour=MUTED)
+        y += 0.4
+
+    # **One block, two paragraphs, placed after the list.** These were two boxes at
+    # fixed tops, which collided the moment a filer had six substitutions instead of
+    # two -- the overlap audit caught it on TRACON. A single box cannot overlap
+    # itself, and following `y` means the list's length decides where it sits rather
+    # than a constant that happened to suit the fixture.
+    legend = (
+        "Grey marks a constant with no free source, on every valuation here. Amber "
+        "marks something substituted for this filer specifically.\n"
+        "Not a market valuation. No market capitalisation appears anywhere in this "
+        "deck: yfinance fundamentals are current values with no as-of date, which is "
+        "wrong for anything historical."
+    )
+    _text(ctx, slide, legend, px + 0.22, min(max(y + 0.14, 4.5), 4.95),
+          pw - 0.44, 1.05, size=MICRO, colour=MUTED)
 
 
 def _page_identity(ctx: _Ctx) -> None:
@@ -404,7 +795,7 @@ def _page_cash_flow(ctx: _Ctx) -> None:
               "Absent capex is not zero capex. 22.7% of operating filers "
               "present no capex line, and `unmapped` is 0% -- the line is "
               "genuinely not there. This free cash flow is an upper bound.",
-              0.6, 3.4, SLIDE_W - 1.2, 0.8, size=12, colour=WARN)
+              MARGIN, 3.4, content_width(), 0.8, size=H2, colour=WARN)
 
 
 def _page_peers(ctx: _Ctx) -> None:
@@ -434,7 +825,7 @@ def _page_peers(ctx: _Ctx) -> None:
           "within-set turnover spread is 0.43 at 4-digit and 0.49 at 2-digit on "
           "the filers that clear eight peers at every depth. What tightens a set "
           "is the size band, not the industry code.",
-          0.6, 3.6, SLIDE_W - 1.2, 0.8, size=11, colour=MUTED)
+          MARGIN, 3.6, content_width(), 0.8, size=SMALL, colour=MUTED)
 
 
 def _page_valuation(ctx: _Ctx) -> None:
@@ -460,7 +851,7 @@ def _page_valuation(ctx: _Ctx) -> None:
     for name in s.substitutions:
         rows.append((name, SUBSTITUTION_WORDS.get(name, name)))
     if len(rows) > 1:
-        _rows(ctx, slide, rows, top=3.7, size=10, widths=(3.4, 8.5))
+        _rows(ctx, slide, rows, top=3.7, size=BODY, widths=(3.4, 8.5))
 
 
 def _page_sensitivity(ctx: _Ctx) -> None:
@@ -480,8 +871,8 @@ def _page_sensitivity(ctx: _Ctx) -> None:
     ev = v.get("enterprise_value")
     flex = v.get("flex") or {}
     if ev is None:
-        _text(ctx, slide, "No valuation, so nothing to flex.", 0.6, 2.0,
-              8.0, 0.5, size=14, colour=MUTED)
+        _text(ctx, slide, "No valuation, so nothing to flex.", MARGIN, 2.0,
+              8.0, 0.5, size=LEAD, colour=MUTED)
         return
     if not flex:
         # Said rather than drawn empty: a missing flex means the row was written
@@ -491,7 +882,7 @@ def _page_sensitivity(ctx: _Ctx) -> None:
               "This valuation carries no stored sensitivity. Re-run `mr dcf` -- "
               "the deck renders the flex rather than deriving it, so that this "
               "page and the dashboard cannot disagree.",
-              0.6, 2.0, SLIDE_W - 1.2, 0.8, size=13, colour=WARN)
+              MARGIN, 2.0, content_width(), 0.8, size=LEAD, colour=WARN)
         return
     base = float(ev)
     base_rate = v.get("growth")
@@ -508,7 +899,7 @@ def _page_sensitivity(ctx: _Ctx) -> None:
           "flat 3% out of sample -- past growth does not predict future growth, "
           "with a correlation of -0.035 to +0.079 across 30 quarters. So the "
           "constant stays and this page shows what it costs.",
-          0.6, 4.2, SLIDE_W - 1.2, 0.8, size=11, colour=MUTED)
+          MARGIN, 4.2, content_width(), 0.8, size=SMALL, colour=MUTED)
 
 
 def _page_insiders(ctx: _Ctx) -> None:
@@ -518,7 +909,7 @@ def _page_insiders(ctx: _Ctx) -> None:
                      "filing is not.")
     if not s.insiders:
         _text(ctx, slide, "No Form 4 clusters on record for this issuer.",
-              0.6, 2.0, 8.0, 0.5, size=14, colour=MUTED)
+              MARGIN, 2.0, 8.0, 0.5, size=LEAD, colour=MUTED)
         return
     rows: list[tuple[str, ...]] = [("role", "buyers", "value", "window",
                                    "note")]
@@ -539,7 +930,7 @@ def _page_deals(ctx: _Ctx) -> None:
                      "required, timestamped and unambiguous.")
     if not s.deals:
         _text(ctx, slide, "No deal filings on record for this CIK.",
-              0.6, 2.0, 8.0, 0.5, size=14, colour=MUTED)
+              MARGIN, 2.0, 8.0, 0.5, size=LEAD, colour=MUTED)
         return
     rows: list[tuple[str, ...]] = [("filed", "form", "type", "value", "role")]
     for row in s.deals[:10]:
@@ -554,32 +945,51 @@ def _page_deals(ctx: _Ctx) -> None:
 
 
 def _page_prices(ctx: _Ctx) -> None:
+    """Monthly candles, from the aggregation the dashboard uses.
+
+    Imported rather than reimplemented: the deck and the panel must not disagree
+    about what a month did, and the only way to guarantee that is one function. A
+    second implementation here would agree right up until one of them was changed.
+    """
     s = ctx.subject
     slide = add_page(ctx, "Price history",
-                     "Split-adjusted. Percent moves on unadjusted prices read a "
-                     "reverse split as a 95% fall.")
+                     "Monthly candles -- open of the first session, close of the "
+                     "last, max high, min low, summed volume")
     if not s.prices:
-        _text(ctx, slide,
-              "No price history. A delisted company has none -- which is what an "
-              "acquisition looks like from inside a survivor-only universe.",
-              0.6, 2.0, SLIDE_W - 1.2, 0.8, size=13, colour=WARN)
+        candles(ctx, slide, [], left=col(0) + 0.8, top=CONTENT_TOP,
+                width=span(12) - 0.8, height=3.2)
         return
-    lo = min(p for _d, p in s.prices)
-    hi = max(p for _d, p in s.prices)
+
+    from marketradar.dashboard.tickers import aggregate, _month
+
+    bars = aggregate(list(s.prices), _month)[-132:]
+    candles(ctx, slide, bars, left=col(0) + 0.82, top=CONTENT_TOP + 0.1,
+            width=span(12) - 0.82, height=3.05)
+
+    lo = min(b[3] for b in bars)
+    hi = max(b[2] for b in bars)
     first, last = s.prices[0], s.prices[-1]
-    _rows(ctx, slide, [
-        ("field", "value"),
-        ("window", f"{first[0]} to {last[0]}"),
-        ("sessions", str(len(s.prices))),
-        ("range", f"{lo:,.2f} to {hi:,.2f}"),
-        ("last", f"{last[1]:,.2f}"),
-        ("unexplained moves", str(s.unexplained_moves)),
-    ], widths=(3.0, 9.1))
+    y = _rows(ctx, slide, [
+        ("window", "sessions", "months drawn", "range", "last close"),
+        (f"{first[0]} to {last[0]}", f"{len(s.prices):,}", f"{len(bars):,}",
+         f"{_num(lo, 4)} - {_num(hi, 4)}", _num(last[4], 4)),
+    ], top=CONTENT_TOP + 3.45,
+        widths=(span(3), span(2), span(2), span(3), span(2)),
+        numeric=(1, 2, 3, 4))
+
+    # **Raw, not back-adjusted, and that is stated rather than implied.** The
+    # dashboard's candles are raw too, so the two agree -- but a reverse split
+    # therefore reads as a cliff on both, and inferring the ratio from the jump is
+    # exactly the fabrication the action table refuses. Cumulative back-adjustment
+    # is owed work, not a caveat to bury.
+    note = ("Raw prices, not back-adjusted -- the same basis the dashboard draws, "
+            "so a split reads as a step on both. ")
     if s.unexplained_moves:
-        _text(ctx, slide,
-              f"{s.unexplained_moves} large single-session moves have no "
-              "corporate action on record to explain them. Tiingo's per-bar "
-              "split factor is itself incomplete, worst on exactly the small "
-              "tickers where reverse splits are constant -- so the action table "
-              "is not assumed complete.",
-              0.6, 4.0, SLIDE_W - 1.2, 0.8, size=11, colour=WARN)
+        note += (f"{s.unexplained_moves} large single-session moves have no "
+                 "corporate action on record to explain them; Tiingo's per-bar "
+                 "split factor is itself incomplete, worst on exactly the small "
+                 "tickers where reverse splits are constant.")
+    else:
+        note += "No unexplained single-session moves on record for this ticker."
+    _text(ctx, slide, note, MARGIN, y + 0.12, content_width(), 0.5,
+          size=SMALL, colour=WARN if s.unexplained_moves else MUTED)

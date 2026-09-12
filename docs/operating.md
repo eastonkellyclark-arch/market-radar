@@ -68,7 +68,15 @@ uv run mr xbrl --quarter 2024q1      # normalize one quarter of fundamentals
 uv run mr form5500                   # DOL plan data, resolved by EIN
 uv run mr symbols                    # recover tickers for stopped filers
 uv run mr backfill --budget 200      # drain N queue items, low priority
+uv run mr decks --cik 0000066740     # one pitch deck, on demand
 ```
+
+**Decks are on demand and there is no `--all`.** 2,564 valuations is 2,564 files
+nobody opens, and a directory generated nightly is indistinguishable from one where
+the generator broke last Tuesday. `--archetype clean growth_mismatch heavy` picks a
+filer by evidence quality instead of making you hunt a CIK. The `deck` button beside
+a row in the DCF panel **copies the command** rather than running it — the dashboard
+is a static file with no server, so a button claiming to generate would be lying.
 
 **Rule for all of them: a long sweep resumes by default.** `--restart` is always
 explicit. If one dies at request 9,000, run it again — it picks up from the

@@ -848,6 +848,60 @@ def _nav_and_panels(
 #: in-page state -- a checked gate, a sort order -- resets when you leave it.
 #: That is the right trade at this size, and it is why the open panel is the
 #: only thing remembered.
+DECK_SCRIPT: Final[str] = r"""
+/* --- deck buttons -------------------------------------------------------
+   Delegated, like every other handler: these buttons live inside panel bodies
+   that are injected on demand, so a load-time binding finds nothing.
+
+   The clipboard write is guarded twice over. `navigator.clipboard` is undefined
+   on a file:// page in some browsers and rejects without a user gesture in
+   others, so there is a textarea fallback -- and if both fail the command is
+   shown in the button's place rather than the click reading as having worked. A
+   copy button that silently copies nothing is worse than no button. */
+(function () {
+  function flash(btn, text, ok) {
+    var was = btn.textContent;
+    btn.textContent = text;
+    btn.setAttribute('data-state', ok ? 'ok' : 'fail');
+    window.setTimeout(function () {
+      btn.textContent = was;
+      btn.removeAttribute('data-state');
+    }, ok ? 1400 : 6000);
+  }
+  function legacy(cmd) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = cmd;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var done = document.execCommand && document.execCommand('copy');
+      document.body.removeChild(ta);
+      return !!done;
+    } catch (e) { return false; }
+  }
+  document.addEventListener('click', function (ev) {
+    var btn = ev.target.closest ? ev.target.closest('[data-deck-cik]') : null;
+    if (!btn) { return; }
+    ev.stopPropagation();          /* not a row click; the row opens a drawer */
+    var cik = btn.getAttribute('data-deck-cik');
+    var cmd = 'uv run mr decks --cik ' + cik;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(cmd).then(function () {
+        flash(btn, 'copied', true);
+      }, function () {
+        flash(btn, legacy(cmd) ? 'copied' : cmd, legacy(cmd));
+      });
+      return;
+    }
+    flash(btn, legacy(cmd) ? 'copied' : cmd, legacy(cmd));
+  });
+})();
+"""
+
+
 PANEL_SCRIPT: Final[str] = r"""
 (function () {
   var main = document.getElementById('mr-main');
@@ -1095,6 +1149,7 @@ def render(
     # this is the one that calls them, and it is what moves the page from
     # fourteen stacked panels to one. Appending it before a registration
     # would run the binders against a list that did not have it yet.
+    parts.append(DECK_SCRIPT)
     parts.append(PANEL_SCRIPT)
     # One tag per part, not one tag holding all of them. A parse or reference
     # error anywhere in a single concatenated script kills everything after it
@@ -1309,6 +1364,13 @@ td.new {{ color:#0ca30c; font-size:9.5px; font-weight:700; width:26px; }}
 .bias {{ display:block; font-size:9px; font-weight:600; color:#fab219;
          letter-spacing:.03em; text-transform:none; }}
 .bias-note {{ border-left:2px solid #fab219; padding-left:9px; }}
+.deckbtn {{ font:inherit; font-size:10px; margin-left:7px; padding:0 5px;
+  cursor:pointer; color:var(--ink-2); background:var(--plane);
+  border:1px solid var(--rule); border-radius:3px; vertical-align:middle; }}
+.deckbtn:hover {{ color:var(--ink); border-color:var(--ink-2); }}
+.deckbtn[data-state="ok"] {{ color:#0ca30c; border-color:#0ca30c; }}
+.deckbtn[data-state="fail"] {{ color:#fab219; border-color:#fab219;
+  font-size:9.5px; }}
 /* The participant sparkline. A year the sponsor did not file is a *gap* --
    drawn as an empty slot rather than a zero-height bar, because the whole
    point of the series is that an absence is not a headcount of nothing. */
