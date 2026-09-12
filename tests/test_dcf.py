@@ -382,3 +382,81 @@ def test_a_financial_filer_never_enters_the_population(con) -> None:
              for r in rows_for("2", "A Bank", ocf=100_000_000, capex=1_000_000)]
     build(con, rows)
     assert [r.inputs.cik for r in dcf.screen(con).rows] == ["1"]
+
+
+# --- the growth decision: measured, and the constant won ----------------
+
+
+def test_a_fitted_growth_rate_is_rejected_and_the_reason_is_recorded() -> None:
+    """**The measurement said keep the constant, so the constant stayed.**
+
+    Out of sample over 30 quarters -- a rate fitted on the first half of each
+    filer's annual history, scored against the growth actually realised in the
+    second half, beside a flat 3% on the same filers and years:
+
+        revenue, CAGR endpoints    n=2,753  corr +0.010  fitted 0.138  const 0.089
+        revenue, log-linear        n=2,606  corr -0.035  fitted 0.129  const 0.084
+        free cash flow, CAGR       n=1,585  corr +0.079  fitted 0.365  const 0.227
+        free cash flow, log-linear n=1,236  corr -0.011  fitted 0.311  const 0.199
+
+    The constant wins all four and the past-to-future correlation is
+    indistinguishable from zero -- negative for both log-linear fits. A fitted rate
+    would be ~50% worse on held-out data *while looking filer-specific*, and the
+    substitution list would stop warning about it. That is strictly worse than an
+    honest constant, which is why this is a recorded rejection and not a TODO.
+    """
+    assert "loses to the flat" in dcf.GROWTH_FITTING_REJECTED
+    assert "-0.035" in dcf.GROWTH_FITTING_REJECTED
+    assert dcf.DEFAULT_GROWTH == 0.03
+
+
+def test_the_history_flags_the_constant_rather_than_replacing_it(con) -> None:
+    """What the history *can* support: not the rate, only that 3% is not it.
+
+    Scored on the 20 large caps: the flag catches **7 of the 8** names trading
+    above 3.3x the DCF, with one false alarm in the 12 already in range. It misses
+    Texas Instruments at 0.12x, whose own history is flat while the market prices a
+    recovery -- a backward-looking flag cannot see a forward-looking re-rating, and
+    that limit is the point of flagging rather than fitting.
+    """
+    build(con, rows_for("1", "Fast Grower Inc", ocf=100_000_000,
+                        capex=20_000_000))
+    row = dcf.screen(con, betas={"1": 1.0},
+                     historical_growth={"1": 0.40}).rows[0]
+    assert dcf.GROWTH_MISMATCH in row.substitutions
+    assert dcf.GROWTH_CONSTANT in row.substitutions, (
+        "the constant is still what was used; the flag does not replace it")
+    assert row.inputs.growth == dcf.DEFAULT_GROWTH
+    assert "compounded at +40.0%" in row.inputs.source["growth"]
+
+    # An ordinary company is not flagged.
+    row = dcf.screen(con, betas={"1": 1.0},
+                     historical_growth={"1": 0.05}).rows[0]
+    assert dcf.GROWTH_MISMATCH not in row.substitutions
+
+    # Shrinking counts too: the band is two-sided.
+    row = dcf.screen(con, betas={"1": 1.0},
+                     historical_growth={"1": -0.20}).rows[0]
+    assert dcf.GROWTH_MISMATCH in row.substitutions
+
+
+def test_the_mismatch_flag_is_not_one_of_the_unavoidable_constants(con) -> None:
+    """It is filer-specific *evidence*, which is the opposite of an assumption
+    everybody shares. Folding it into ``clean_but_constants`` would hide exactly
+    the rows where the constant is least likely to hold."""
+    build(con, rows_for("1", "Fast Inc", ocf=100_000_000, capex=20_000_000))
+    row = dcf.screen(con, betas={"1": 1.0},
+                     historical_growth={"1": 0.40}).rows[0]
+    assert not row.clean_but_constants
+    assert dcf.GROWTH_MISMATCH not in dcf.Valuation.UNAVOIDABLE
+
+
+def test_a_caller_supplied_growth_is_neither_constant_nor_mismatch(con) -> None:
+    """An explicit forecast is a real input, so it is charged for neither."""
+    build(con, rows_for("1", "Forecast Inc", ocf=100_000_000,
+                        capex=20_000_000))
+    row = dcf.screen(con, betas={"1": 1.0}, growths={"1": 0.11},
+                     historical_growth={"1": 0.40}).rows[0]
+    assert dcf.GROWTH_CONSTANT not in row.substitutions
+    assert dcf.GROWTH_MISMATCH not in row.substitutions
+    assert row.inputs.growth == 0.11

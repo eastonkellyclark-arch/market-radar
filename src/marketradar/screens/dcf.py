@@ -107,8 +107,52 @@ NO_BETA: Final[str] = "no_beta"
 #: off the list made 1,584 rows look cleaner than they are.
 GROWTH_CONSTANT: Final[str] = "growth_constant"
 
+#: The filer's own history says the growth constant is badly wrong for it.
+#:
+#: **Not a rate -- a warning.** Measured 2026-09-12, a filer-specific growth rate
+#: fitted from our own 30 quarters loses a held-out horse race against the flat
+#: 3%, on every variant tried (see :data:`GROWTH_FITTING_REJECTED`). Past growth
+#: does not predict future growth here, so this module does not pretend to know
+#: NVIDIA's rate.
+#:
+#: What the history *can* say is that 3% is not it. A company that compounded
+#: revenue at 40% for six years may or may not continue, but the constant is
+#: certainly the wrong centre for it, and a valuation resting on that constant
+#: should say so where it is least likely to hold.
+GROWTH_MISMATCH: Final[str] = "growth_mismatch"
+
 SUBSTITUTIONS: Final[tuple[str, ...]] = (
-    PEER_BETA, COMP_DEPTH, ABSENT_CAPEX, ERP_CONSTANT, GROWTH_CONSTANT, NO_BETA,
+    PEER_BETA, COMP_DEPTH, ABSENT_CAPEX, ERP_CONSTANT, GROWTH_CONSTANT,
+    GROWTH_MISMATCH, NO_BETA,
+)
+
+#: How far a filer's historical growth may sit from the constant before the row is
+#: flagged. Set at the p75 of the measured distribution: median full-history
+#: revenue growth is +6.0% and p75 is +17.0%, so this catches the upper quartile
+#: and the shrinking tail without firing on ordinary companies.
+GROWTH_MISMATCH_BAND: Final[float] = 0.10
+
+#: Why the fitted rate is not used, recorded so it is not re-derived.
+#:
+#: Measured 2026-09-12 over the 30 loaded quarters. A rate fitted on the first half
+#: of each filer's annual history, scored against the growth actually realised in
+#: the second half, beside a flat 3% on the same filers and years:
+#:
+#:     revenue, CAGR endpoints    n=2,753  corr +0.010  fitted 0.138  const 0.089
+#:     revenue, log-linear        n=2,606  corr -0.035  fitted 0.129  const 0.084
+#:     free cash flow, CAGR       n=1,585  corr +0.079  fitted 0.365  const 0.227
+#:     free cash flow, log-linear n=1,236  corr -0.011  fitted 0.311  const 0.199
+#:
+#: **The constant wins all four, and the correlation between a filer's past and
+#: future growth is indistinguishable from zero** -- it is negative for both
+#: log-linear fits. A fitted rate would be 50% worse on held-out data while
+#: looking filer-specific, and the substitution list would stop warning about it.
+#: That is strictly worse than an honest constant.
+GROWTH_FITTING_REJECTED: Final[str] = (
+    "A per-filer growth rate fitted from our own history loses to the flat "
+    "constant out of sample, on revenue and on free cash flow, by CAGR and by "
+    "log-linear fit. Correlation between first-half and second-half growth runs "
+    "-0.035 to +0.079. Rejected 2026-09-12; see docs/build-spec.md."
 )
 
 #: What each substitution does to the answer, in the direction it does it. Printed
@@ -130,6 +174,10 @@ SUBSTITUTION_WHY: Final[dict[str, str]] = {
                      "forecast. **Understates** any company growing faster than "
                      "it -- measured at 0.03x of market cap for Amazon against "
                      "0.96x for Johnson & Johnson",
+    GROWTH_MISMATCH: "this filer's own history is more than 10 points from the "
+                     "growth constant, so the constant is unlikely to be the "
+                     "right centre for it. A warning, not a rate: a fitted rate "
+                     "loses to the constant out of sample",
 }
 
 # --- WACC inputs --------------------------------------------------------
@@ -326,6 +374,9 @@ class Valuation:
     #: The substitutions that are on every row because no alternative exists, so
     #: "clean apart from the unavoidable" is a number that can be read.
     UNAVOIDABLE = (ERP_CONSTANT, GROWTH_CONSTANT)
+    #: Deliberately **not** in UNAVOIDABLE: GROWTH_MISMATCH is filer-specific
+    #: evidence that the constant is wrong here, which is the opposite of an
+    #: unavoidable assumption everyone shares.
 
     @property
     def clean_but_constants(self) -> bool:
@@ -513,6 +564,7 @@ def screen(
     betas: dict[str, float] | None = None,
     peer_betas: dict[str, tuple[float, int]] | None = None,
     growths: dict[str, float] | None = None,
+    historical_growth: dict[str, float] | None = None,
     risk_free: float | None = None,
     erp: float = ERP,
     growth: float = DEFAULT_GROWTH,
@@ -539,6 +591,8 @@ def screen(
     peer_betas = {cik_key(k): v for k, v in (peer_betas or {}).items()}
     growths = ({cik_key(k): v for k, v in growths.items()}
                if growths is not None else None)
+    historical_growth = {cik_key(k): v
+                         for k, v in (historical_growth or {}).items()}
     rf = risk_free if risk_free is not None else RISK_FREE_FALLBACK
     cap = min(terminal_growth, rf)
 
@@ -565,6 +619,14 @@ def screen(
             subs.append(GROWTH_CONSTANT)
             source["growth"] = (f"flat {growth:.1%} constant, not a forecast for "
                                 "this filer")
+            past = historical_growth.get(cik_key(cik))
+            if past is not None and abs(past - growth) > GROWTH_MISMATCH_BAND:
+                # The history cannot say what the rate *is* -- that was measured
+                # and rejected -- but it can say the constant is not it.
+                subs.append(GROWTH_MISMATCH)
+                source["growth"] += (
+                    f"; this filer's own history compounded at {past:+.1%}, "
+                    f"more than {GROWTH_MISMATCH_BAND:.0%} away")
         beta: float | None = None
         key = cik_key(cik)
         if key in betas:

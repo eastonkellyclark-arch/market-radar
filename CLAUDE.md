@@ -155,6 +155,29 @@ Names are for *display* and for *review*, never for joining. Where only a
 name exists, the answer is a review queue with a human-confirmable record --
 not a similarity threshold.
 
+**And the guaranteed identifier only helps if both sides agree on its
+representation.** A CIK is the right key and it has two spellings in this
+codebase: the XBRL partitions carry it unpadded (`7332`) and Postgres carries it
+zero-padded to ten (`0000007332`). Those strings do not compare, and the failure
+looks nothing like a type error.
+
+Measured 2026-09-12: the DCF was handed **5,499 real betas and matched none of
+6,431 filers.** Nothing raised. Every row simply read `no_beta` -- which is a
+perfectly plausible answer, because half the universe genuinely has no usable
+ticker. The same mismatch returned **zero** peer betas from a working peer-set
+query, and separately joined `shares` to `companies` for 0 of 3,443 filers.
+
+So the right identifier in the wrong representation fails *exactly* like a
+name-based join: silently, with a believable result, and every number downstream
+stays plausible. The rule above is necessary and not sufficient.
+
+The fix is a normaliser at every boundary, not a convention: `cik_key()` in
+`screens/dcf.py` and an `lpad` on both sides of every cross-source SQL join. A
+convention cannot be tested and this can -- a test pins that a padded key finds an
+unpadded CIK. Where a join crosses two stores, **assert a non-zero match count**
+rather than trusting the row count you got: an empty join is the one result that
+looks like a correct answer about the data.
+
 **Every screen ends with a funnel.** The exact parallel of the freshness
 assertion on every loader, one step later in the pipeline: `assert_fresh`
 refuses to let a job exit green on empty data, and the funnel refuses to let
