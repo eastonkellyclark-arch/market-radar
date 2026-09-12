@@ -15,6 +15,14 @@ mr = "marketradar.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
+# Decks only, and deliberately not in `dev`. python-pptx pulls lxml and pillow,
+# which is ~10 MB of wheels no data job needs -- the same reasoning as node and
+# jsdom being test-only, and the same rule as yfinance: local-only, and a test
+# asserts nothing reachable from .github/workflows imports it.
+#
+# Pure-Python with no native build, and the only way to write a .pptx. That is
+# the reason; "it would be convenient" is not one.
+decks = ["python-pptx>=1.0"]
 
 [build-system]
 requires = ["hatchling"]

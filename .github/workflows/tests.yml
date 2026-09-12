@@ -65,7 +65,13 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Sync dependencies
-        run: uv sync --frozen
+        # `--group decks` so tests/test_decks.py runs here instead of skipping.
+        # Same reasoning as setup-node for the DOM suite: a guard that silently
+        # skips on the runner is not a guard, and 15 of those tests are the only
+        # thing standing between a deck and a slide with no provenance on it.
+        # python-pptx is not a runtime dependency of any data job -- no workflow
+        # runs `mr decks`, and a test asserts that.
+        run: uv sync --frozen --group decks
 
       - name: Verify the DOM toolchain
         # Checked before pytest so a broken install says so in one line here,
