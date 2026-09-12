@@ -2582,6 +2582,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"mr comps: error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
+    if args.command == "symbols":
+        load_dotenv()
+        try:
+            return _cmd_symbols(args)
+        except Exception as exc:
+            from marketradar.freshness import StaleDataError
+
+            label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
+            print(f"mr symbols: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
     if args.command == "targets":
         load_dotenv()
         try:

@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+
 import pytest
 
-from marketradar.cli import EXIT_NOT_IMPLEMENTED, EXIT_OK, build_parser, main
+from marketradar import cli
+from marketradar.cli import (
+    EXIT_NOT_IMPLEMENTED,
+    EXIT_OK,
+    build_parser,
+    main,
+)
 
 EXPECTED_COMMANDS = {"prices", "screens", "digest", "backfill", "selftest", "manifest"}
 
@@ -139,3 +148,55 @@ def test_a_file_that_is_not_a_plan_year_is_skipped(tmp_path) -> None:
     (tmp_path / "form5500_sponsors_notes.parquet").write_bytes(b"")
     (tmp_path / "form5500_sponsors_2024.parquet").write_bytes(b"")
     assert list(cli._sponsor_parquets(str(tmp_path))) == [2024]
+
+
+def test_every_subcommand_is_dispatched() -> None:
+    """**A command the parser accepts and `main` does not route is a command that
+    cannot run.**
+
+    `mr symbols` shipped exactly that way: the parser was complete, `--help` was
+    correct, `set_defaults(func=...)` was set -- and `main` dispatches on
+    `args.command` rather than calling `args.func`, so the only thing running it
+    produced was `KeyError: 'symbols'`. The restart-flag test beside this one passed
+    the whole time, because parsing arguments says nothing about whether anything
+    acts on them.
+
+    Checks the parser's own subcommand list against the comparisons in `main`, so it
+    covers every future command rather than the one that happened to break. A command
+    deliberately not built yet belongs in `main`'s `pending` map, which is a
+    dispatch -- it prints what is missing and exits non-zero.
+    """
+    import ast
+
+    parser = build_parser()
+    declared: set[str] = set()
+    for action in parser._actions:                       # argparse exposes no public
+        if isinstance(action, argparse._SubParsersAction):  # accessor for this
+            declared |= set(action.choices)
+    assert declared, "no subcommands found; the parser shape changed"
+
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    main_fn = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "main")
+
+    routed: set[str] = set()
+    for node in ast.walk(main_fn):
+        # `args.command == "name"`, in either order.
+        if isinstance(node, ast.Compare) and len(node.comparators) == 1:
+            for side in (node.left, node.comparators[0]):
+                if isinstance(side, ast.Constant) and isinstance(side.value, str):
+                    routed.add(side.value)
+        # `args.command in {"a", "b"}` and the `pending` map, which is a dispatch:
+        # it reports what is not built and exits non-zero.
+        if isinstance(node, (ast.Set, ast.Tuple, ast.List, ast.Dict)):
+            items = node.keys if isinstance(node, ast.Dict) else node.elts
+            for item in items:
+                if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                    routed.add(item.value)
+
+    missing = sorted(declared - routed)
+    assert not missing, (
+        "these subcommands parse but `main` never routes them, so running one is a "
+        f"KeyError rather than a job: {missing}"
+    )
