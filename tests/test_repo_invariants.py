@@ -458,3 +458,133 @@ def test_every_postgres_write_is_counted_not_assumed() -> None:
         + "\n\nA writer that reports what it attempted is how corporate_actions "
         "held 365 splits while staging held 3,724."
     )
+
+
+#: A ``cik_sql`` interpolation, collapsed to this token before the SQL is scanned.
+#: Any other interpolation becomes ``?`` -- the scan cares only whether a CIK
+#: reference went through the helper.
+CIK_TOKEN: Final[str] = "CIKSQL"
+
+#: An ON clause: everything between ``on`` and the next clause keyword.
+_ON_CLAUSE: Final[re.Pattern[str]] = re.compile(
+    r"\bon\b(.*?)(?=\b(?:join|left|right|inner|outer|cross|where|group|order|"
+    r"having|limit|union|qualify|window)\b|$)", re.I | re.S)
+_USING_CIK: Final[re.Pattern[str]] = re.compile(r"\busing\s*\(\s*cik\s*\)", re.I)
+_BARE_CIK: Final[re.Pattern[str]] = re.compile(r"\bcik\b", re.I)
+#: Only strings that are actually queries. A docstring that happens to contain the
+#: words "on" and "cik" is prose, and flagging it would teach the next person to
+#: delete the explanation rather than fix the code.
+_IS_SQL: Final[re.Pattern[str]] = re.compile(r"\bselect\b.*\bfrom\b", re.I | re.S)
+
+
+def _cik_scan_targets(path: Path) -> list[tuple[int, str]]:
+    """Every SQL-looking string in a module, with cik_sql interpolations marked.
+
+    Docstrings are excluded by position, not by heuristic: the string that opens a
+    module, class or function body is documentation whatever it contains.
+    """
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                             ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None) or []
+            if body and isinstance(body[0], ast.Expr) and \
+                    isinstance(body[0].value, ast.Constant):
+                docstrings.add(id(body[0].value))
+
+    out: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if id(node) in docstrings:
+            continue
+        if isinstance(node, ast.Constant):
+            text = node.value if isinstance(node.value, str) else None
+        elif isinstance(node, ast.JoinedStr):
+            parts = []
+            for part in node.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    parts.append(part.value)
+                elif isinstance(part, ast.FormattedValue):
+                    expr = ast.unparse(part.value)
+                    parts.append(CIK_TOKEN if "cik_sql(" in expr else "?")
+            text = "".join(parts)
+        else:
+            continue
+        if not text or not _IS_SQL.search(text):
+            continue
+        # SQL comments out first. The same trap the `any_value` ban hit: a note
+        # explaining the rule must not be the thing that trips it, and this scan
+        # flagged the comment in `filers.py` that says why the join is not a USING.
+        stripped = re.sub(r"--[^\n]*", " ", text)
+        out.append((node.lineno, re.sub(r"\s+", " ", stripped)))
+    return out
+
+
+def test_no_join_compares_a_raw_cik_column() -> None:
+    """**Four silent failures, so the rule is enforced rather than documented.**
+
+    A CIK is the right key -- SEC assigns it and never reuses it -- and it has two
+    spellings here: the XBRL partitions carry it unpadded (`7332`) and Postgres
+    zero-padded to ten (`0000007332`). Those strings do not compare, and every time
+    they have failed to, the result was a believable number rather than an error:
+
+    - the DCF was handed **5,499 real betas and matched none of 6,431 filers**
+    - the same mismatch returned **zero** peer betas from a working query
+    - and joined `shares` to `companies` for **0 of 3,443** filers
+    - a measurement script printed **"0 of 3,744 stopped filers carry a recovered
+      ticker"** -- a finding, not an error, about a map that had just been built
+
+    So every CIK comparison in a query goes through `entities.cik.cik_sql`, on both
+    sides, with **no exceptions**. `lpad` is idempotent, so wrapping an
+    already-consistent pair costs a function call; "wrap it only where the sides
+    might differ" costs the judgement that has been wrong four times, and a
+    carve-out for locally-consistent tables is a carve-out that gets copied into the
+    next cross-store join.
+
+    Three shapes are rejected:
+
+    - an ON clause mentioning a `cik` column that did not go through the helper
+    - `USING (cik)`, which cannot wrap its columns and so is the one join shape
+      unable to state its own normalisation
+    - a column aliased `cik10` not produced by the helper, which would otherwise be
+      a way to launder a raw CIK into a name the first rule trusts
+
+    Mutated to confirm it fires: reverting `deal_multiples`'s join to
+    `a.cik = b.cik`, restoring `USING (cik)` in `filers`, and aliasing a raw column
+    as `cik10` each turn it red. It also found a fifth occurrence that no test had
+    seen -- `_deal_events` in `cli.py` read `ltrim(c.cik, '0') = d.cik`, normalised
+    on one side and in the opposite direction from everywhere else. That one was
+    correct *today* and only by coincidence: both forms return 14,700 rows, because
+    companies.cik is padded and deals.cik is not. It was a latent failure waiting
+    for a loader to start padding the other side.
+    """
+    offenders: list[str] = []
+    for path in sorted(SRC.rglob("*.py")):
+        if path.name == "cik.py":                  # the helper defines the form
+            continue
+        for lineno, sql in _cik_scan_targets(path):
+            where = f"{path.relative_to(SRC.parent.parent)}:{lineno}"
+            if _USING_CIK.search(sql):
+                offenders.append(
+                    f"{where}: USING (cik) cannot normalise its columns; "
+                    "use an explicit ON with cik_sql on both sides")
+            if " join " in f" {sql.lower()} ":
+                for clause in _ON_CLAUSE.findall(sql):
+                    if _BARE_CIK.search(clause):
+                        offenders.append(
+                            f"{where}: ON clause compares a raw cik: "
+                            f"{clause.strip()[:70]}")
+            for match in re.finditer(r"(\S+)\s+as\s+cik10", sql, re.I):
+                if CIK_TOKEN not in match.group(1):
+                    offenders.append(
+                        f"{where}: cik10 not built by cik_sql: "
+                        f"{match.group(0)[:60]}")
+
+    assert not offenders, (
+        "a CIK comparison is not going through entities.cik.cik_sql:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nThe two spellings of a CIK do not compare and the failure is always "
+        "a believable number rather than an error. Wrap both sides -- lpad is "
+        "idempotent, so there is no case where wrapping is wrong."
+    )

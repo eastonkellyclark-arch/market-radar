@@ -201,10 +201,26 @@ So the right identifier in the wrong representation fails *exactly* like a
 name-based join: silently, with a believable result, and every number downstream
 stays plausible. The rule above is necessary and not sufficient.
 
-The fix is a normaliser at every boundary, not a convention: `cik_key()` in
-`screens/dcf.py` and an `lpad` on both sides of every cross-source SQL join. A
-convention cannot be tested and this can -- a test pins that a padded key finds an
-unpadded CIK. Where a join crosses two stores, **assert a non-zero match count**
+Decided 2026-09-12, after the fourth: **a convention is not a rule, it is a
+hope.** Both forms now live in `entities/cik.py` -- `cik_key()` for Python and
+`cik_sql()` for SQL -- and a repo invariant fails the build on any join that
+compares a raw `cik` column, on `USING (cik)` (the one join shape that cannot
+wrap its own columns), and on a `cik10` alias not produced by the helper.
+
+**No exceptions, and that is what makes it readable.** `lpad` is idempotent, so
+wrapping an already-consistent pair costs a function call; "wrap it only where
+the two sides might differ" costs the judgement that has been wrong four times,
+and a carve-out for locally-consistent tables is a carve-out that gets copied
+into the next cross-store join. There was also a second implementation of the
+normaliser in `entities/resolve.py` which agreed with the first on every normal
+input -- which is why nothing had broken yet, and exactly the drift the
+invariant now forbids; it delegates.
+
+Writing it found a fifth occurrence no test had seen: `_deal_events` in `cli.py`
+read `ltrim(c.cik, '0') = d.cik` -- normalised on one side, in the opposite
+direction from everywhere else. Correct *today* and only by coincidence: both
+forms return 14,700 rows because `companies.cik` is padded and `deals.cik` is
+not. A latent failure waiting for a loader to start padding the other side. Where a join crosses two stores, **assert a non-zero match count**
 rather than trusting the row count you got: an empty join is the one result that
 looks like a correct answer about the data.
 

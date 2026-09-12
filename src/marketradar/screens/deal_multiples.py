@@ -87,6 +87,7 @@ from typing import Any, Final
 
 import duckdb
 
+from marketradar.entities.cik import cik_sql
 from marketradar.screens import funnel as funnel_mod
 
 log = logging.getLogger(__name__)
@@ -244,7 +245,7 @@ def screen(
     """)
     con.execute(f"""
         create or replace view dm_facts as
-        select lpad(cast(cik as varchar), 10, '0') as cik10,
+        select {cik_sql('cik')} as cik10,
                period_end, concept, value, tag, status
         from {fundamentals}
     """)
@@ -291,7 +292,7 @@ def screen(
         try:
             con.execute(
                 "create or replace view dm_filers as "
-                "select lpad(cast(cik as varchar), 10, '0') as cik10, "
+                f"select {cik_sql('cik')} as cik10, "
                 f"last_period, last_filed, status from {filers}")
             using_universe = True
         except duckdb.Error as exc:
@@ -318,7 +319,7 @@ def screen(
     con.execute(f"""
         create or replace table dm_matched as
         with d as (
-            select *, lpad(cast(cik as varchar), 10, '0') as cik10
+            select *, {cik_sql('cik')} as cik10
             from dm_deals where {operating}
         ),
         spans as (
@@ -354,13 +355,12 @@ def screen(
     # sample had **twenty** deal filings between 2019 and 2025, a stream of $1-31M
     # transactions, and every priced one read as a takeout because its *10-K*
     # history had ended. It filed an 8-K in September 2025. It exists.
-    con.execute("""
+    con.execute(f"""
         create or replace table dm_later as
         select a.accession,
                max(b.filed_date) as last_deal_filing
         from dm_deals a join dm_deals b
-          on lpad(cast(b.cik as varchar), 10, '0')
-             = lpad(cast(a.cik as varchar), 10, '0')
+          on {cik_sql('b.cik')} = {cik_sql('a.cik')}
         group by a.accession
     """)
 

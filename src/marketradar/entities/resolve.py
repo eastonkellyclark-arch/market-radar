@@ -22,6 +22,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Final
+from marketradar.entities.cik import cik_key
 
 #: Stripped from the end of a name, repeatedly, longest first. Order matters:
 #: "Holdings Inc" must lose "inc" then "holdings".
@@ -131,10 +132,12 @@ def normalize_cik(value: Any) -> str | None:
     """
     if value is None:
         return None
-    digits = re.sub(r"\D", "", str(value))
-    if not digits:
-        return None
-    return digits.zfill(10)
+    # Delegates: there was a second implementation of this in `screens/dcf.py` and
+    # the two agreed on every normal input, which is why nothing had broken yet.
+    # Two definitions of one identifier is the drift the invariant now forbids.
+    # The contracts differ on purpose -- "" is a usable dict key, None says there is
+    # no CIK here -- and only the contract lives in each function.
+    return cik_key(value) or None
 
 
 def normalize_ticker(value: Any) -> str | None:

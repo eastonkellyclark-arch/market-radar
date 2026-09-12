@@ -18,6 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 
+from marketradar.entities.cik import cik_sql
 from marketradar import __version__
 
 EXIT_OK = 0
@@ -1591,11 +1592,16 @@ def _cluster_events(con, path: str | None):
 
 def _deal_events(con):
     """8-K deal candidates as events, joined to a ticker."""
-    # companies.cik is zero-padded and deals.cik is not, and a company can
-    # hold several tickers at once -- joining through company_tickers fanned
-    # 10,684 deals out into 13,686 rows, which would have weighted those
+    # A company can hold several tickers at once -- joining through company_tickers
+    # fanned 10,684 deals out into 13,686 rows, which would have weighted those
     # events several times over in every median below.
-    return con.sql("""
+    #
+    # The CIK join goes through `cik_sql` on both sides. It used to read
+    # `ltrim(c.cik, '0') = d.cik`, which is correct today and only by coincidence:
+    # companies.cik is padded and deals.cik is not. Both forms return 14,700 rows,
+    # measured -- so this was a latent failure, not a live one, and the kind that
+    # appears the day a loader starts padding the other side.
+    return con.sql(f"""
         select event_id, ticker, event_date, deal_type, confidence
         from (
             select d.accession as event_id, c.ticker,
@@ -1610,7 +1616,7 @@ def _deal_events(con):
             join postgres_query('pg', '
                 select id, cik, ticker from companies
                 where cik is not null and ticker is not null') c
-              on ltrim(c.cik, '0') = d.cik
+              on {cik_sql('c.cik')} = {cik_sql('d.cik')}
         )
         where rn = 1
     """)

@@ -63,6 +63,7 @@ from typing import Any, Final
 
 import duckdb
 
+from marketradar.entities.cik import cik_sql
 from marketradar.screens import funnel as funnel_mod
 
 log = logging.getLogger(__name__)
@@ -315,7 +316,7 @@ def _peer_table(con: duckdb.DuckDBPyConnection, depth: int, *,
     from _comps_base a
     join _comps_base p
       on p.sic // {div} = a.sic // {div}
-     and p.cik <> a.cik
+     and {cik_sql('p.cik')} <> {cik_sql('a.cik')}
      and p.{SIZE_CONCEPT} between a.{SIZE_CONCEPT} / {band}
                               and a.{SIZE_CONCEPT} * {band}
     group by a.cik
@@ -361,7 +362,8 @@ def screen(
         _peer_table(con, depth, material=material_revenue, band=band)
 
     joins = "\n".join(
-        f"left join _comps_peers_{d} p{d} on p{d}.cik = b.cik"
+        f"left join _comps_peers_{d} p{d} "
+        f"on {cik_sql(f'p{d}.cik')} = {cik_sql('b.cik')}"
         for d in SIC_DEPTHS)
     # The ladder, as a CASE per column rather than a correlated subquery: the
     # first depth clearing the floor wins, and every column is taken from that
@@ -509,11 +511,11 @@ def peer_median(
         from _comps_base a
         join _comps_base p
           on p.sic // {div} = a.sic // {div}
-         and p.cik <> a.cik
+         and {cik_sql('p.cik')} <> {cik_sql('a.cik')}
          and p.revenue > {material_revenue}
          and p.{SIZE_CONCEPT} between a.{SIZE_CONCEPT} / {band}
                                   and a.{SIZE_CONCEPT} * {band}
-        join _comps_value v on v.cik = p.cik
+        join _comps_value v on {cik_sql('v.cik')} = {cik_sql('p.cik')}
         where a.sic is not null and a.{SIZE_CONCEPT} > 0
         group by a.cik
         """)
@@ -525,7 +527,8 @@ def peer_median(
     arms_n = " ".join(
         f"when coalesce(p{d}.n, 0) >= {min_peers} then p{d}.n"
         for d in SIC_DEPTHS)
-    joins = "\n".join(f"left join _comps_pm_{d} p{d} on p{d}.cik = b.cik"
+    joins = "\n".join(f"left join _comps_pm_{d} p{d} "
+                      f"on {cik_sql(f'p{d}.cik')} = {cik_sql('b.cik')}"
                       for d in SIC_DEPTHS)
     rows = con.execute(f"""
     select b.cik, case {arms_depth} end as depth,
@@ -553,7 +556,7 @@ def _alternatives(con: duckdb.DuckDBPyConnection, *, band: float,
             div = 10 ** (SIC_DEPTHS[0] - depth)
             arms.append(f"""
             select a.cik from _comps_base a join _comps_base p
-              on p.sic // {div} = a.sic // {div} and p.cik <> a.cik
+              on p.sic // {div} = a.sic // {div} and {cik_sql('p.cik')} <> {cik_sql('a.cik')}
              and p.{SIZE_CONCEPT} between a.{SIZE_CONCEPT} / {band}
                                       and a.{SIZE_CONCEPT} * {band}
             where a.sic is not null and a.{SIZE_CONCEPT} > 0

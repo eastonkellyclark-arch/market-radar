@@ -58,6 +58,7 @@ from typing import Any, Final
 
 import duckdb
 
+from marketradar.entities.cik import cik_key as _cik_key
 from marketradar.screens import funnel as funnel_mod
 
 log = logging.getLogger(__name__)
@@ -291,16 +292,11 @@ OUTCOME_WHY: Final[dict[str, str]] = {
 }
 
 
-def cik_key(cik: Any) -> str:
-    """A CIK in one representation, so two sources can be joined on it.
-
-    The XBRL partitions carry it unpadded and Postgres carries it zero-padded to
-    ten characters. Both are the same identifier and neither string equals the
-    other, so every cross-source lookup in this module goes through here. A
-    mismatch here does not raise -- it produces a believable wrong answer, which
-    is the whole reason it is a function rather than a convention.
-    """
-    return str(cik).strip().lstrip("0").rjust(10, "0") if str(cik).strip() else ""
+# Re-exported, not reimplemented. This module is where the mismatch was first
+# measured and where the call sites import it from; the definition lives in
+# `entities/cik.py` so the SQL form sits beside it. Two names for one function,
+# never two implementations that can drift apart.
+cik_key = _cik_key
 
 
 @dataclass(frozen=True, slots=True)

@@ -52,6 +52,7 @@ from typing import Any, Final
 
 import duckdb
 
+from marketradar.entities.cik import cik_sql
 from marketradar.freshness import assert_fresh
 from marketradar.sources.xbrl import tag_map
 from marketradar.sources.xbrl.download import fetch as fetch_quarter
@@ -131,7 +132,7 @@ def _sub_sql(path: str) -> str:
     """
     return f"""
         select
-            lpad(cast(cik as varchar), 10, '0')      as cik,
+            {cik_sql('cik')}      as cik,
             name                                     as company,
             try_cast(sic as integer)                 as sic,
             form,
@@ -305,11 +306,13 @@ def coverage_against(
     """
     rows = con.execute(f"""
         with u as (select cik, status from {table}),
-             o as (select distinct lpad(cast({cik_column} as varchar), 10, '0')
-                          as cik from {other})
+             o as (select distinct {cik_sql(cik_column)} as cik from {other})
         select u.status, count(*) as n_total,
                count(*) filter (where o.cik is not null) as n_known
-        from u left join o using (cik) group by u.status
+        -- An explicit ON rather than USING (cik): USING cannot wrap its columns,
+        -- so it is the one join shape that cannot state its own normalisation.
+        from u left join o on {cik_sql('u.cik')} = {cik_sql('o.cik')}
+        group by u.status
     """).fetchall()
     out: dict[str, Any] = {"table": other, "by_status": {}}
     for status, total, known in rows:

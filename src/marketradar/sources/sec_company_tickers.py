@@ -30,6 +30,7 @@ import httpx
 
 from marketradar import manifest, storage
 from marketradar.entities.resolve import normalize, normalize_cik, normalize_ticker
+from marketradar.entities.cik import cik_sql
 from marketradar.freshness import assert_fresh
 
 log = logging.getLogger(__name__)
@@ -313,7 +314,7 @@ def load(filers: list[Filer], con: duckdb.DuckDBPyConnection | None = None) -> d
             "insert into company_tickers (company_id, ticker, source) "
             f"select c.id, v.ticker, '{SOURCE}' "
             f"from (values {pairs}) as v(cik, ticker) "
-            "join companies c on c.cik = v.cik "
+            f"join companies c on {cik_sql('c.cik')} = {cik_sql('v.cik')} "
             "on conflict (company_id, ticker, source) do update set "
             "last_seen = current_date"
         )
