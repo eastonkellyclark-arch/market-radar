@@ -1228,8 +1228,24 @@ def _multiples_rows(con: Any, out_dir: Path) -> dict[str, Any]:
     con.execute(
         f"create or replace view _mult_xb as select * from read_parquet('{glob}')"
     )
+    # **The filer universe has to be in scope, and the difference is not small.**
+    # Without it the screen falls back to the fundamentals table for identity, and
+    # "stopped appearing in the loaded quarters" stands in for "stopped filing
+    # anything" -- which is a much weaker test. Measured 2026-09-12 over the
+    # completed re-sweep: 280 usable rows without the universe, **43 with it**. The
+    # 280 counted companies that still file, just not 10-Ks.
+    #
+    # The screen warns when the universe is absent. A warning nothing acts on is
+    # how a 6.5x overcount reaches a dashboard, so this builds it.
+    filers_table = None
+    try:
+        _filer_universe(con)
+        filers_table = "sec_filers"
+    except Exception as exc:
+        log.warning("filer universe unavailable; identity will be weaker: %s", exc)
     result = deal_multiples.screen(
-        con, deals=f"{storage.PG_ALIAS}.deals", fundamentals="_mult_xb")
+        con, deals=f"{storage.PG_ALIAS}.deals", fundamentals="_mult_xb",
+        filers=filers_table)
     usable = [r for r in result.rows if r.usable]
     usable.sort(key=lambda r: r.filed_date, reverse=True)
     return {
