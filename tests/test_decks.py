@@ -49,7 +49,11 @@ def subject(**over) -> decks.Subject:
                "turnover_median": 2.41, "turnover_iqr": 0.62},
         valuation={"enterprise_value": 3.53e11, "wacc": 0.070,
                    "terminal_share": 0.66, "beta": 0.62,
-                   "free_cash_flow": 1.3e10,
+                   "free_cash_flow": 1.3e10, "growth": 0.03,
+                   # Stored, not derived: the page renders these rather than
+                   # recomputing them, so a deck cannot disagree with the panel.
+                   "flex": {0.0: 2.6e11, 0.03: 3.53e11, 0.06: 4.9e11,
+                            0.10: 7.8e11},
                    "substitutions": ["erp_constant", "growth_constant"]},
         insiders=[], deals=[], prices=[(date(2026, 9, 10), 104.5)],
     )
@@ -315,8 +319,38 @@ def test_every_concept_shows_its_own_coverage(tmp_path) -> None:
     assert "never averaged" in fund
 
 
-def test_the_sensitivity_page_shows_what_the_constant_costs(tmp_path) -> None:
+def test_the_sensitivity_page_renders_stored_values_and_never_computes(
+    tmp_path, monkeypatch
+) -> None:
+    """**A page that computes is a page that can disagree with the panel**, and the
+    deck is the artifact that leaves the room. So the four flex points are computed
+    once beside the valuation and read here.
+
+    Pinned by breaking the calculator: if this page still derived anything, making
+    ``dcf.enterprise_value`` raise would change what it draws.
+    """
+    from marketradar.screens import dcf as dcf_mod
+
+    def boom(*a, **kw):
+        raise AssertionError("the sensitivity page computed instead of reading")
+
+    monkeypatch.setattr(dcf_mod, "enterprise_value", boom)
     pages = slide_text(decks.build(subject(), tmp_path / "d.pptx"))
     sens = next(t for t in pages if "Sensitivity" in t)
     assert "base case" in sens
     assert "does not predict future growth" in sens
+    # The stored values, not recomputed ones.
+    assert "$260.00B" in sens and "$780.00B" in sens
+
+
+def test_a_row_with_no_stored_flex_says_so(tmp_path) -> None:
+    """An absent flex means the row predates the stored field, which is a fact
+    about the row. Drawing an empty table would read as a flat sensitivity."""
+    stale = subject(valuation={
+        "enterprise_value": 3.5e11, "wacc": 0.07, "terminal_share": 0.66,
+        "beta": 0.62, "free_cash_flow": 1.3e10, "growth": 0.03,
+        "substitutions": ["erp_constant", "growth_constant"]})
+    pages = slide_text(decks.build(stale, tmp_path / "d.pptx"))
+    sens = next(t for t in pages if "Sensitivity" in t)
+    assert "no stored sensitivity" in sens
+    assert "mr dcf" in sens

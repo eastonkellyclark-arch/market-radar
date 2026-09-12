@@ -241,6 +241,18 @@ DEFAULT_GROWTH: Final[float] = 0.0300
 #: it makes the terminal value explode. Rejected rather than clamped.
 MIN_WACC: Final[float] = 0.0400
 
+#: Growth rates the valuation is flexed at, stored with every row.
+#:
+#: **Stored rather than recomputed by a consumer.** The deck used to derive these
+#: four numbers itself, which made it the only surface that computed rather than
+#: rendered -- and therefore the only one that could disagree with the panel about
+#: the same filer. A deck is the artifact that leaves the room, so it reads.
+#:
+#: Four points rather than a curve: the flat constant, zero, and two steps above
+#: it. Enough to show what the assumption costs without implying a distribution
+#: nobody measured.
+FLEX_GROWTH: Final[tuple[float, ...]] = (0.00, 0.03, 0.06, 0.10)
+
 #: A beta outside this range is a failed regression, not a risky company.
 #:
 #: **Measured 2026-09-12 and it was not hypothetical.** A first pass over 5,500
@@ -348,6 +360,10 @@ class Valuation:
 
     wacc: float | None = None
     enterprise_value: float | None = None
+    #: ``{growth rate: enterprise value}`` at :data:`FLEX_GROWTH`. Computed here,
+    #: with the valuation, so every consumer renders the same numbers -- see the
+    #: note on that constant.
+    flex: dict[float, float] = field(default_factory=dict)
     #: Present value of the explicit forecast, and of the terminal value. Split
     #: because the terminal value is usually most of the answer, and a reader who
     #: cannot see that share cannot judge the sensitivity to one growth number.
@@ -672,6 +688,7 @@ def screen(
         subs.extend(rate_subs)
         ordered = tuple(s for s in SUBSTITUTIONS if s in set(subs))
 
+        flex: dict[float, float] = {}
         if fcf is None:
             outcome, ev, pv_f, pv_t = NO_CASH_FLOW, None, None, None
         elif fcf <= 0:
@@ -683,6 +700,16 @@ def screen(
                 fcf, rate, growth=inputs.growth, terminal_growth=cap,
                 horizon=horizon)
             outcome = VALUED
+            for alt in FLEX_GROWTH:
+                try:
+                    flex[alt] = enterprise_value(
+                        fcf, rate, growth=alt, terminal_growth=cap,
+                        horizon=horizon)[0]
+                except ValueError:
+                    # A flex point that cannot be computed is omitted rather
+                    # than clamped: a renderer showing four rows where one is a
+                    # substitute would be the midpoint mistake again.
+                    continue
         outcomes[outcome] += 1
         if outcome == VALUED:
             for name in ordered:
@@ -693,6 +720,7 @@ def screen(
             substitutions=ordered if outcome == VALUED else (),
             wacc=rate if outcome == VALUED else None,
             enterprise_value=ev, pv_forecast=pv_f, pv_terminal=pv_t,
+            flex=flex,
         ))
 
     has_ocf = sum(1 for r in out if r.inputs.operating_cash_flow is not None)

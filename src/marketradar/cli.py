@@ -1065,7 +1065,11 @@ def _dcf_rows(con: Any, out_dir: Path) -> dict[str, Any]:
                 "enterprise_value": (None if r.enterprise_value is None
                                      else f"{r.enterprise_value:.0f}"),
                 "wacc": r.wacc, "terminal_share": r.terminal_share,
-                "beta": r.inputs.beta,
+                "beta": r.inputs.beta, "growth": r.inputs.growth,
+                "free_cash_flow": r.inputs.free_cash_flow,
+                # Stored so the deck renders the sensitivity rather than deriving
+                # it. Keys are stringified by JSON; the renderer reads either.
+                "flex": {f"{k}": v for k, v in sorted(r.flex.items())},
                 "substitutions": list(r.substitutions),
                 "clean_but_constants": r.clean_but_constants,
                 "source": r.inputs.source,

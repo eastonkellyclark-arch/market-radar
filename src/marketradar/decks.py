@@ -464,33 +464,44 @@ def _page_valuation(ctx: _Ctx) -> None:
 
 
 def _page_sensitivity(ctx: _Ctx) -> None:
+    """The stored flex, rendered. **This page does not compute.**
+
+    It used to call ``dcf.enterprise_value`` itself, which made it the only page in
+    the deck that derived a number rather than rendering one -- and so the only one
+    that could disagree with the dashboard about the same filer. A deck is the
+    artifact that leaves the room, so the four points are computed once beside the
+    valuation, stored on the row, and read here.
+    """
     s = ctx.subject
     v = s.valuation
     slide = add_page(ctx, "Sensitivity",
-                     "What the answer does when the two constants move. Both "
-                     "are assumptions, so this is the honest range.")
+                     "What the answer does when the growth constant moves. It is "
+                     "an assumption, so this is the honest range.")
     ev = v.get("enterprise_value")
-    wacc = v.get("wacc")
-    if ev is None or not wacc:
+    flex = v.get("flex") or {}
+    if ev is None:
         _text(ctx, slide, "No valuation, so nothing to flex.", 0.6, 2.0,
               8.0, 0.5, size=14, colour=MUTED)
         return
-    from marketradar.screens import dcf
-
-    fcf = v.get("free_cash_flow")
+    if not flex:
+        # Said rather than drawn empty: a missing flex means the row was written
+        # by an older screen, which is a fact about the row and not about the
+        # company.
+        _text(ctx, slide,
+              "This valuation carries no stored sensitivity. Re-run `mr dcf` -- "
+              "the deck renders the flex rather than deriving it, so that this "
+              "page and the dashboard cannot disagree.",
+              0.6, 2.0, SLIDE_W - 1.2, 0.8, size=13, colour=WARN)
+        return
+    base = float(ev)
+    base_rate = v.get("growth")
     rows: list[tuple[str, ...]] = [("near-term growth", "enterprise value",
                                    "vs the base case")]
-    base = float(ev)
-    for growth in (0.00, 0.03, 0.06, 0.10):
-        try:
-            got, _f, _t = dcf.enterprise_value(
-                float(fcf), float(wacc), growth=growth,
-                terminal_growth=min(dcf.TERMINAL_GROWTH, float(wacc) - 0.005))
-        except (TypeError, ValueError):
-            continue
-        mark = "base case" if abs(growth - dcf.DEFAULT_GROWTH) < 1e-9 else \
-            f"{got / base:.2f}x"
-        rows.append((f"{growth * 100:.0f}%", _money(got), mark))
+    for key in sorted(flex, key=float):
+        growth, got = float(key), float(flex[key])
+        is_base = base_rate is not None and abs(growth - float(base_rate)) < 1e-9
+        rows.append((f"{growth * 100:.0f}%", _money(got),
+                     "base case" if is_base else f"{got / base:.2f}x"))
     _rows(ctx, slide, rows, widths=(3.0, 3.0, 6.1))
     _text(ctx, slide,
           "A growth rate fitted from this company's own history loses to the "
