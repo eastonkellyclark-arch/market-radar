@@ -492,6 +492,79 @@ def upsert_statement(values: str) -> str:
     )
 
 
+#: How a recovered symbol relates to the price history we hold. Five outcomes, not a
+#: boolean, because four different absences must not collapse into one NULL -- the
+#: same reason `proxy_consideration` carries a `shape` and a nil XBRL tag is not a
+#: zero. Only `usable` means "these bars are this company's".
+USABLE: Final[str] = "usable"
+#: The symbol is in the price file, but the bars fall outside the window it was
+#: observed in for this CIK -- they are a different owner's. **Both directions**: the
+#: issuer that took the symbol after this company was acquired, and the one that held
+#: it before. Named for the later case at first, which is also the only case the
+#: first fixture covered, so a mutation dropping the lower bound went unnoticed.
+#: Not fixable by buying history: the bars exist and belong to somebody else.
+OTHER_OWNER_BARS: Final[str] = "other_owner_bars"
+#: The symbol is absent from the price file. Tiingo's supported list is current
+#: listings, so a delisted symbol is not in it at all -- a purchase fixes this.
+NOT_IN_FILE: Final[str] = "not_in_file"
+#: The symbol was last seen before our price history begins. The symbol is right; we
+#: hold no bars from that decade. A purchase fixes this, and only a purchase does.
+BEFORE_OUR_HISTORY: Final[str] = "before_our_history"
+
+PRICE_FATE: Final[tuple[str, ...]] = (
+    USABLE, OTHER_OWNER_BARS, NOT_IN_FILE, BEFORE_OUR_HISTORY)
+
+
+def usable_prices(con: Any, *, prices: str, alias: str = "pg",
+                  view: str = "ticker_price_fate") -> Any:
+    """Classify every recovered symbol against the price history we hold.
+
+    **Overlap, never presence.** A recovered symbol appearing in the price file is
+    not this company's price history: 356 active symbols carry two companies inside a
+    ten-year pull, and a current-listings sweep collects the *later* owner. SGEN is
+    the case in point -- bars run through 2026 because a different issuer took the
+    symbol after Seagen was acquired in 2023. Measured on the stopped-filer
+    population, **56 of 206 symbols present in the price file had bars belonging to
+    the next owner**, so a presence test would have been wrong about more than a
+    quarter of what it called coverage.
+
+    ``prices`` is a relation with ``ticker`` and ``date``, resolved by the caller
+    through the manifest -- this module holds no data location of its own.
+
+    Returns the created relation. Every row carries its fate from `PRICE_FATE`, so a
+    consumer can ask for the usable ones and still *see* how many it did not get and
+    why -- the funnel rule applied to a join.
+    """
+    # No CIK join here: the price file keys on ticker, which is exactly why the
+    # date bounds have to do the work the identifier cannot.
+    con.execute(f"""create or replace view _tpf_px as
+        select ticker, min(date) as first_bar, max(date) as last_bar,
+               count(*) as bars
+        from {prices} group by ticker""")
+    first_bar, last_bar = con.execute(
+        "select min(first_bar), max(last_bar) from _tpf_px").fetchone()
+    if first_bar is None:
+        raise SymbolError(
+            f"the price relation {prices!r} is empty, so every symbol would be "
+            "classified `not_in_file` -- which is a believable answer about a map "
+            "of delisted companies and the reason this raises instead."
+        )
+    con.execute(f"""create or replace view {view} as
+        select h.cik, h.ticker, h.first_seen, h.last_seen, h.filings, h.source,
+               p.first_bar, p.last_bar, p.bars,
+               case
+                 when p.ticker is null
+                      and h.last_seen < date '{first_bar}' then '{BEFORE_OUR_HISTORY}'
+                 when p.ticker is null                     then '{NOT_IN_FILE}'
+                 when p.first_bar <= h.last_seen
+                      and p.last_bar >= h.first_seen       then '{USABLE}'
+                 else '{OTHER_OWNER_BARS}'
+               end as fate
+        from {alias}.company_ticker_history h
+        left join _tpf_px p on p.ticker = h.ticker""")
+    return con.table(view)
+
+
 def load(report: SweepReport, con: Any, *, alias: str = "pg",
          min_rows: int = 1) -> Any:
     """Upsert the recovered ranges and assert the result is real.
