@@ -1924,3 +1924,144 @@ DCF_SCRIPT: Final[str] = """
   apply();
 });
 """
+
+
+# --- U16: proxy sections -------------------------------------------------
+
+#: What a reader gets from each section, and how often the locator found it.
+#: Measured 2026-09-12 over 20 consecutive DEFM14A filings.
+_PROXY_SECTION_WHY: Final[dict[str, tuple[str, str]]] = {
+    "prospective_financial": (
+        "15/15 takeouts",
+        "management's projected years &mdash; the only forward estimate anywhere "
+        "in this system, and the one section reliably where it says it is"),
+    "merger_consideration": (
+        "18/20",
+        "what one share receives. Anchored on the money clause, not a heading: "
+        "&ldquo;Merger Consideration&rdquo; is a defined term matching 22 times "
+        "in a real proxy and every occurrence is prose"),
+    "premium_statement": (
+        "16/20",
+        "the premium the board is justifying. Anchored on the premium sentence, "
+        "because the Premiums Paid Analysis heading contains this deal&rsquo;s "
+        "own premium <strong>zero times in 13</strong> &mdash; that table is "
+        "other transactions"),
+    "fairness_opinion": (
+        "17/20, unmeasured",
+        "the banker&rsquo;s methodology and comparables. Offered, not relied on: "
+        "its accuracy was never measured"),
+}
+
+
+def proxy_html(
+    rows: list[dict[str, Any]],
+    stats: dict[str, Any] | None = None,
+) -> str:
+    """Where to open each proxy, and the few projections worth storing.
+
+    **This panel is the shipped half of the proxy reader.** Extraction was measured
+    at 62% per figure over 20 hand-checked documents and declined; the locator was
+    not, and it is free. So the panel's job is to get a reader to the right passage
+    of a 1.26-million-character filing, not to tell them what it says.
+
+    Every row is a character offset, a matched heading, and the figure density that
+    chose that window over the other nine places the heading appeared. Nothing here
+    is a number read by a model, which is why nothing here needs a caveat about one.
+    """
+    stats = stats or {}
+    if not rows:
+        return ('<p class="why"><span class="why-k">waiting</span> No proxies '
+                "located. Run <code>mr proxy</code> &mdash; it needs no model and "
+                "costs nothing.</p>")
+    body = []
+    for row in rows[:ROWS_PER_LIST]:
+        found = row.get("sections") or {}
+        cells = []
+        for name in _PROXY_SECTION_WHY:
+            got = found.get(name)
+            if not got:
+                cells.append('<td class="note">--</td>')
+                continue
+            cells.append(
+                f'<td class="num" title="{_esc(str(got.get("heading") or ""))}">'
+                f'{int(got.get("char_start") or 0):,}'
+                f'<span class="note"> ({int(got.get("figures") or 0)}f)</span>'
+                "</td>")
+        proj = int(row.get("projection_years") or 0)
+        body.append(
+            "<tr>"
+            f'<td class="tk">{_esc(str(row.get("company") or ""))}</td>'
+            f'<td class="note">{_esc(str(row.get("form") or ""))}</td>'
+            f'<td class="num">{int(row.get("chars") or 0):,}</td>'
+            + "".join(cells)
+            + (f'<td class="num">{proj}</td>' if proj
+               else '<td class="note">--</td>')
+            + "</tr>"
+        )
+    guide = "".join(
+        "<tr>"
+        f'<td class="tk">{_esc(name)}</td>'
+        f'<td class="num">{_esc(found_in)}</td>'
+        f"<td class=\"note\">{what}</td>"
+        "</tr>"
+        for name, (found_in, what) in _PROXY_SECTION_WHY.items()
+    )
+    located = int(stats.get("documents") or 0)
+    stored = int(stats.get("projection_rows") or 0)
+    refused = int(stats.get("projections_refused") or 0)
+    return f"""
+      <p class="why"><span class="why-k">how to read this</span>
+        A <code>DEFM14A</code> is about 1.26 million characters and the part worth
+        reading is a few thousand. These are character offsets into the visible
+        text, with the heading the locator matched and the figure density that
+        chose that window over the other places the heading appeared &mdash; in a
+        real proxy the same heading matches in the table of contents, the body, the
+        tax discussion and the appended merger agreement, so
+        <strong>&ldquo;first&rdquo; lands in the contents and &ldquo;last&rdquo; in
+        the annex</strong>.</p>
+      <p class="note"><strong>The locator shipped and the extraction did not.</strong>
+        Measured 2026-09-12 over 20 hand-checked documents: per-figure accuracy was
+        <strong>62% across 45 cells</strong> &mdash; cash 67%, acquirer shares 73%,
+        premium 47% &mdash; against 63% for a simpler earlier schema. And the
+        population decides it regardless: proxies exist only for companies being
+        acquired, so ~500 documents against 2,564 valued filers would improve a
+        growth input for under 20% of valuations, never for the filers whose growth
+        constant is most wrong. Reopens on a cheaper capable model or a forward
+        estimate that is not merger-conditional &mdash; not on better prompting.</p>
+      <table class="rows">
+        <thead><tr><th>company</th><th>form</th><th class="num">chars</th>
+          <th class="num">projections</th><th class="num">consideration</th>
+          <th class="num">premium</th><th class="num">opinion</th>
+          <th class="num" title="projected fiscal years stored, only where the
+            table passed its own arithmetic">yrs</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+      <h5>what each section gives a reader</h5>
+      <table class="rows">
+        <thead><tr><th>section</th><th class="num">found in</th>
+          <th>what it is</th></tr></thead>
+        <tbody>{guide}</tbody>
+      </table>
+      <h5>projections, stored only when the table passes its own arithmetic</h5>
+      <p class="note">The one extracted field that survived, and it survived for a
+        specific reason: a projections table is a labelled multi-year grid, so a
+        wrong one is catchable <strong>without knowing the right answer</strong>
+        &mdash; years consecutive, EBITDA below revenue, a plausible margin, no
+        tenfold step between adjacent years. A table failing any of those is
+        <code>incoherent</code> and is refused rather than stored. Measured: 5 of 15
+        takeouts produced a coherent table, and <strong>76 of 76 values in those
+        five appear verbatim in their filings</strong>. High precision on low yield.</p>
+      <table class="rows">
+        <thead><tr><th>count</th><th class="num">rows</th></tr></thead>
+        <tbody>
+          <tr><td class="tk">documents located</td>
+            <td class="num">{located:,}</td></tr>
+          <tr><td class="tk">projected years stored</td>
+            <td class="num">{stored:,}</td></tr>
+          <tr><td class="tk">tables refused by the self-check</td>
+            <td class="num">{refused:,}</td></tr>
+        </tbody>
+      </table>
+      <p class="note">Every stored row carries <code>source = 'extracted'</code>.
+        A consumer joining these to XBRL is joining a <em>forecast</em> to a
+        <em>fact</em>, and the column exists so that cannot happen by accident.</p>"""

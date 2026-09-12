@@ -161,6 +161,9 @@ class Context:
     #: Valuations and their substitution counts. Same contract as `xbrl` and
     #: `comps`: computed with the rows, never a stored second copy of a number.
     dcf: dict[str, Any] = field(default_factory=dict)
+    #: Located proxy sections. The shipped half of the proxy reader -- extraction
+    #: was measured and declined; see docs/build-spec.md.
+    proxy: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -514,6 +517,26 @@ def _probe_dcf(ctx: Context) -> tuple[str, str]:
     )
 
 
+def _probe_proxy(ctx: Context) -> tuple[str, str]:
+    """Live once proxies are located. Reports sections, never figures.
+
+    The distinction is the panel's whole point: the locator shipped and the
+    extraction was declined at 62% per figure, so a headline counting extracted
+    numbers would advertise the part that was measured and rejected.
+    """
+    stats = (ctx.proxy or {}).get("stats") or {}
+    docs = int(stats.get("documents") or 0)
+    if not docs:
+        return WAITING, "no proxies located -- run `mr proxy` (needs no model)"
+    rows = int(stats.get("section_rows") or 0)
+    stored = int(stats.get("projection_rows") or 0)
+    return LIVE, (
+        f"{docs:,} proxies located, {rows:,} readable sections"
+        + (f"; {stored:,} projected years passed the self-check" if stored
+           else "; no projections stored")
+    )
+
+
 def _probe_deals(ctx: Context) -> tuple[str, str]:
     if not ctx.deals:
         return WAITING, "no deal candidates stored -- run `mr deals`"
@@ -574,6 +597,12 @@ PANELS: Final[tuple[Panel, ...]] = (
     # Not `weekend="Weekend 3"`, which is what this said for a day after the
     # decision. A panel promising a weekend that is never coming is the shell
     # misreporting the roadmap, and the measurement is the useful part.
+    Panel("proxy", "Proxy sections", "Filings",
+          "Where to open a merger proxy. A DEFM14A is 1.26M characters and the "
+          "part worth reading is a few thousand; the locator finds it every "
+          "time, free. Extraction was measured at 62% per figure and declined "
+          "-- this panel reports sections, not figures.",
+          probe=_probe_proxy),
     Panel("news", "News", "Filings",
           "Headlines against watched issuers. Measured against real 8-K deal "
           "dates and declined: M&A detection is by form type, and news is "
@@ -915,6 +944,10 @@ def render(
         (ctx.comps or {}).get("rows") or [],
         (ctx.comps or {}).get("stats") or {},
         (ctx.comps or {}).get("funnel"),
+    )
+    bodies["proxy"] = body_html.proxy_html(
+        (ctx.proxy or {}).get("rows") or [],
+        (ctx.proxy or {}).get("stats") or {},
     )
     bodies["dcf"] = body_html.dcf_html(
         (ctx.dcf or {}).get("rows") or [],

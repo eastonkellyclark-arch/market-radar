@@ -174,6 +174,18 @@ def build_parser() -> argparse.ArgumentParser:
                        help="directory holding the fundamentals partitions")
     p_dcf.set_defaults(func=_cmd_dcf)
 
+    p_proxy = sub.add_parser(
+        "proxy", help="locate the readable sections of merger proxies (no model)")
+    p_proxy.add_argument("--limit", type=int, default=20, metavar="N",
+                         help="how many proxies to locate, newest first")
+    p_proxy.add_argument("--projections", action="store_true",
+                         help="also extract management projections, storing only "
+                              "tables that pass their own arithmetic. The one "
+                              "extraction that survived the 2026-09-12 decline")
+    p_proxy.add_argument("--no-load", action="store_true",
+                         help="report only; write nothing")
+    p_proxy.set_defaults(func=_cmd_proxy)
+
     p_comps = sub.add_parser(
         "comps", help="peer sets by SIC and size, with the depth each settled on")
     p_comps.add_argument("--out", default=".cache/xbrl/out", metavar="DIR",
@@ -1121,6 +1133,89 @@ def _cmd_dcf(args: argparse.Namespace) -> int:
               f"wacc {(row['wacc'] or 0) * 100:5.1f}%  "
               f"term {(row['terminal_share'] or 0) * 100:3.0f}%  "
               f"{','.join(row['substitutions'])}")
+    return EXIT_OK
+
+
+def _cmd_proxy(args: argparse.Namespace) -> int:
+    """Locate the readable sections of merger proxies. **No model, no cost.**
+
+    This is the half of the proxy reader that shipped. Extraction was measured at
+    62% per figure over 20 hand-checked documents and declined -- see
+    docs/build-spec.md, "Proxy extraction: measured 2026-09-12, declined" -- but the
+    locator is free, deterministic, and puts a reader on the right passage of a
+    1.26-million-character document every time.
+
+    ``--projections`` is the one extraction that survived, and only because a
+    projections table can be checked against its own arithmetic: a table that fails
+    is refused rather than stored. 5 of 15 takeouts produced a coherent table and
+    76 of 76 values in those five appear verbatim in their filings.
+    """
+    import httpx
+
+    from marketradar import storage
+    from marketradar.signals import deals as deals_mod
+    from marketradar.signals import proxy as proxy_mod
+    from marketradar.signals.edgar_rss import Pacer
+
+    con = storage.connect()
+    A = storage.PG_ALIAS
+    rows = con.execute(f"""
+        select accession, cik, company, form, filed_date
+        from {A}.target_filing
+        where form in ('DEFM14A', 'PREM14A', 'DEFM14C')
+        order by filed_date desc
+        limit {int(args.limit)}
+    """).fetchall()
+    if not rows:
+        print("mr proxy: no merger proxies in target_filing; run `mr deals`",
+              file=sys.stderr)
+        return EXIT_ERROR
+    print(f"{len(rows)} merger proxies to locate")
+    print()
+
+    client = httpx.Client(timeout=300, follow_redirects=True)
+    pacer = Pacer(per_second=2.0)
+    located = stored = projected = refused = 0
+    try:
+        for accession, cik, company, form, _filed in rows:
+            try:
+                document, text = proxy_mod.fetch_document(
+                    cik, accession, client=client, pacer=pacer)
+            except Exception as exc:
+                print(f"  {company[:30]:<32} fetch failed: {str(exc)[:50]}")
+                continue
+            got = proxy_mod.locate_all(
+                accession, text, cik=cik, company=company, form=form,
+                document=document)
+            located += 1
+            for line in got.lines():
+                print(line)
+            if not args.no_load:
+                stored += proxy_mod.upsert_sections(con, got, alias=A)
+
+            if args.projections and "prospective_financial" in got.sections:
+                series = proxy_mod.extract_projections(
+                    accession, text, filer=company,
+                    filed_year=int(str(_filed)[:4]))
+                if series.usable:
+                    if not args.no_load:
+                        projected += proxy_mod.upsert_projections(
+                            con, series, cik=cik, alias=A)
+                    print(f"  projections              {len(series.years)} years "
+                          f"coherent, stored ({series.scenario or 'no case'})")
+                else:
+                    refused += 1
+                    why = (", ".join(series.failures) if series.failures
+                           else series.reason)
+                    print(f"  projections              refused: {why}")
+            print()
+    finally:
+        client.close()
+
+    print(f"{located} documents located, {stored} section rows written")
+    if args.projections:
+        print(f"{projected} projection rows stored, {refused} tables refused "
+              "-- a table that fails its own arithmetic is not stored")
     return EXIT_OK
 
 
@@ -2245,6 +2340,14 @@ def main(argv: list[str] | None = None) -> int:
 
             label = "STALE DATA" if isinstance(exc, StaleDataError) else "error"
             print(f"mr xbrl: {label}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+    if args.command == "proxy":
+        load_dotenv()
+        try:
+            return _cmd_proxy(args)
+        except Exception as exc:
+            print(f"mr proxy: error: {exc}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.command == "dcf":

@@ -259,6 +259,41 @@ DCF_ROWS: dict = {
 }
 
 
+#: A loaded proxy panel. One document with all four sections and stored
+#: projections, one with a gap -- the panel exists to show where to read, so a
+#: fixture where everything is found would leave the missing case untested.
+PROXY_ROWS: dict = {
+    "rows": [
+        {"accession": "0000058492-26-000364", "cik": "0000058492",
+         "company": "LEGGETT & PLATT INC", "form": "DEFM14A",
+         "chars": 1094646, "projection_years": 5,
+         "sections": {
+             "prospective_financial": {"char_start": 362171, "figures": 26,
+                                       "heading": "unaudited prospective financial information"},
+             "merger_consideration": {"char_start": 687038, "figures": 25,
+                                      "heading": "consideration of 19,869,666 shares"},
+             "premium_statement": {"char_start": 264794, "figures": 14,
+                                   "heading": "premium of approximately 21.8%"},
+             "fairness_opinion": {"char_start": 360688, "figures": 26,
+                                  "heading": "Opinion of Leggett & Platt's Financial Advisor"},
+         }},
+        {"accession": "0001104659-26-105957", "cik": "0001104659",
+         "company": "Varex Imaging Corp", "form": "PREM14A",
+         "chars": 742467, "projection_years": 0,
+         "sections": {
+             "prospective_financial": {"char_start": 263983, "figures": 24,
+                                       "heading": "Management Forecasts"},
+             "merger_consideration": {"char_start": 73199, "figures": 4,
+                                      "heading": "Merger Consideration of $18.90"},
+             "premium_statement": {"char_start": 216032, "figures": 12,
+                                   "heading": "represents a premium"},
+         }},
+    ],
+    "stats": {"documents": 2, "section_rows": 7, "projection_rows": 5,
+              "projections_refused": 1},
+}
+
+
 def loaded_context(**overrides):
     """A dashboard Context with every source present and nothing empty.
 
@@ -327,6 +362,7 @@ def loaded_context(**overrides):
         xbrl=XBRL_COVERAGE,
         comps=COMPS_SETS,
         dcf=DCF_ROWS,
+        proxy=PROXY_ROWS,
     )
     base.update(overrides)
     ctx = shell.Context(**base)

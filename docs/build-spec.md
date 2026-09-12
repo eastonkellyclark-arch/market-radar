@@ -534,6 +534,7 @@ the build goes red naming both.
 | Filings | Form 4 clusters — officers & directors | `clusters_insider` | live | W3 |
 | Filings | Form 4 clusters — 10% holders | `clusters_tenpct` | live | a separate panel, not a filter: the medians are 78x apart, so one floor cannot serve both |
 | Filings | 8-K deals | `deals` | live | W3-T3. Both classifiers shown; disagreements are a review queue |
+| Filings | Proxy sections | `proxy` | live | U16. Where to open a merger proxy: character offsets and the matched heading for four sections. The locator shipped; extraction was measured at 62% per figure and declined |
 | Filings | News | `news` | declined | measured 2026-09-10 and declined — see *News: measured, declined*. The panel carries the measurement, not a weekend |
 | Private | Private companies | `private` | live | W4 |
 | Private | Mature targets | `mature` | live | W4 |
@@ -1659,6 +1660,127 @@ between — a drained *minute* bucket asking for 42 seconds, measured on
 `gpt-oss-20b` — fall through for this call and keep the provider in the ladder,
 because deferring on 42 seconds would throw away the only capable model over one
 busy minute.
+
+#### Proxy extraction: measured 2026-09-12, declined
+
+Same treatment as GDELT news. The locator ships; the extraction does not. Both
+halves were measured on the same 20 consecutive `DEFM14A` filings, hand-checked
+against my own reading of each document before any model ran.
+
+**The locator is excellent and it is what ships.** A `DEFM14A` is ~1.26 million
+characters and the part worth reading is a few thousand. Deterministic heading
+patterns put a reader on the right passage:
+
+| section | found in | note |
+|---|---|---|
+| `prospective_financial` | **15/15 takeouts (100%)** | management projections; a disclosure obligation makes the heading near-boilerplate |
+| `merger_consideration` | 18/20 | anchored on the money clause, not a heading — "Merger Consideration" is a defined term matching 22 times |
+| `premium_statement` | 16/20 | anchored on the premium sentence; the *Premiums Paid Analysis* heading contains this deal's premium **zero times in 13** |
+| `fairness_opinion` | — | present, unmeasured |
+
+**The extraction was not good enough, on three separate fields.**
+
+45 cells over the 15 real takeouts — a cash cell, an acquirer-shares cell and a
+premium cell each:
+
+| cell | right | wrong | missed |
+|---|---|---|---|
+| cash | 10/15 (67%) | 1 | 4 |
+| acquirer shares | 11/15 (73%) | 2 | 2 |
+| premium | 7/15 (47%) | 4 | 4 |
+| **all cells** | **28/45 = 62%** | 7 | 10 |
+| shape (scalar/collar/mixed/per-class) | 7/15 = 47% | | |
+
+v1 scored 63% on a simpler schema. **v2 moved nothing**, and that is the finding:
+the structured consideration, the attribution check and the Canadian gate phrasing
+each fixed something real without lifting the aggregate.
+
+What v2 genuinely fixed, for the record, because "no movement" hides it:
+
+- **Collars became representable.** Enviri's `$14.50–$16.50` and CoreCard's
+  `0.2783–0.3142` both come back exactly. v1 stored one end of each as a price — a
+  wrong number that looks right.
+- **The phantom merger-sub ratio is gone.** Farmer Brothers' shares cell is
+  correctly absent; v1 reported 1.0, quoting merger-sub boilerplate.
+
+What it did not fix:
+
+- **The premium is the worst cell and attribution did not save it.** Comerica
+  returns 7.0 — the 75th-percentile figure from a comparables table — in both
+  versions. The check passes because the model simply claims the attribution is
+  Comerica, and a head-word name test cannot see that.
+- **Mixed deals lose a leg.** Veeco came back `shares_only 0.3575` (truth: 0.265
+  shares *and* $10.15); Norfolk Southern `scalar 320` (truth: 1 share *and*
+  $88.82). The schema can express a mix; the extraction does not find both halves.
+- **Four consideration cells read `not_stated` where a value exists** — a locator
+  depth problem, not an extraction one.
+
+**Projections invert the shape, and that is worth knowing separately.**
+
+A projections table is a labelled multi-year grid rather than one number in prose,
+so it is **internally checkable**: years consecutive, EBITDA below revenue, margin
+plausible, no hundredfold step between adjacent years, capex under revenue, EBIT
+under EBITDA. `incoherent` is the first reason code in this system detectable
+**without knowing the truth**.
+
+| | of 15 takeouts |
+|---|---|
+| locator found a section | 15 (100%) |
+| coherent table extracted | **5 (33%)** |
+| caught by the self-check | 1 (7%) |
+| failed another way | 9 (60%) — 4 `not_stated`, 3 `uncited`, 2 `misattributed` |
+
+And the coherent tables are **exact**: 76 of 76 values verbatim in their filings,
+four to six years each, with units and scenario carried rather than normalised. So
+projections are high precision on low yield, where consideration is low accuracy on
+high yield. The failure is the window reaching the heading and not the table under
+it.
+
+**Enviri corrected my own ground truth, in the model's favour.** Its table came
+back labelled "Clean Earth Forecasts" at $1,054M against $2,240M of filed revenue,
+which read as a segment forecast mistaken for the company's. It is not — the proxy
+sells the Clean Earth business and leaves holders with shares of New Enviri, so the
+segment forecast is correct and the `mixed` shape the model returned is probably
+correct too. One of the 45 ground-truth cells needs re-reading and the error was
+mine.
+
+**Cost, measured rather than estimated.** Prompts average **2,478 tokens**
+(consideration) and **2,484** (projections) at the 8,000-character window.
+
+| scope | tokens | days of free tier |
+|---|---|---|
+| projections only, 500 documents | 1.24M | **~6 days** |
+| all three fields, 500 documents | 3.7M | **~19 days** |
+
+Only `gpt-oss-120b` can do the task at all — 4/4 on a hand-checked probe against
+1/4 for `gpt-oss-20b` and `qwen3.8-27b`, 0/4 for local `qwen3:4b` — so the three
+Groq day-buckets do not help. 200,000 tokens per day per model is ~45 proxies.
+
+**And the population argument decides it independently of accuracy.** Proxies exist
+only for companies being acquired. ~500 documents against **2,564 valued filers**,
+so even at 100% extraction this improves the growth input for **under 20%** of
+valuations — and specifically for companies about to stop existing. The filers whose
+growth constant is most wrong are NVIDIA, Amazon, AMD, Tesla, measured at 0.03x to
+0.22x of market cap; none of them will ever file a merger proxy. Nineteen days of
+free tier buys a forward estimate for the subset that needs it least.
+
+So: **proxies give a human sections to read, not a pipeline figures to store.**
+
+##### What would reopen it
+
+Not better prompting. Two conditions, either of which changes the arithmetic
+rather than the technique:
+
+1. **A cheaper capable model.** The binding constraint is one model at 200k
+   tokens/day. A capable model at 10x the budget makes 500 documents a two-day job
+   and makes the 62% worth iterating on rather than worth declining.
+2. **A forward estimate that is not merger-conditional.** The population argument
+   is the stronger half and prompting cannot touch it. Sell-side consensus, a
+   guidance feed, or anything covering live companies would improve the growth
+   input where it is actually wrong. Proxies structurally cannot.
+
+Reopen on either of those, not on a better prompt. The locator and the coherence
+self-check stay regardless, because they are free and they already work.
 
 #### The re-sweep, and why it goes by CIK
 

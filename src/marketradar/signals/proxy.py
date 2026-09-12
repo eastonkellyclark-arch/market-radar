@@ -1466,3 +1466,174 @@ def extract_projections(
         note=("the table fails its own arithmetic: " + ", ".join(failures))
         if failures else None,
         **prov)
+
+
+# --- the locator, as a reading aid --------------------------------------
+
+
+#: Every section the locator can find, with what a reader gets from each and how
+#: often it was found. Measured 2026-09-12 over 20 consecutive DEFM14A filings.
+#:
+#: This is the half of the proxy reader that **shipped**. The extraction was
+#: measured at 62% per figure and declined -- see docs/build-spec.md -- but the
+#: locator is free, deterministic, and puts a reader on the right passage of a
+#: 1.26-million-character document every time.
+SECTION_GUIDE: Final[dict[str, tuple[str, str]]] = {
+    "prospective_financial": (
+        "15/15 takeouts",
+        "management's projected years. The only forward estimate anywhere in "
+        "this system, and the one section that is reliably where it says it is",
+    ),
+    "merger_consideration": (
+        "18/20 documents",
+        "what one share receives. Anchored on the money clause, not a heading: "
+        "'Merger Consideration' is a defined term that matches 22 times in a "
+        "real proxy and every occurrence is prose",
+    ),
+    "premium_statement": (
+        "16/20 documents",
+        "the premium the board is justifying. Anchored on the premium sentence, "
+        "because the Premiums Paid Analysis heading contains this deal's own "
+        "premium zero times in 13 -- that table is other transactions",
+    ),
+    "fairness_opinion": (
+        "unmeasured",
+        "the banker's methodology and comparables. Present, and its coverage "
+        "was never measured -- so it is offered, not relied on",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Located:
+    """Every section found in one document, and where to open it."""
+
+    accession: str
+    cik: str
+    company: str
+    form: str
+    document: str
+    chars: int
+    sections: dict[str, Section] = dc_field(default_factory=dict)
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        return tuple(n for n in SECTION_GUIDE if n not in self.sections)
+
+    def lines(self) -> list[str]:
+        out = [f"{self.company} -- {self.accession} ({self.form}), "
+               f"{self.chars:,} characters in {self.document}"]
+        for name, (found_in, what) in SECTION_GUIDE.items():
+            got = self.sections.get(name)
+            if got is None:
+                out.append(f"  {name:<24} not found        ({found_in} "
+                           "in the measured set)")
+                continue
+            out.append(f"  {name:<24} chars {got.start:>7,}-{got.end:<7,} "
+                       f"{got.figures:>3} figures, {got.candidates} candidate"
+                       f"{'s' if got.candidates != 1 else ''}")
+            out.append(f"  {'':<24} {got.heading[:86]}")
+        return out
+
+
+def locate_all(
+    accession: str, text: str, *, cik: str = "", company: str = "",
+    form: str = "DEFM14A", document: str = "",
+) -> Located:
+    """Every section the locator can find in one document. No model, no cost.
+
+    This is the shipped half. A reader gets character offsets into the visible text
+    and the heading that was matched, which is enough to open the file at the right
+    place and to see *why* that place rather than one of the other matches.
+    """
+    found: dict[str, Section] = {}
+    for name in SECTION_GUIDE:
+        got = section_window(text, name)
+        if got is not None:
+            found[name] = got
+    return Located(accession=accession, cik=cik, company=company, form=form,
+                   document=document, chars=len(text), sections=found)
+
+
+def upsert_sections(con: Any, located: Located, *, alias: str = "pg") -> int:
+    """Store where to read. Returns rows written.
+
+    Upsert on (accession, section): re-locating a document after a pattern change
+    replaces the window rather than appending a second opinion about where to read.
+    """
+    rows = [
+        (located.accession, located.cik, located.form, name, got.start, got.end,
+         got.heading, got.figures, got.candidates)
+        for name, got in located.sections.items()
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        f"""
+        insert into {alias}.proxy_section
+            (accession, cik, form, section, char_start, char_end, heading,
+             figures, candidates)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict (accession, section) do update set
+            char_start = excluded.char_start,
+            char_end   = excluded.char_end,
+            heading    = excluded.heading,
+            figures    = excluded.figures,
+            candidates = excluded.candidates,
+            located_at = now()
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_projections(con: Any, series: ProjectionSeries, *, cik: str,
+                       alias: str = "pg") -> int:
+    """Store a projections table **only when it passed its own arithmetic**.
+
+    Refuses anything else, and the refusal is the feature. 5 of 15 takeouts
+    produced a coherent table and 76 of 76 values in those five appear verbatim in
+    their filings; the other 10 produced nothing worth keeping. Writing an
+    incoherent table "for reference" would put a forecast that fails arithmetic
+    beside four that do not, and nothing downstream would tell them apart.
+
+    Every row is ``source = 'extracted'``. A consumer joining this to XBRL is
+    joining a forecast to a fact, and the column is there so that cannot happen by
+    accident.
+    """
+    if not series.usable:
+        raise ValueError(
+            f"{series.accession}: refusing to store a {series.reason!r} series"
+            + (f" (fails: {', '.join(series.failures)})" if series.failures
+               else "")
+            + ". Only a table that passes check_projections is stored -- see "
+              "sql/013_proxy_sections.sql."
+        )
+    rows = [
+        (series.accession, cik, year.fiscal_year,
+         year.values.get("revenue"), year.values.get("ebitda"),
+         year.values.get("ebit"), year.values.get("net_income"),
+         year.values.get("free_cash_flow"), year.values.get("capex"),
+         series.units, series.scenario or "", series.quote,
+         series.section_start, series.provider, series.model,
+         series.prompt_version)
+        for year in series.years
+    ]
+    con.executemany(
+        f"""
+        insert into {alias}.proxy_projection
+            (accession, cik, fiscal_year, revenue, ebitda, ebit, net_income,
+             free_cash_flow, capex, units, scenario, quote, section_start,
+             provider, model, prompt_version)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict (accession, fiscal_year, scenario, prompt_version)
+        do update set
+            revenue = excluded.revenue, ebitda = excluded.ebitda,
+            ebit = excluded.ebit, net_income = excluded.net_income,
+            free_cash_flow = excluded.free_cash_flow, capex = excluded.capex,
+            units = excluded.units, quote = excluded.quote,
+            extracted_at = now()
+        """,
+        rows,
+    )
+    return len(rows)

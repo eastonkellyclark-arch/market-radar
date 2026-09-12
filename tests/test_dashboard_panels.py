@@ -16,7 +16,7 @@ import pytest
 from marketradar import digest as digest_mod
 from marketradar.dashboard import panels, shell
 from marketradar.screens import volatility
-from conftest import COMPS_SETS, DCF_ROWS
+from conftest import COMPS_SETS, DCF_ROWS, PROXY_ROWS
 
 D3, D4 = date(2026, 9, 3), date(2026, 9, 4)
 
@@ -402,3 +402,81 @@ def test_an_empty_dcf_panel_says_what_to_run() -> None:
     html = panels.dcf_html([], {}, None)
     assert "mr dcf" in html
     assert "waiting" in html
+
+
+# --- U16: proxy sections ------------------------------------------------
+
+
+def flat(html: str) -> str:
+    """Whitespace-collapsed, because the source wraps and a reader does not.
+
+    Asserting on raw HTML made two of these fail on an f-string line break rather
+    than on missing content -- a test that is sensitive to source formatting is
+    testing the formatter.
+    """
+    import re as _re
+
+    return _re.sub(r"\s+", " ", html)
+
+
+def test_the_proxy_panel_reports_sections_and_not_figures() -> None:
+    """**The distinction the panel exists for.** The locator shipped and the
+    extraction was measured at 62% per figure and declined, so a panel that led
+    with extracted numbers would advertise the half that was rejected.
+    """
+    html = panels.proxy_html(PROXY_ROWS["rows"], PROXY_ROWS["stats"])
+    # Offsets and headings, which is what a reader needs to open the file.
+    assert "362,171" in html
+    assert "1,094,646" in html
+    # And the decline is stated where the sections are, not in an appendix.
+    text = flat(html)
+    assert "62% across 45 cells" in text
+    assert "The locator shipped and the extraction did not" in text
+    assert "not on better prompting" in text
+
+
+def test_the_proxy_panel_states_the_population_argument() -> None:
+    """It is the stronger half of the decline and prompting cannot touch it:
+    proxies exist only for companies being acquired."""
+    html = panels.proxy_html(PROXY_ROWS["rows"], PROXY_ROWS["stats"])
+    text = flat(html)
+    assert "proxies exist only for companies being acquired" in text
+    assert "2,564 valued filers" in text
+    assert "under 20% of valuations" in text
+
+
+def test_a_missing_section_is_shown_as_missing() -> None:
+    """Varex has no fairness-opinion window. A blank cell is the honest rendering;
+    a panel that only listed what it found would read as full coverage."""
+    html = panels.proxy_html(PROXY_ROWS["rows"], PROXY_ROWS["stats"])
+    varex = html.split("Varex Imaging Corp", 1)[1].split("</tr>", 1)[0]
+    assert "--" in varex, "the absent section is not marked"
+
+
+def test_the_panel_explains_why_density_chose_the_window() -> None:
+    """In a real proxy the same heading matches in the table of contents, the
+    body, the tax discussion and the appended merger agreement."""
+    html = panels.proxy_html(PROXY_ROWS["rows"], PROXY_ROWS["stats"])
+    text = flat(html)
+    assert "table of contents" in text
+    assert "annex" in text
+
+
+def test_the_panel_says_projections_are_gated_by_arithmetic() -> None:
+    """The one extracted field that survived, and only because a table can be
+    checked against itself without knowing the right answer."""
+    html = panels.proxy_html(PROXY_ROWS["rows"], PROXY_ROWS["stats"])
+    text = flat(html)
+    assert "without knowing the right answer" in text
+    assert "incoherent" in text
+    assert "76 of 76 values" in text
+    assert "refused" in text
+    # And the forecast/fact distinction is on the page.
+    assert "source = 'extracted'" in html
+    assert "forecast" in html and "fact" in html
+
+
+def test_an_empty_proxy_panel_says_it_costs_nothing() -> None:
+    html = panels.proxy_html([], {})
+    assert "mr proxy" in html
+    assert "costs nothing" in html
