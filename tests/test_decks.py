@@ -253,9 +253,23 @@ def test_the_deck_module_is_unreachable_from_a_workflow() -> None:
     assert commands, "no `uv run mr` commands found; check the regex"
     assert "decks" not in commands, (
         f"a workflow runs `mr decks`: {sorted(set(commands))}")
+
+    # `tests.yml` is the one workflow allowed to install the group, and it must:
+    # 15 tests in this file are the only thing standing between a deck and a slide
+    # with no provenance on it, and a guard that silently skips on the runner is
+    # not a guard. Same resolution as setup-node for the DOM suite.
+    #
+    # Every *data* workflow must not, because that is where the dependency would
+    # become a runtime cost nobody decided to pay.
     for path in workflows:
         text = path.read_text(encoding="utf-8")
-        assert "--group decks" not in text, f"{path.name} installs the decks group"
+        if path.name == "tests.yml":
+            assert "--group decks" in text, (
+                "tests.yml does not install the decks group, so every test in "
+                "this file skips in CI")
+            continue
+        assert "--group decks" not in text, (
+            f"{path.name} is a data workflow and installs the decks group")
 
 
 def test_no_src_module_outside_decks_imports_pptx() -> None:
