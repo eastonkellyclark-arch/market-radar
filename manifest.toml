@@ -144,7 +144,15 @@ all = { location = "macro_series", backend = "supabase" }
 2022 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2022.parquet", backend = "github_release" }
 2023 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2023.parquet", backend = "github_release" }
 2024 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2024.parquet", backend = "github_release" }
-2025 = { location = "https://github.com/eastonkellyclark-arch/market-radar/releases/download/form5500/form5500_sponsors_2025.parquet", backend = "github_release" }
+# 2025 was declared here and never built, and `mr manifest --verify` is what
+# found it. Removed rather than left pointing at a 404: plan-year filings lag the
+# plan year by about eighteen months, so 2025 is genuinely incomplete -- it held
+# roughly a third of 2024's filings while still being filed. A consumer asking for
+# it now gets UnknownDatasetError, which says "no data for that year yet"; a
+# declared URL says "here it is" and then 404s mid-read.
+#
+# Declare the partition when the data exists. An aspirational entry is a
+# hardcoded location with extra steps.
 
 [sec_filers]
 # Point-in-time filer universe: one row per CIK with the window it filed across,

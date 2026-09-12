@@ -400,7 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="deliberately publish stale data; must exit non-zero",
     )
 
-    sub.add_parser("manifest", help="show dataset locations and engine capabilities")
+    p_manifest = sub.add_parser(
+        "manifest", help="show dataset locations and engine capabilities")
+    p_manifest.add_argument(
+        "--verify", action="store_true",
+        help="check that every declared location actually holds something. "
+             "Exits non-zero if any does not, so it works as a gate")
 
     p_migrate = sub.add_parser("migrate", help="apply SQL migrations to Supabase")
     p_migrate.add_argument(
@@ -410,8 +415,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _cmd_manifest() -> int:
-    """Works offline, with no credentials. Useful as a first smoke test."""
+def _cmd_manifest(args: argparse.Namespace | None = None) -> int:
+    """Works offline, with no credentials. Useful as a first smoke test.
+
+    ``--verify`` is the part that needs the network, and it is the check this
+    module went years without: whether every declared location actually holds
+    something.
+
+    **Found on its first run, 2026-09-12:** all 30 ``xbrl_fundamentals``
+    partitions, three ``form5500_sponsors`` years and ``sec_filers/all`` pointed
+    at Release assets that did not exist, and one partition was declared for a
+    year that had never been built. Nothing had ever failed, because every
+    consumer read a local cache instead. This module exists so that nothing
+    hardcodes a location -- and a declared location nobody checks is the same
+    silent-guard pattern one level up.
+    """
     from marketradar import manifest, storage
 
     print(f"manifest: {manifest.manifest_path()}")
@@ -429,6 +447,19 @@ def _cmd_manifest() -> int:
     print("\nengine:")
     for key, value in caps.items():
         print(f"  {key:<16} {value}")
+
+    if args is not None and getattr(args, "verify", False):
+        print()
+        results = manifest.verify_all(con=storage.connect())
+        for line in manifest.verify_lines(results):
+            print(line)
+        broken = [r for r in results if r.broken]
+        if broken:
+            # Non-zero on purpose, so this is a gate rather than a report
+            # somebody reads when they remember to.
+            print(f"\nmr manifest: {len(broken)} declared location(s) hold "
+                  "nothing", file=sys.stderr)
+            return EXIT_ERROR
     return EXIT_OK
 
 
@@ -2123,7 +2154,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     if args.command == "manifest":
-        return _cmd_manifest()
+        if getattr(args, "verify", False):
+            load_dotenv()
+        return _cmd_manifest(args)
 
     if args.command == "prices":
         load_dotenv()
