@@ -371,9 +371,13 @@ def test_every_panel_script_registers_a_binder_and_the_runtime_runs_them(
     markup that declared them stayed byte-identical.
     """
     load = step(report, "load")
-    assert load["binders"] == 4, (
-        f"{load['binders']} binders registered; expected screens, feed, deals "
-        "and private"
+    # A literal on purpose, and it has to be bumped deliberately. The value of
+    # this test is that adding a script without wiring it -- or wiring one twice
+    # -- moves this number, which a count derived from the scripts themselves
+    # could never notice.
+    assert load["binders"] == 5, (
+        f"{load['binders']} binders registered; expected screens, feed, deals, "
+        "private and dcf"
     )
     assert load["hasShowPanel"], "no runtime: the binders have no consumer"
     # A binder having *run* is the part that matters, and the proof is that
