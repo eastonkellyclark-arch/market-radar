@@ -315,58 +315,116 @@ def test_no_upsert_goes_through_duckdbs_postgres_insert_path() -> None:
         executemany, WITH ON CONFLICT    FAILED -- COPY, id null
         single execute, WITH ON CONFLICT FAILED -- COPY, id null
 
-    The extension does not implement ON CONFLICT, so it falls back to a plain COPY
-    of *every* column -- discarding the column list and every default. On a table
-    with `id bigserial primary key` that fails loudly, which is the lucky case: it
-    is how this was found, after `mr proxy` reported "3 documents located" and wrote
-    **zero rows** three times, and `proxy_section` and `proxy_projection` turned out
-    never to have written anything at all.
+    The extension does not implement ON CONFLICT, so it falls back to a plain COPY of
+    *every* column -- discarding the column list and every default. On a table with
+    `id bigserial primary key` that fails loudly, which is the lucky case: it is how
+    this was found, after `mr proxy` reported "3 documents located" and wrote **zero
+    rows** three times, and `proxy_section` and `proxy_projection` turned out never to
+    have written anything at all.
 
     The unlucky case is a table whose columns are all nullable with no serial key.
     There the COPY *succeeds* and the upsert silently becomes an append -- duplicate
     rows where an update was intended, and nothing anywhere to say so.
 
-    So: an upsert against Postgres goes through `postgres_execute`, which sends the
-    SQL intact. This scan is line-based and deliberately crude; the thing it has to
-    catch is a literal `on conflict` in a string handed to `con.execute`.
+    **Structural, not a line window, and that is the second thing this guard has had
+    to learn.** The first version searched the window for the bare word
+    `postgres_execute`, and the comment in `sec_trading_symbols.load` explaining why
+    it uses `postgres_execute` satisfied the check -- so renaming the actual call left
+    the test green. Tightened to require the call shape, it then fired on correct
+    code: extracting the statement into `upsert_statement()` put the SQL more than
+    sixty lines from the call that sends it. A window assumes a statement sits near
+    its call, which stops being true the moment a statement gets a name -- and naming
+    it was right, because it is what let a test read the SQL instead of the source
+    text.
+
+    So the rule is now what it always meant. SQL containing ON CONFLICT must *reach*
+    `postgres_execute`: either the function holding it calls that directly, or it is
+    a builder whose return value every caller passes on. Widening the window instead
+    would have bought a pass today and hidden the next real one.
     """
+
+    def mentions_postgres_execute(node: ast.AST) -> bool:
+        """A `postgres_execute` **call**, not the words. The documentation that
+        explains why the call exists must not be able to satisfy the check."""
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            for arg in sub.args:
+                # f-strings included: every real call interpolates the alias, so
+                # checking only ast.Constant misses all of them. The literal parts
+                # are what carry the call shape.
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    parts = [arg.value]
+                elif isinstance(arg, ast.JoinedStr):
+                    parts = [v.value for v in arg.values
+                             if isinstance(v, ast.Constant)
+                             and isinstance(v.value, str)]
+                else:
+                    continue
+                # The call shape, not the bare word -- prose explaining why the
+                # call uses postgres_execute must not satisfy the check.
+                if any("postgres_execute('" in t or "postgres_execute({" in t
+                       for t in parts):
+                    return True
+            if isinstance(sub.func, ast.Attribute) and \
+                    sub.func.attr == "postgres_execute":
+                return True
+        return False
+
+    def holds_on_conflict(node: ast.AST) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str) \
+                    and "on conflict" in sub.value.lower():
+                return True
+        return False
+
     offenders: list[str] = []
     for path in sorted(SRC.rglob("*.py")):
-        lines = path.read_text(encoding="utf-8").splitlines()
-        for i, line in enumerate(lines):
-            if "on conflict" not in line.lower():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:                                   # not ours to judge
+            continue
+        funcs = [n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        # Builders: they hold the SQL but send nothing themselves. Their callers are
+        # where the obligation lands.
+        builders = {f.name for f in funcs
+                    if holds_on_conflict(f) and not mentions_postgres_execute(f)}
+        for func in funcs:
+            if not holds_on_conflict(func):
                 continue
-            stripped = line.lstrip()
-            # Only SQL inside a string literal counts. Prose that names the clause
-            # -- a docstring explaining why a natural key is what it is, a comment
-            # above the call -- is documentation, and flagging it would train the
-            # next person to delete the explanation rather than fix the code.
-            if not stripped.startswith(('"', "'", 'f"', "f'")):
+            if mentions_postgres_execute(func):
                 continue
-            if "`" in line:
-                continue
-            # The statement is assembled over many lines and the mechanism is
-            # whichever call wraps it, so the window has to reach the enclosing
-            # call rather than a fixed few lines.
-            window = lines[max(0, i - 60):i + 20]
-            # The *call*, not a mention of it. A first version searched the window
-            # for the bare word, and the comment in `sec_trading_symbols.load`
-            # explaining why it uses `postgres_execute` satisfied the check -- so
-            # renaming the actual call left the test green. A guard that passes on
-            # its own documentation is the pattern this file exists to catch,
-            # found by mutating the call and watching nothing happen.
-            if any(
-                ("postgres_execute('" in w or 'postgres_execute({' in w)
-                and "`" not in w
-                for w in window
-            ):
+            if func.name in builders:
+                # A builder is fine in itself; every *caller* must send it through.
+                users = [
+                    other for other in funcs
+                    if other is not func and any(
+                        isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                        and c.func.id == func.name
+                        for c in ast.walk(other))
+                ]
+                if not users:
+                    offenders.append(
+                        f"{path.relative_to(SRC.parent.parent)}:{func.lineno}: "
+                        f"{func.name}() builds an upsert nothing sends")
+                for user in users:
+                    if not mentions_postgres_execute(user):
+                        offenders.append(
+                            f"{path.relative_to(SRC.parent.parent)}:{user.lineno}: "
+                            f"{user.name}() uses {func.name}() without "
+                            "postgres_execute")
                 continue
             # A local DuckDB table is fine -- the extension is not involved.
-            if any(t in window for t in ("create temp table", "_comps_", "_dcf_")):
+            body = ast.get_source_segment(
+                path.read_text(encoding="utf-8"), func) or ""
+            if any(t in body for t in ("create temp table", "_comps_", "_dcf_")):
                 continue
             offenders.append(
-                f"{path.relative_to(SRC.parent.parent)}:{i + 1}: "
-                f"{line.strip()[:70]}")
+                f"{path.relative_to(SRC.parent.parent)}:{func.lineno}: "
+                f"{func.name}() holds an upsert and does not send it through "
+                "postgres_execute")
+
     assert not offenders, (
         "an upsert is going through DuckDB's Postgres insert path, which turns "
         "ON CONFLICT into a COPY of every column:\n  "

@@ -223,3 +223,84 @@ def test_the_report_surfaces_recycling() -> None:
     text = "\n".join(report.lines())
     assert "more than one CIK" in text
     assert "DUP" in text
+
+
+# --- the route reaching the row -----------------------------------------
+
+
+def test_the_route_is_written_to_the_row_not_a_module_constant() -> None:
+    """**The defect this section exists for, found by measuring rather than by
+    reading.**
+
+    ``load`` interpolated a module-level ``SOURCE`` string, so all 138 symbols the
+    prose route had recovered were stored as ``dei:TradingSymbol``. The route was
+    computed, carried through ``collapse``, attached to the range -- and dropped at
+    the write. Every test passed, because nothing could see the statement.
+
+    Same rule as the provider and model on an LLM-produced row and the resolved tag
+    on a fundamentals row: provenance that does not reach the row does not exist.
+    """
+    prose = sym.collapse([obs("0000000001", "LNKD", "2012-01-01", route="prose"),
+                          obs("0000000001", "LNKD", "2016-05-01", route="prose")])[0]
+    tag = sym.collapse([obs("0000000002", "TWTR", "2019-02-01", route="tag")])[0]
+
+    assert sym.SOURCE["prose"] in sym.row_values(prose)
+    assert sym.SOURCE["tag"] not in sym.row_values(prose)
+    assert sym.SOURCE["tag"] in sym.row_values(tag)
+
+
+def test_both_routes_on_one_range_are_stored_as_both() -> None:
+    """A symbol confirmed by the tag *and* the prose is stronger evidence than
+    either alone, and collapsing it to one route throws that away."""
+    both = sym.collapse([obs("0000000003", "DOW", "2016-01-01", route="prose"),
+                         obs("0000000003", "DOW", "2021-01-01", route="tag")])[0]
+    assert sym.source_of(both) == sym.SOURCE["prose+tag"]
+
+
+def test_an_unknown_route_raises_rather_than_inheriting_a_label() -> None:
+    """A default is precisely what caused the defect: the row inherited a label it
+    had not earned and read plausibly. A new route must stop the load."""
+    import dataclasses
+
+    rng = dataclasses.replace(
+        sym.collapse([obs("0000000004", "AAA", "2020-01-01")])[0],
+        routes=("semantic-guess",))
+    try:
+        sym.source_of(rng)
+    except sym.SymbolError as exc:
+        assert "semantic-guess" in str(exc)
+    else:
+        raise AssertionError("an unrecognised route was given a label anyway")
+
+
+def test_every_stored_label_is_allowed_by_the_table() -> None:
+    """The Python labels and the CHECK constraint are two statements of the same
+    list, and a label Python can produce but Postgres rejects would fail the whole
+    batch at the end of a 45-minute sweep."""
+    import re as _re
+
+    sql = Path("sql/015_ticker_history_route.sql").read_text(encoding="utf-8")
+    allowed = set(_re.findall(r"'([^']+)'", sql.split("check (source in (")[1]))
+    assert set(sym.SOURCE.values()) <= allowed, (
+        f"labels Python can write but the table rejects: "
+        f"{set(sym.SOURCE.values()) - allowed}")
+
+
+def test_the_conflict_clause_widens_the_route_like_the_bounds() -> None:
+    """A row first recovered by the tag and later confirmed in prose must end up
+    saying both. Leaving ``source`` out of the update would leave it claiming the tag
+    only -- the same silent narrowing as an upsert that reset the bounds instead of
+    extending them.
+
+    Reads the statement the loader builds, not the module's source text. The first
+    version of this test read the source, and a deliberately broken mutation passed
+    it: the clause was still *present* in the file while no longer reaching the SQL.
+    """
+    stmt = sym.upsert_statement("('x')")
+    update = stmt.split("do update set")[1]
+    for column, widening in (("first_seen", "least"), ("last_seen", "greatest"),
+                             ("filings", "+ excluded.filings"),
+                             ("source", "case when")):
+        assert f"{column} " in update, f"{column} is not widened on conflict"
+        assert widening in update, f"{column} does not widen, it replaces"
+    assert sym.SOURCE["prose+tag"] in update

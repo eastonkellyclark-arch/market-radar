@@ -50,7 +50,19 @@ from marketradar.freshness import assert_fresh
 log = logging.getLogger(__name__)
 
 DATASET: Final[str] = "company_ticker_history"
-SOURCE: Final[str] = "dei:TradingSymbol"
+
+#: How a row's symbol was read, as it is stored. **Not a module constant any more,
+#: and that was a real defect**: `load` wrote `SOURCE` for every row, so every
+#: symbol recovered from prose was labelled as a cover-page tag. The two are not
+#: interchangeable evidence -- the tag is unambiguous and the prose is a regex
+#: measured at 7 of 8 -- and the whole reason the route is computed is so a consumer
+#: can tell them apart. A figure's provenance has to reach the row or it does not
+#: exist; the same rule as the provider and model on every LLM-produced row.
+SOURCE: Final[dict[str, str]] = {
+    "tag": "dei:TradingSymbol",
+    "prose": "cover-page prose",
+    "prose+tag": "dei:TradingSymbol and cover-page prose",
+}
 
 #: Rows per round trip. 500, the same as `upsert_corporate_actions`, for the same
 #: reason: one round trip per row does not finish at this scale.
@@ -406,6 +418,80 @@ def collapse(observations: Iterable[Observation]) -> list[SymbolRange]:
     return out
 
 
+def source_of(rng: "SymbolRange") -> str:
+    """The stored label for a range's route(s).
+
+    Raises on a route it does not know rather than falling back to the tag label.
+    A silent default here is exactly what the old module constant was, and it
+    mislabelled every prose row -- so an unrecognised route is a programming error
+    that should stop the load, not a row that reads plausibly and is wrong.
+    """
+    key = "+".join(sorted(set(rng.routes)))
+    if key not in SOURCE:
+        raise SymbolError(
+            f"no stored label for route(s) {key!r}. Add it to SOURCE rather than "
+            "letting the row inherit a label it did not earn."
+        )
+    return SOURCE[key]
+
+
+def _lit_both() -> str:
+    """The both-routes label as a SQL literal, for the conflict clause."""
+    return "'" + SOURCE["prose+tag"].replace("'", "''") + "'"
+
+
+def row_values(rng: "SymbolRange") -> str:
+    """One range as the SQL tuple that reaches the table.
+
+    A named function rather than an inline comprehension so a test can read what is
+    actually written. That matters here specifically: the route was computed and
+    then silently dropped at this exact point, and the defect was invisible in every
+    test because nothing could see the statement.
+    """
+    def lit(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    return (f"({lit(rng.cik)}, {lit(rng.ticker)}, "
+            f"{lit(rng.exchange) if rng.exchange else 'NULL'}, "
+            f"date {lit(rng.first_seen)}, date {lit(rng.last_seen)}, "
+            f"{int(rng.filings)}, {lit(source_of(rng))})")
+
+
+def upsert_statement(values: str) -> str:
+    """The upsert, as one string a test can read.
+
+    Built by a named function rather than inline, because the clause that was
+    missing from it could not be seen from outside. Asserting on the module's own
+    source text would pass on a commented-out clause; asserting on this cannot.
+
+    Every column the upsert *widens* rather than replaces is here for the same
+    reason: a second pass that observes an earlier filing must extend the range
+    backwards, add to the filing count, and add to the evidence -- never reset any
+    of the three.
+    """
+    return (
+        "insert into company_ticker_history "
+        "(cik, ticker, exchange, first_seen, last_seen, filings, source) "
+        f"values {values} "
+        "on conflict (cik, ticker) do update set "
+        "first_seen = least(company_ticker_history.first_seen, "
+        "                   excluded.first_seen), "
+        "last_seen  = greatest(company_ticker_history.last_seen, "
+        "                      excluded.last_seen), "
+        "filings    = company_ticker_history.filings "
+        "             + excluded.filings, "
+        "exchange   = coalesce(excluded.exchange, "
+        "                      company_ticker_history.exchange), "
+        # Widened, like the bounds. A row first seen by the tag and later confirmed
+        # in prose is evidenced by both, and saying so is the point of storing the
+        # route at all.
+        "source     = case when company_ticker_history.source = excluded.source "
+        "                  then excluded.source "
+        f"                  else {_lit_both()} end, "
+        "updated_at = now()"
+    )
+
+
 def load(report: SweepReport, con: Any, *, alias: str = "pg",
          min_rows: int = 1) -> Any:
     """Upsert the recovered ranges and assert the result is real.
@@ -427,37 +513,12 @@ def load(report: SweepReport, con: Any, *, alias: str = "pg",
     # row does not finish -- the same lesson `upsert_corporate_actions` learned,
     # where sequential round trips reported success having written a tenth of what
     # they attempted.
-    def lit(value: Any) -> str:
-        return "'" + str(value).replace("'", "''") + "'"
-
     written = 0
     for start in range(0, len(report.ranges), BATCH):
         batch = report.ranges[start:start + BATCH]
-        values = ", ".join(
-            f"({lit(r.cik)}, {lit(r.ticker)}, "
-            f"{lit(r.exchange) if r.exchange else 'NULL'}, "
-            f"date {lit(r.first_seen)}, date {lit(r.last_seen)}, "
-            f"{int(r.filings)}, {lit(SOURCE)})"
-            for r in batch
-        )
-        con.execute(
-            f"CALL postgres_execute('{alias}', ?)",
-            [
-                "insert into company_ticker_history "
-                "(cik, ticker, exchange, first_seen, last_seen, filings, source) "
-                f"values {values} "
-                "on conflict (cik, ticker) do update set "
-                "first_seen = least(company_ticker_history.first_seen, "
-                "                   excluded.first_seen), "
-                "last_seen  = greatest(company_ticker_history.last_seen, "
-                "                      excluded.last_seen), "
-                "filings    = company_ticker_history.filings "
-                "             + excluded.filings, "
-                "exchange   = coalesce(excluded.exchange, "
-                "                      company_ticker_history.exchange), "
-                "updated_at = now()"
-            ],
-        )
+        values = ", ".join(row_values(r) for r in batch)
+        con.execute(f"CALL postgres_execute('{alias}', ?)",
+                    [upsert_statement(values)])
         written += len(batch)
     rel = con.sql(
         f"select cik, ticker, first_seen, last_seen, filings "
