@@ -72,6 +72,8 @@ SAMPLE_PER_CIK: Final[int] = 3
 #: and hyphen that share classes use. Deliberately strict: this column is joined
 #: against price data, where a malformed symbol matches nothing rather than
 #: erroring.
+#: Note what this does *not* admit: a slash. The tag capture deliberately takes
+#: ``/`` so a sentinel arrives intact, and this is what then refuses it.
 SYMBOL: Final[re.Pattern[str]] = re.compile(r"^[A-Z][A-Z0-9.\-]{0,8}$")
 
 #: The cover-page tag, in the two shapes filers' HTML uses. Matched against the
@@ -79,10 +81,51 @@ SYMBOL: Final[re.Pattern[str]] = re.compile(r"^[A-Z][A-Z0-9.\-]{0,8}$")
 #: in an attribute-bearing span and the text extraction drops it — measured: the
 #: visible text of all four test filings did *not* contain the symbol while the
 #: tag did.
+#: The capture class includes ``/`` so that ``N/A`` is seen *whole* and rejected.
+#: Without it the class stopped at the slash and the value came back as ``N`` --
+#: which passes every validity check, because N is a real NYSE ticker. A sentinel
+#: truncated into a valid symbol is the worst shape available here: it would have
+#: mapped a company with no listing to somebody else's stock.
 TAG: Final[re.Pattern[str]] = re.compile(
-    r"""(?:name|id)=["'][^"']*TradingSymbol[^"']*["'][^>]*>\s*([A-Za-z0-9.\-]{1,9})"""
-    r"""|TradingSymbol[^>]{0,400}?>\s*([A-Za-z0-9.\-]{1,9})\s*<""",
+    r"""(?:name|id)=["'][^"']*TradingSymbol[^"']*["'][^>]*>\s*([A-Za-z0-9./\-]{1,12})"""
+    r"""|TradingSymbol[^>]{0,400}?>\s*([A-Za-z0-9./\-]{1,12})\s*<""",
     re.IGNORECASE | re.DOTALL,
+)
+
+#: A symbol inside the pattern, where a dot counts **only when a share-class
+#: letter follows it**.
+#:
+#: That lookahead is the whole trick. A first version used ``[A-Z.\-]*`` and scored
+#: **1 of 6** because the boilerplate ends the sentence right after the quoted
+#: symbol -- "under the symbol 'WFM.'" -- so the class character swallowed the full
+#: stop and every answer came back one character long. With the lookahead it is
+#: 7 of 8. ``BRK.A`` still parses; ``WFM.`` does not.
+_SYM: Final[str] = r"([A-Z](?:[A-Z0-9\-]|\.(?=[A-Z]))*)"
+
+#: The symbol as **prose**, for filings that predate the cover-page XBRL mandate.
+#:
+#: **Why this exists.** The `dei:TradingSymbol` tag is post-2019 only, and the
+#: recovery rate shows the cliff exactly: 1 row in 2017 against 40 in 2019 and 62
+#: in 2020. A decade of takeouts sits on the wrong side of it, and that is the
+#: population deal multiples and the filer universe care about.
+#:
+#: Two other routes were tried and rejected first, measured on LinkedIn and Whole
+#: Foods: **Form 25-NSE and the contemporaneous 8-K Item 3.01 do not carry the
+#: symbol at all**, in raw HTML or visible text. What does carry it is the 10-K's
+#: own listing sentence, which is legal boilerplate -- "listed on the New York
+#: Stock Exchange under the symbol 'LNKD'".
+#:
+#: Deterministic, and that matters: the extraction half of the proxy reader was
+#: measured at 62% and declined, so a second field needing a model would be
+#: declined on the same evidence. These are regexes. 7 of 8 on a hand-picked set
+#: spanning 2016-2023 -- LinkedIn, Whole Foods, Twitter, Monsanto, Rockwell
+#: Collins, Activision, VMware; the miss is Time Warner, which words it
+#: differently and is a `no_symbol` rather than a wrong answer.
+PROSE: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"under\s+the\s+(?:ticker\s+|trading\s+)?symbols?\s*"
+               r"[:“‘\"']?\s*" + _SYM),
+    re.compile(r"(?:ticker|trading)\s+symbol\s*[:“‘\"']?\s*" + _SYM),
+    re.compile(r"symbol\s*[:“‘\"']\s*" + _SYM),
 )
 
 #: Tokens a cover page sometimes puts where the symbol goes when there is none.
@@ -107,6 +150,9 @@ class Observation:
     form: str
     accession: str
     exchange: str | None = None
+    #: ``tag`` or ``prose``. Carried because they are different evidence: the XBRL
+    #: tag is unambiguous, the prose is a regex over boilerplate that scores 7 of 8.
+    route: str = "tag"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +165,9 @@ class SymbolRange:
     last_seen: date
     filings: int
     exchange: str | None = None
+    #: Every route that produced this symbol. A range evidenced by both a tag and
+    #: the prose is stronger than one resting on either.
+    routes: tuple[str, ...] = ("tag",)
 
     @property
     def is_point(self) -> bool:
@@ -179,20 +228,40 @@ class SweepReport:
         return out
 
 
-def symbol_from(html: str) -> str | None:
-    """The cover-page trading symbol, or None.
+def symbol_from(html: str) -> tuple[str, str] | None:
+    """``(symbol, how it was found)``, or None.
 
-    Parsed from the raw document rather than the visible text. Measured on four
-    filings from companies known to have been acquired: the *visible text* of all
-    four lacked the symbol while the tag carried it, because the fact lives in an
-    XBRL span the text extraction drops.
+    **The tag first, then the prose, and the route is returned.** The XBRL tag is
+    unambiguous and exists only after the 2019 cover-page mandate; the prose
+    sentence is boilerplate and spans the whole decade. Trying the tag first means
+    a post-2019 filing never depends on a regex over prose, and returning which
+    route answered means a consumer can tell a tagged symbol from a parsed one --
+    the same reason the resolved XBRL tag rides on every fundamentals row.
+
+    The tag is matched against the **raw** document and the prose against the
+    **visible text**, which is not a detail: measured on four known-acquired
+    companies, the visible text lacked the symbol entirely while the tag carried
+    it, because the fact lives in an XBRL span the text extraction drops. The prose
+    is the other way round -- it is a sentence, and the raw HTML interleaves it
+    with markup.
     """
     for match in TAG.finditer(html):
         raw = (match.group(1) or match.group(2) or "").strip().upper()
         if not raw or raw in NOT_A_SYMBOL:
             continue
         if SYMBOL.match(raw):
-            return raw
+            return raw, "tag"
+
+    from marketradar.signals.deals import visible
+
+    text = visible(html)
+    for pattern in PROSE:
+        match = pattern.search(text)
+        if not match:
+            continue
+        raw = match.group(1).strip().upper()
+        if raw and raw not in NOT_A_SYMBOL and SYMBOL.match(raw):
+            return raw, "prose"
     return None
 
 
@@ -295,11 +364,12 @@ def fetch(
             except Exception as exc:
                 failed.append((padded, f"{filing['accession']}: {str(exc)[:60]}"))
                 continue
-            ticker = symbol_from(doc.text)
-            if ticker is None:
+            got = symbol_from(doc.text)
+            if got is None:
                 continue
+            ticker, route = got
             observations.append(Observation(
-                cik=padded, ticker=ticker,
+                cik=padded, ticker=ticker, route=route,
                 filed=datetime.strptime(filing["filed"], "%Y-%m-%d").date(),
                 form=filing["form"], accession=filing["accession"]))
             found += 1
@@ -331,7 +401,8 @@ def collapse(observations: Iterable[Observation]) -> list[SymbolRange]:
         out.append(SymbolRange(
             cik=cik, ticker=ticker, first_seen=dates[0], last_seen=dates[-1],
             filings=len(group),
-            exchange=next((o.exchange for o in group if o.exchange), None)))
+            exchange=next((o.exchange for o in group if o.exchange), None),
+            routes=tuple(sorted({o.route for o in group}))))
     return out
 
 

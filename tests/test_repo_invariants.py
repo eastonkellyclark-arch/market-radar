@@ -303,3 +303,100 @@ def test_a_file_written_and_read_back_is_never_a_shared_path() -> None:
         "filename. See tiingo.publish, which published 2023's rows into the "
         "2024 partition this way."
     )
+
+
+def test_no_upsert_goes_through_duckdbs_postgres_insert_path() -> None:
+    """**An ON CONFLICT that DuckDB sends to Postgres silently becomes a COPY.**
+
+    Measured 2026-09-12, by isolating it against `dataset_stats`:
+
+        executemany, no ON CONFLICT      OK
+        single execute, no ON CONFLICT   OK
+        executemany, WITH ON CONFLICT    FAILED -- COPY, id null
+        single execute, WITH ON CONFLICT FAILED -- COPY, id null
+
+    The extension does not implement ON CONFLICT, so it falls back to a plain COPY
+    of *every* column -- discarding the column list and every default. On a table
+    with `id bigserial primary key` that fails loudly, which is the lucky case: it
+    is how this was found, after `mr proxy` reported "3 documents located" and wrote
+    **zero rows** three times, and `proxy_section` and `proxy_projection` turned out
+    never to have written anything at all.
+
+    The unlucky case is a table whose columns are all nullable with no serial key.
+    There the COPY *succeeds* and the upsert silently becomes an append -- duplicate
+    rows where an update was intended, and nothing anywhere to say so.
+
+    So: an upsert against Postgres goes through `postgres_execute`, which sends the
+    SQL intact. This scan is line-based and deliberately crude; the thing it has to
+    catch is a literal `on conflict` in a string handed to `con.execute`.
+    """
+    offenders: list[str] = []
+    for path in sorted(SRC.rglob("*.py")):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines):
+            if "on conflict" not in line.lower():
+                continue
+            stripped = line.lstrip()
+            # Only SQL inside a string literal counts. Prose that names the clause
+            # -- a docstring explaining why a natural key is what it is, a comment
+            # above the call -- is documentation, and flagging it would train the
+            # next person to delete the explanation rather than fix the code.
+            if not stripped.startswith(('"', "'", 'f"', "f'")):
+                continue
+            if "`" in line:
+                continue
+            # The statement is assembled over many lines and the mechanism is
+            # whichever call wraps it, so the window has to reach the enclosing
+            # call rather than a fixed few lines.
+            window = lines[max(0, i - 60):i + 20]
+            # The *call*, not a mention of it. A first version searched the window
+            # for the bare word, and the comment in `sec_trading_symbols.load`
+            # explaining why it uses `postgres_execute` satisfied the check -- so
+            # renaming the actual call left the test green. A guard that passes on
+            # its own documentation is the pattern this file exists to catch,
+            # found by mutating the call and watching nothing happen.
+            if any(
+                ("postgres_execute('" in w or 'postgres_execute({' in w)
+                and "`" not in w
+                for w in window
+            ):
+                continue
+            # A local DuckDB table is fine -- the extension is not involved.
+            if any(t in window for t in ("create temp table", "_comps_", "_dcf_")):
+                continue
+            offenders.append(
+                f"{path.relative_to(SRC.parent.parent)}:{i + 1}: "
+                f"{line.strip()[:70]}")
+    assert not offenders, (
+        "an upsert is going through DuckDB's Postgres insert path, which turns "
+        "ON CONFLICT into a COPY of every column:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nSend it through `CALL postgres_execute('pg', ?)` instead. On a table "
+        "with a serial key this fails loudly; on one without, the upsert silently "
+        "becomes an append."
+    )
+
+
+def test_every_postgres_write_is_counted_not_assumed() -> None:
+    """The other half of the same lesson.
+
+    `upsert_corporate_actions` returned `len(rows)` regardless of outcome and
+    reported complete success having written a tenth of what it attempted. So a
+    write path returns what landed, which means it has to read the table back --
+    and the way to check that cheaply is that every writer in `sources/` either
+    returns a count it measured or asserts freshness on the table afterwards.
+    """
+    missing: list[str] = []
+    for path in sorted((SRC / "sources").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "postgres_execute" not in text:
+            continue
+        if "assert_fresh" in text or "anti join" in text.lower():
+            continue
+        missing.append(str(path.relative_to(SRC.parent.parent)))
+    assert not missing, (
+        "these modules write to Postgres without asserting what landed:\n  "
+        + "\n  ".join(missing)
+        + "\n\nA writer that reports what it attempted is how corporate_actions "
+        "held 365 splits while staging held 3,724."
+    )

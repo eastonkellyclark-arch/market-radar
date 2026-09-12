@@ -113,6 +113,35 @@ manifest, per the rule above. Repo holds code and SQL only. The one exception
 is a small, deliberately chosen set of parser test fixtures — never a bulk
 archive.
 
+**A new invariant is not a test until it has been shown to fail.** Write it,
+then break the thing it guards and watch it go red. If it stays green, it is
+documentation with an `assert` in it.
+
+This is not a counsel of perfection — it is the *only* way this class of defect
+has ever been caught here. Six times now a guard has been green because it was
+not examining what it claimed to:
+
+- the panel test sliced on `data-panel="<id>"`, which a new sidebar made appear
+  twice, so 19 of 20 panels inspected the health panel
+- the shared-path invariant used DOTALL, so its "does the filename vary" regex
+  matched an f-string hundreds of lines away and passed on the very code it was
+  written to catch
+- `tests/test_repo_invariants.py` globbed `sources/*.py` non-recursively, so a
+  source that is a *package* was invisible to all three repo rules
+- `--drop-zips` deleted the reference quarter and the drift test went from
+  passing to **skipped**, silently, in the commit that added a concept
+- the spec-table test compared the doc to the panel map and the probes compared
+  the map to the data, so a panel saying "not built" while its engine ran was
+  invisible to both
+- the ON CONFLICT invariant searched a window for the word `postgres_execute`,
+  and the *comment explaining why the call uses it* satisfied the check —
+  renaming the actual call left the test green
+
+Every one was found by mutating, never by reading. So: break it on purpose, and
+say in the test's docstring what you broke and what it did. A test whose
+docstring records its own mutation is a test the next person can trust without
+repeating the exercise.
+
 **Every pipeline stage ends with a freshness assertion.** Row count and max
 timestamp against expectation, and it must raise — not warn, not log. A job
 that exits green on empty data is the failure mode we care most about. This has
