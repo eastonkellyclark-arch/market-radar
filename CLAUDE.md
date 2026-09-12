@@ -65,6 +65,7 @@ uv run mr screens                   # rebuild screens from local data
 uv run mr digest --dry-run          # render email, don't send
 uv run mr backfill --budget 200     # drain N queue items
 uv run mr xbrl --quarter 2024q1     # normalize one quarter of fundamentals
+uv run mr symbols                   # recover tickers for stopped filers
 ```
 
 Every job runs standalone from CLI. If it only works inside a GitHub Action,
@@ -206,6 +207,13 @@ convention cannot be tested and this can -- a test pins that a padded key finds 
 unpadded CIK. Where a join crosses two stores, **assert a non-zero match count**
 rather than trusting the row count you got: an empty join is the one result that
 looks like a correct answer about the data.
+
+And it recurs hardest *outside* the suite. The fourth occurrence (2026-09-12) was
+in a one-off measurement script, which printed **"0 of 3,744 stopped filers carry
+a recovered ticker"** -- a finding, not an error, and a believable one about a map
+that had just been built. A scratch script is where no test is watching and where
+the numbers get read aloud, so the non-zero assertion belongs *in the script*,
+before the first figure it prints.
 
 **Every screen ends with a funnel.** The exact parallel of the freshness
 assertion on every loader, one step later in the pipeline: `assert_fresh`

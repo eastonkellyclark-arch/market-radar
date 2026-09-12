@@ -90,6 +90,18 @@ def test_prices_has_the_restart_flag() -> None:
     assert build_parser().parse_args(["prices", "--restart"]).restart is True
 
 
+def test_symbols_has_the_restart_flag() -> None:
+    """Same rule, and the symbol sweep is the one it was learned on twice.
+
+    ~15,000 requests over three quarters of an hour, interrupted twice already --
+    once by a kill that I reported as an exit while it ran on for another twenty
+    minutes. A default that discarded the checkpoint would have thrown the whole
+    pass away each time.
+    """
+    assert build_parser().parse_args(["symbols"]).restart is False
+    assert build_parser().parse_args(["symbols", "--restart"]).restart is True
+
+
 def test_selftest_has_the_staleness_injector() -> None:
     args = build_parser().parse_args(["selftest", "--inject-staleness"])
     assert args.inject_staleness is True

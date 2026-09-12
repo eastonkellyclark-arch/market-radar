@@ -192,6 +192,23 @@ def build_parser() -> argparse.ArgumentParser:
                          help="directory holding the fundamentals partitions")
     p_comps.set_defaults(func=_cmd_comps)
 
+    p_symbols = sub.add_parser(
+        "symbols",
+        help="recover the ticker a stopped filer traded under, from its cover pages")
+    p_symbols.add_argument(
+        "--out", default=".cache/xbrl/out", metavar="DIR",
+        help="directory holding the fundamentals partitions, for the filer universe")
+    p_symbols.add_argument(
+        "--chunk", type=int, default=50, metavar="N",
+        help="CIKs per checkpointed chunk (default 50)")
+    p_symbols.add_argument(
+        "--limit", type=int, default=0, metavar="N",
+        help="stop after N chunks; 0 sweeps the whole population")
+    p_symbols.add_argument(
+        "--restart", action="store_true",
+        help="discard the checkpoint and sweep from the beginning")
+    p_symbols.set_defaults(func=_cmd_symbols)
+
     p_xbrl = sub.add_parser(
         "xbrl",
         help="normalize one quarter of SEC fundamentals and report coverage",
@@ -965,6 +982,108 @@ def _comps_rows(con: Any, out_dir: Path) -> dict[str, Any]:
         "funnel": result.funnel.as_dict() if hasattr(result.funnel, "as_dict")
         else None,
     }
+
+
+def _cmd_symbols(args: argparse.Namespace) -> int:
+    """Recover the ticker a stopped filer traded under, from its own cover pages.
+
+    **Why this is a job and not a query.** `company_tickers.json` is a current
+    snapshot and SEC's submissions JSON returns an empty `tickers` array for a
+    delisted company -- checked against Twitter, Activision, VMware and Seagen, all
+    blank. An acquisition target is by definition a company that stopped being
+    listed, so the symbol it traded under is not available from any current-state
+    source and has to be read out of the filings themselves.
+
+    Two routes, tried in that order, and **the route is stored on the row**: the
+    `dei:TradingSymbol` cover-page tag, which is unambiguous and exists only after
+    the 2019 mandate, and the 10-K's own listing sentence, which is boilerplate and
+    covers the decade before it. On the stopped-filer population the prose route
+    carries most of what is recovered, so a column calling all of it a tag would
+    hide the map's weaker half.
+
+    Chunked, checkpointed and resumable by default, per the sweep rule: ~15,000
+    requests at 6/sec is about three quarters of an hour and it will be interrupted.
+    `--restart` is explicit because the default must never be the destructive one.
+    """
+    import httpx
+
+    from marketradar import manifest, storage
+    from marketradar.checkpoint import Checkpoint
+    from marketradar.signals.edgar_rss import Pacer
+    from marketradar.sources import sec_trading_symbols as sym
+    from marketradar.sources.xbrl import filers as filers_mod
+
+    con = storage.connect()
+    glob = (Path(args.out) / COMPS_GLOB).as_posix()
+    con.execute(f"create or replace view xb as select * from read_parquet('{glob}')")
+    quarters = sorted(r.partition for r in manifest.datasets()
+                      if r.dataset == "xbrl_fundamentals")
+    if not quarters:
+        print("mr symbols: no fundamentals partitions declared; run `mr xbrl` first",
+              file=sys.stderr)
+        return EXIT_ERROR
+    filers_mod.build(con, quarters)
+    stopped = filers_mod.stopped_ciks(con)
+    if not stopped:
+        print("mr symbols: the filer universe holds no stopped filers, which is "
+              "the one answer that cannot be right", file=sys.stderr)
+        return EXIT_ERROR
+
+    chunks = [stopped[i:i + args.chunk]
+              for i in range(0, len(stopped), args.chunk)]
+    book = Checkpoint.load_or_create("ticker_history_v2", run_id="stopped-both",
+                                     total_chunks=len(chunks))
+    if args.restart:
+        book.clear()
+    pending = book.pending()
+    if args.limit:
+        pending = pending[:args.limit]
+    print(f"{len(stopped):,} stopped filers in {len(chunks)} chunks; "
+          f"{book.done_count} done, {len(pending)} this run")
+
+    client = httpx.Client(timeout=120, follow_redirects=True)
+    pacer = Pacer(per_second=6.0)
+    routes: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    ranges = none = failed = 0
+    try:
+        for index in pending:
+            report = sym.fetch(chunks[index], client=client, pacer=pacer)
+            if report.ranges:
+                sym.load(report, con, alias=storage.PG_ALIAS)
+            for rng in report.ranges:
+                key = "+".join(sorted(set(rng.routes)))
+                routes[key] = routes.get(key, 0) + 1
+            # Reasons, not just a count. One chunk of an earlier run failed 14 of 50
+            # and the script printed only the number, so whether that was 404s on
+            # pre-2001 document paths or rate limiting was unanswerable afterwards.
+            for _cik, why in report.failed:
+                head = why.split(":", 1)[-1].strip()[:48]
+                reasons[head] = reasons.get(head, 0) + 1
+            ranges += len(report.ranges)
+            none += len(report.no_symbol)
+            failed += len(report.failed)
+            print(f"  chunk {index + 1:>4}/{len(chunks)}  {len(report.ranges):>3} "
+                  f"ranges  {len(report.no_symbol):>3} none  "
+                  f"{len(report.failed):>3} failed  {routes}", flush=True)
+            book.mark_done(index, ciks=len(chunks[index]),
+                           ranges=len(report.ranges),
+                           no_symbol=len(report.no_symbol))
+    finally:
+        client.close()
+
+    print()
+    print(f"{ranges:,} ranges, {none:,} filers with no parsable symbol, "
+          f"{failed:,} failed")
+    print(f"by route: {routes}")
+    if reasons:
+        print("top failure reasons:")
+        for why, n in sorted(reasons.items(), key=lambda kv: -kv[1])[:8]:
+            print(f"  {n:>5,}  {why}")
+    for row in con.execute(
+            f"select * from {storage.PG_ALIAS}.ticker_history_by_route").fetchall():
+        print(f"  {row}")
+    return EXIT_OK
 
 
 def _cmd_comps(args: argparse.Namespace) -> int:
