@@ -46,6 +46,25 @@ def setup(con: duckdb.DuckDBPyConnection, deals: list[tuple],
     """)
     if facts:
         con.executemany("insert into xb values (?, ?, ?, ?, ?, ?)", facts)
+    # **The filer universe, built rather than fallen back to.**
+    #
+    # The screen used to warn and silently use the fundamentals table for identity
+    # when this was absent, and two tests here were passing through that fallback
+    # without saying so. On real data the fallback overcounts confirmed targets by
+    # about 6.5x -- 280 rows against 43 -- so the screen now raises, and a test that
+    # wants the weaker path has to pass `filers=None` and mean it.
+    #
+    # Derived from the same facts, so a fixture cannot drift from what the screen
+    # sees: `last_period` is the newest period the filer reported anything for.
+    con.execute("""
+        create or replace table sec_filers as
+        select cik,
+               max(period_end) as last_period,
+               max(period_end) as last_filed,
+               'stopped'       as status
+        from xb
+        group by cik
+    """)
 
 
 def deal(accession: str, cik: str, company: str, filed: date,
@@ -412,3 +431,37 @@ def test_a_later_deal_filing_by_the_same_target_excludes_the_earlier_one() -> No
     # Only the last one can be the transaction that ended it.
     assert [r.accession for r in res.rows] == ["p-2"]
     assert res.identities.get(dm.KEPT_FILING) == 1
+
+
+# --- the warning that became a failure -----------------------------------
+
+
+def test_a_missing_filer_universe_raises_rather_than_warning() -> None:
+    """**A screen that can warn and still publish is a green run on empty data.**
+
+    This used to log "no filer universe in scope; identity falls back to the
+    fundamentals table, which is narrower" and carry on. On the completed re-sweep
+    the fallback produced **280 usable rows against the universe's 43** -- a 6.5x
+    overcount of confirmed acquisitions -- because "stopped appearing in the loaded
+    quarters" stands in for "stopped filing anything", which counts every company
+    that still files just not 10-Ks.
+
+    The warning was the only thing that said so, and nothing read it. So it raises,
+    and the message says what the number would have been.
+    """
+    con = duckdb.connect()
+    setup(con, [], [])
+    con.execute("drop table sec_filers")
+    with pytest.raises(ValueError, match="6.5x"):
+        dm.screen(con, today=TODAY)
+
+
+def test_the_weaker_test_has_to_be_asked_for(monkeypatch) -> None:
+    """`filers=None` is still allowed -- a caller with no universe available is a
+    real case. It is visible in the call rather than buried in a log, which is the
+    difference that matters."""
+    con = duckdb.connect()
+    setup(con, [], [])
+    con.execute("drop table sec_filers")
+    res = dm.screen(con, filers=None, today=TODAY)
+    assert res.rows == []

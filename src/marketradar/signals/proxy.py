@@ -1536,6 +1536,18 @@ class Located:
         return out
 
 
+def _lit(value: Any) -> str:
+    """A single-quoted SQL literal, or NULL.
+
+    Needed because these upserts send raw SQL to Postgres rather than binding
+    parameters -- see the note in `upsert_sections` on why. Locations and headings
+    come from documents, so escaping is not optional here.
+    """
+    if value is None:
+        return "NULL"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def locate_all(
     accession: str, text: str, *, cik: str = "", company: str = "",
     form: str = "DEFM14A", document: str = "",
@@ -1561,30 +1573,32 @@ def upsert_sections(con: Any, located: Located, *, alias: str = "pg") -> int:
     Upsert on (accession, section): re-locating a document after a pattern change
     replaces the window rather than appending a second opinion about where to read.
     """
-    rows = [
-        (located.accession, located.cik, located.form, name, got.start, got.end,
-         got.heading, got.figures, got.candidates)
-        for name, got in located.sections.items()
-    ]
-    if not rows:
+    # Raw SQL through `postgres_execute`, not a DuckDB insert. The extension
+    # implements `insert ... values` as a COPY and a COPY does not apply column
+    # defaults, so `id bigserial` arrives NULL and every row is rejected. Found
+    # 2026-09-12 when the symbol sweep hit it on its first batch -- these two
+    # upserts had the same bug and had simply never run.
+    if not located.sections:
         return 0
-    con.executemany(
-        f"""
-        insert into {alias}.proxy_section
-            (accession, cik, form, section, char_start, char_end, heading,
-             figures, candidates)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        on conflict (accession, section) do update set
-            char_start = excluded.char_start,
-            char_end   = excluded.char_end,
-            heading    = excluded.heading,
-            figures    = excluded.figures,
-            candidates = excluded.candidates,
-            located_at = now()
-        """,
-        rows,
+    values = ", ".join(
+        f"({_lit(located.accession)}, {_lit(located.cik)}, "
+        f"{_lit(located.form)}, {_lit(name)}, {int(got.start)}, "
+        f"{int(got.end)}, {_lit(got.heading)}, {int(got.figures)}, "
+        f"{int(got.candidates)})"
+        for name, got in located.sections.items()
     )
-    return len(rows)
+    con.execute(
+        f"CALL postgres_execute('{alias}', ?)",
+        [
+            "insert into proxy_section (accession, cik, form, section, "
+            "char_start, char_end, heading, figures, candidates) values "
+            f"{values} on conflict (accession, section) do update set "
+            "char_start = excluded.char_start, char_end = excluded.char_end, "
+            "heading = excluded.heading, figures = excluded.figures, "
+            "candidates = excluded.candidates, located_at = now()"
+        ],
+    )
+    return len(located.sections)
 
 
 def upsert_projections(con: Any, series: ProjectionSeries, *, cik: str,
@@ -1609,31 +1623,36 @@ def upsert_projections(con: Any, series: ProjectionSeries, *, cik: str,
             + ". Only a table that passes check_projections is stored -- see "
               "sql/013_proxy_sections.sql."
         )
-    rows = [
-        (series.accession, cik, year.fiscal_year,
-         year.values.get("revenue"), year.values.get("ebitda"),
-         year.values.get("ebit"), year.values.get("net_income"),
-         year.values.get("free_cash_flow"), year.values.get("capex"),
-         series.units, series.scenario or "", series.quote,
-         series.section_start, series.provider, series.model,
-         series.prompt_version)
+    def num(value: Any) -> str:
+        return "NULL" if value is None else repr(float(value))
+
+    values = ", ".join(
+        f"({_lit(series.accession)}, {_lit(cik)}, {int(year.fiscal_year)}, "
+        f"{num(year.values.get('revenue'))}, "
+        f"{num(year.values.get('ebitda'))}, {num(year.values.get('ebit'))}, "
+        f"{num(year.values.get('net_income'))}, "
+        f"{num(year.values.get('free_cash_flow'))}, "
+        f"{num(year.values.get('capex'))}, "
+        f"{_lit(series.units)}, {_lit(series.scenario or '')}, "
+        f"{_lit(series.quote)}, "
+        f"{int(series.section_start or 0)}, {_lit(series.provider)}, "
+        f"{_lit(series.model)}, {_lit(series.prompt_version)})"
         for year in series.years
-    ]
-    con.executemany(
-        f"""
-        insert into {alias}.proxy_projection
-            (accession, cik, fiscal_year, revenue, ebitda, ebit, net_income,
-             free_cash_flow, capex, units, scenario, quote, section_start,
-             provider, model, prompt_version)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        on conflict (accession, fiscal_year, scenario, prompt_version)
-        do update set
-            revenue = excluded.revenue, ebitda = excluded.ebitda,
-            ebit = excluded.ebit, net_income = excluded.net_income,
-            free_cash_flow = excluded.free_cash_flow, capex = excluded.capex,
-            units = excluded.units, quote = excluded.quote,
-            extracted_at = now()
-        """,
-        rows,
     )
-    return len(rows)
+    con.execute(
+        f"CALL postgres_execute('{alias}', ?)",
+        [
+            "insert into proxy_projection (accession, cik, fiscal_year, revenue, "
+            "ebitda, ebit, net_income, free_cash_flow, capex, units, scenario, "
+            "quote, section_start, provider, model, prompt_version) values "
+            f"{values} "
+            "on conflict (accession, fiscal_year, scenario, prompt_version) "
+            "do update set revenue = excluded.revenue, "
+            "ebitda = excluded.ebitda, ebit = excluded.ebit, "
+            "net_income = excluded.net_income, "
+            "free_cash_flow = excluded.free_cash_flow, capex = excluded.capex, "
+            "units = excluded.units, quote = excluded.quote, "
+            "extracted_at = now()"
+        ],
+    )
+    return len(series.years)

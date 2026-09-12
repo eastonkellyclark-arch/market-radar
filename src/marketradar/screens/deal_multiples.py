@@ -271,6 +271,21 @@ def screen(
     # Identity from the wide table where there is one. `last_period` is the
     # newest fiscal period the filer reported *anything* for, across every form
     # and every SIC.
+    # **This raises rather than warns, and that is a correction.**
+    #
+    # It used to log a warning and fall back to the fundamentals table, where
+    # "stopped appearing in the loaded quarters" stands in for "stopped filing
+    # anything" -- a far weaker identity test that counts companies which still
+    # file, just not 10-Ks. Measured 2026-09-12 over the completed re-sweep: the
+    # fallback produced **280 usable rows against the universe's 43**, a 6.5x
+    # overcount, and the warning was the only thing that said so.
+    #
+    # A screen that can warn and still publish is the same shape as a job exiting
+    # green on empty data: the mechanism was there, nothing acted on it, and the
+    # number downstream stayed plausible. So a caller that names a filers table is
+    # held to it, and a caller that wants the weaker test has to ask for it by
+    # passing `filers=None` -- which is visible in the call rather than buried in a
+    # log nobody reads.
     using_universe = False
     if filers:
         try:
@@ -279,9 +294,14 @@ def screen(
                 "select lpad(cast(cik as varchar), 10, '0') as cik10, "
                 f"last_period, last_filed, status from {filers}")
             using_universe = True
-        except duckdb.Error:
-            log.warning("no filer universe in scope; identity falls back to the "
-                        "fundamentals table, which is narrower")
+        except duckdb.Error as exc:
+            raise ValueError(
+                f"the filer universe {filers!r} is not in scope, and falling back "
+                "to the fundamentals table overcounts confirmed targets by about "
+                "6.5x -- 280 rows against 43, measured 2026-09-12. Build it with "
+                "`filers.build(con, quarters)` first, or pass filers=None to ask "
+                "for the weaker test deliberately."
+            ) from exc
     if not using_universe:
         con.execute(
             "create or replace view dm_filers as "
