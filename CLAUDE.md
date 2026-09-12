@@ -580,8 +580,24 @@ Say which of the two problems it fixes, because they look alike:
   through the filer universe whenever the question is historical. It also makes a
   targeted sweep affordable: 3,744 requests against ~50,000 to find the same
   filings by walking daily indexes.
-- **Survivorship — not fixed, and not fixable from here.** A delisted company
-  still has no prices. Deal multiples gain rows because a multiple is a stated
+- **Survivorship — not fixed, and now measured.** A delisted company still has no
+  prices. Quantified 2026-09-12 after recovering a point-in-time ticker map from
+  cover pages: of 3,744 stopped filers, **2,472 (66.0%) carry a recovered ticker
+  and 282 (7.5%) have price bars that are actually theirs.** The constraint moved
+  from identification to prices — it is no longer that we cannot say what a
+  company was called, it is that we hold no bars for it.
+
+  **The recovery rate is not the usable rate, and the gap is a factor of nine.**
+  Three distinct reasons, and only two are a purchase: 2,172 rows whose symbol is
+  absent from the price file (a current-listings sweep never collected it), 224
+  last seen before our history begins, and **77 where the symbol is in the file
+  but the bars belong to a different owner** — which no purchase fixes, because
+  those bars already exist and are somebody else's. That last one is why the map
+  keys on `(cik, ticker)` with dates: a presence test would have called all 77
+  coverage and reported returns for companies that had ceased to exist.
+  `usable_prices` classifies rather than filters, so the gap stays visible.
+
+  A delisted company still has no prices. Deal multiples gain rows because a multiple is a stated
   price over a reported figure and needs no bars; **forward returns stay biased
   by exactly as much as before**, and the caveat rendered beside every excess
   figure stands. Knowing who a company was says nothing about what its shares did

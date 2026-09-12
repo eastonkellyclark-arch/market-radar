@@ -7,11 +7,28 @@
 -- current-state source, and an acquisition target is by definition a company that
 -- stopped existing.
 --
--- Measured 2026-09-12: of 2,265 filers whose 10-K history has ended, **2,141
--- (94.3%) have no ticker at all** and only 85 have a ticker without prices. The
--- ticker map, not the price history, is the binding constraint on every question
--- that starts "what happened to the companies that were acquired" -- by a factor
--- of 25.
+-- Measured 2026-09-12, before this table existed: of the filers whose 10-K history
+-- has ended, **94.3% had no ticker at all** and only 85 had a ticker without prices.
+-- The ticker map, not the price history, was the binding constraint on every
+-- question that starts "what happened to the companies that were acquired" -- by a
+-- factor of 25.
+--
+-- **That has now reversed, and the reversal is the point of reading this table's
+-- numbers rather than its premise.** Re-measured after the sweep completed, over
+-- 3,744 stopped filers:
+--
+--   2,472 (66.0%) carry a recovered ticker          <- the map is largely solved
+--     282 ( 7.5%) have price bars that are theirs   <- and this is what is usable
+--
+-- So the constraint moved. It is no longer identification -- we can say what 66% of
+-- these companies were called, with a date range. It is the price history, for
+-- 2,473 (cik, ticker) pairs across a window from 2000-03-28 to 2026-09-10. Which is
+-- the half of a point-in-time universe that was always a purchase and still is.
+--
+-- **The recovery rate is not the usable rate**, and anything that quotes the first
+-- as coverage is wrong by a factor of nine. `usable_prices` in
+-- `sources/sec_trading_symbols.py` is the function that separates them, and it
+-- classifies rather than filters so the gap stays visible.
 --
 -- **What recovers it.** `dei:TradingSymbol` is tagged on the cover page of every
 -- filing since the cover-page XBRL mandate. It returns TWTR, ATVI, VMW and SGEN
