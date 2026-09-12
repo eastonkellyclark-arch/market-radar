@@ -553,11 +553,18 @@ def usable_prices(con: Any, *, prices: str, alias: str = "pg",
         select h.cik, h.ticker, h.first_seen, h.last_seen, h.filings, h.source,
                p.first_bar, p.last_bar, p.bars,
                case
-                 when p.ticker is null
-                      and h.last_seen < date '{first_bar}' then '{BEFORE_OUR_HISTORY}'
-                 when p.ticker is null                     then '{NOT_IN_FILE}'
                  when p.first_bar <= h.last_seen
-                      and p.last_bar >= h.first_seen       then '{USABLE}'
+                      and p.last_bar >= h.first_seen then '{USABLE}'
+                 -- **Window before presence, and the order is the whole meaning.**
+                 -- A symbol can be in the price file under its current owner while
+                 -- this company's own window closed before our history opens. Both
+                 -- facts are true; only one is actionable. Buying history DOES
+                 -- recover this company, so calling it `other_owner_bars` -- the one
+                 -- fate a purchase cannot fix -- understates what a purchase buys.
+                 -- The narrowest class has to be tested last: 37 rows sat in the
+                 -- wrong one until two counts of the same quantity disagreed.
+                 when h.last_seen < date '{first_bar}' then '{BEFORE_OUR_HISTORY}'
+                 when p.ticker is null                 then '{NOT_IN_FILE}'
                  else '{OTHER_OWNER_BARS}'
                end as fate
         from {alias}.company_ticker_history h

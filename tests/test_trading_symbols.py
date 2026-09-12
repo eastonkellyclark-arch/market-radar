@@ -335,14 +335,20 @@ def _fate_fixture():
         ('0000000004', 'OLDY', date '2002-01-01', date '2004-01-01', 1, 'prose'),
         -- Seen 2020-2022; the bars under PRED are from 2016-2017, so they are the
         -- previous owner's. Same fate, opposite direction.
-        ('0000000005', 'PRED', date '2020-01-01', date '2022-01-01', 2, 'prose')""")
+        ('0000000005', 'PRED', date '2020-01-01', date '2022-01-01', 2, 'prose'),
+        -- In the price file under its CURRENT owner, while this company's own window
+        -- closed before our history opens. Both facts are true and only one is
+        -- actionable: buying history recovers *this* company, so the fate must be
+        -- `before_our_history` and not the one a purchase cannot fix.
+        ('0000000006', 'HELD', date '2002-01-01', date '2004-01-01', 1, 'prose')""")
     con.execute("""create table bars (ticker text, date date)""")
     con.execute("""insert into bars values
         ('LIVE', date '2016-06-01'), ('LIVE', date '2019-06-01'),
         ('SGEN', date '2024-02-01'), ('SGEN', date '2026-01-01'),
         -- The mirror case, and the one the first fixture missed: bars entirely
         -- BEFORE the observed window, i.e. the symbol's previous owner.
-        ('PRED', date '2016-02-01'), ('PRED', date '2017-01-01')""")
+        ('PRED', date '2016-02-01'), ('PRED', date '2017-01-01'),
+        ('HELD', date '2016-03-01'), ('HELD', date '2026-01-01')""")
     return con
 
 
@@ -364,6 +370,7 @@ def test_the_overlap_check_separates_four_fates() -> None:
         "GONE": sym.NOT_IN_FILE,
         "OLDY": sym.BEFORE_OUR_HISTORY,
         "PRED": sym.OTHER_OWNER_BARS,
+        "HELD": sym.BEFORE_OUR_HISTORY,
     }
 
 
