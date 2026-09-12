@@ -71,6 +71,28 @@ uv run mr symbols                   # recover tickers for stopped filers
 Every job runs standalone from CLI. If it only works inside a GitHub Action,
 it's built wrong.
 
+**No command ships without being invoked once.** Not a test of it -- actually run,
+and its output read. This is a separate rule from the mutation rule because it
+catches a different failure: the mutation rule asks whether a test examines what
+it claims to, and this asks whether anything at all has exercised the path.
+
+Twice now a command has shipped reporting success while writing nothing, with a
+passing test beside it each time:
+
+- `mr proxy` printed "3 documents located" and wrote **zero rows** three times.
+  `proxy_section` and `proxy_projection` turned out never to have written
+  anything at all -- DuckDB's Postgres extension was turning the upsert into a
+  COPY.
+- `mr symbols` could not run at all. The parser was complete, `--help` was
+  correct, `set_defaults(func=...)` was set -- and `main` dispatches on
+  `args.command`, so invoking it produced `KeyError: 'symbols'`. The restart-flag
+  test beside it passed throughout, because parsing arguments says nothing about
+  whether anything acts on them.
+
+Both were found by running the thing, and neither was reachable by reading it. So
+run it, read the output, and check the row count in the place it claims to have
+written -- a command whose output nobody has read is a command nobody has run.
+
 ---
 
 ## Hard rules
