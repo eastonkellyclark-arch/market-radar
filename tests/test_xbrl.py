@@ -57,7 +57,7 @@ def pre(adsh: str, tag: str, line: int = 1, stmt: str = "IS") -> dict:
 
 
 def complete(adsh: str, *, revenue: str = "1000") -> list[dict]:
-    """Every concept stated, so a filer is in the population for all six."""
+    """Every concept stated, so a filer is in the population for all seven."""
     return [
         num(adsh, "Revenues", revenue, qtrs=4),
         num(adsh, "NetIncomeLoss", "100", qtrs=4),
@@ -65,6 +65,10 @@ def complete(adsh: str, *, revenue: str = "1000") -> list[dict]:
         num(adsh, "Liabilities", "2000", qtrs=0),
         num(adsh, "StockholdersEquity", "3000", qtrs=0),
         num(adsh, "NetCashProvidedByUsedInOperatingActivities", "250", qtrs=4),
+        # Capex, the seventh, added when the DCF needed it. Free cash flow is
+        # this subtracted from the line above, and at 87.8% against 99.6% it is
+        # the half that bounds how much of the universe gets a DCF at all.
+        num(adsh, "PaymentsToAcquirePropertyPlantAndEquipment", "60", qtrs=4),
     ]
 
 
@@ -507,8 +511,13 @@ def test_the_deferred_concepts_are_named_with_their_coverage() -> None:
     """Dropped from v1, not forgotten: each comes back carrying its own
     number rather than as a speculative column."""
     assert set(tag_map.DEFERRED_CONCEPTS) == {
-        "capex", "shares", "cash", "operating_income"}
+        "shares", "cash", "operating_income"}
     assert not set(tag_map.DEFERRED_CONCEPTS) & set(tag_map.CONCEPTS)
+    # capex came back when the DCF needed it, carrying its own number -- which
+    # is what the deferred table is for. Its 0.799 was a floor from a thin
+    # candidate list, not a ceiling: measured properly it is 87.8%.
+    assert "capex" in tag_map.CONCEPTS
+    assert tag_map.CONCEPTS["capex"].coverage_2024q1 == 0.878
 
 
 def test_the_rejected_liabilities_derivation_is_recorded() -> None:
@@ -523,7 +532,30 @@ def test_asking_for_a_deferred_concept_is_an_error_that_explains_itself(
     con, quarter
 ) -> None:
     with pytest.raises(ValueError, match="measured and"):
-        built(con, quarter, concepts=("capex",))
+        built(con, quarter, concepts=("shares",))
+
+
+def test_the_capex_tags_that_are_not_capex_are_recorded(con, quarter) -> None:
+    """Name-matching every capex-shaped investing tag reads 93.3% against the
+    honest 87.8% -- 4.5 points of the wrong thing, and the wrong thing is large.
+
+    The entry worth remembering is the first: 26.9% of operating filers report
+    ``CapitalExpendituresIncurredButNotYetPaid``, its name contains
+    "CapitalExpenditures", and it is the *unpaid accrual*. Subtracting it from
+    operating cash flow would deduct money nobody spent -- the same rule as
+    ``TOT_PARTCP_BOY_CNT``: read the field definition, not the field name.
+
+    ``PaymentsToAcquireBusinessesNetOfCashAcquired`` is the other one: it is the
+    largest single entry in the unmapped work queue, and it must stay there.
+    A work queue pointing at a tag that must not be mapped is a trap.
+    """
+    assert "CapitalExpendituresIncurredButNotYetPaid" in tag_map.NOT_CAPEX
+    assert "accrual" in tag_map.NOT_CAPEX[
+        "CapitalExpendituresIncurredButNotYetPaid"]
+    assert "PaymentsToAcquireBusinessesNetOfCashAcquired" in tag_map.NOT_CAPEX
+    # And none of them is in the map, which is the thing that would silently
+    # change every free-cash-flow number if it ever were.
+    assert not set(tag_map.NOT_CAPEX) & set(tag_map.CONCEPTS["capex"].tags)
 
 
 def test_one_concept_can_be_asked_for_alone(con, quarter) -> None:

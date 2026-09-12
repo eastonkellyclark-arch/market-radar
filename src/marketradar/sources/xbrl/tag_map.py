@@ -330,6 +330,55 @@ CONCEPTS: Final[dict[str, Concept]] = {
         ),
         coverage_2024q1=0.977,
     ),
+    "capex": Concept(
+        name="capex",
+        tags=(
+            # Cash paid for productive fixed assets, most-preferred first.
+            # Measured 2026-09-12 on 2024q1's 2,804 operating annual filings:
+            # the first tag alone is 74.5% and the ladder reaches 88.7%.
+            "PaymentsToAcquirePropertyPlantAndEquipment",          # 74.5%
+            "PaymentsToAcquireProductiveAssets",                   # +247
+            "PaymentsForCapitalImprovements",                      # +26
+            "PaymentsToAcquireOtherPropertyPlantAndEquipment",      # +45
+            "PaymentsToAcquireMachineryAndEquipment",               # +29
+            # Extractive filers put their capex here and nowhere else, which is
+            # why two oil-and-gas tags sit in a general map: for an E&P company
+            # this *is* the capital programme, not a special case of one.
+            "PaymentsToAcquireOilAndGasProperty",                   # +14
+            "PaymentsToAcquireOilAndGasPropertyAndEquipment",       # +10
+            "PaymentsToAcquireOtherProductiveAssets",               # +19
+            # The tail: 1-4 filers each. Carried because they are unambiguously
+            # the same concept and a tag that costs nothing to include should not
+            # be a future work-queue entry, not because they move coverage.
+            "PaymentsToDevelopSoftware",
+            "PaymentsToAcquireBuildings",
+            "PaymentsToAcquireLand",
+            "PaymentsToAcquireEquipmentOnLease",
+        ),
+        qtrs=ANNUAL,
+        definition=(
+            "cash paid during the fiscal year for property, plant and equipment "
+            "and other productive fixed assets. Excludes acquisitions of "
+            "businesses, purchases of securities, and intangibles -- see "
+            "NOT_CAPEX for why each of those is a different concept rather than "
+            "a missing tag"
+        ),
+        coverage_2024q1=0.878,
+        note=(
+            "Deferred out of v1 at 0.799 and that number was a floor rather than "
+            "a ceiling: it came from a thinner candidate list. Measured properly "
+            "2026-09-12 it is 0.878, the weakest of the seven and the one that "
+            "bounds a DCF, because free cash flow is operating cash flow minus "
+            "capex and the other half is 0.996. FCF on the same filer is 87.8% "
+            "-- capex is the binding half, essentially alone. "
+            "The number is the loader's, not a probe's. A hand-written probe "
+            "over num.txt read 88.7% because it counted segment-tagged rows; "
+            "the resolver reports those as segment_only, which is the correct "
+            "answer and 0.9 points lower. A concept's coverage figure has to be "
+            "the one the code reproduces, or the drift test is measuring the "
+            "probe."
+        ),
+    ),
     "operating_cash_flow": Concept(
         name="operating_cash_flow",
         tags=(
@@ -350,10 +399,50 @@ CONCEPTS: Final[dict[str, Concept]] = {
 #: question needs it, carrying its own number -- not as a speculative column
 #: dragging joint coverage down for consumers that never read it.
 DEFERRED_CONCEPTS: Final[dict[str, float]] = {
-    "capex": 0.799,
     "shares": 0.951,
     "cash": 0.966,
     "operating_income": 0.913,
+}
+
+#: Tags whose names look like capex and which are **not** capex, with the reason.
+#:
+#: Recorded rather than merely omitted, because the ``unmapped`` work queue keeps
+#: surfacing them and a reviewer has to be able to see that each was decided
+#: against rather than overlooked. Name-matching every capex-shaped investing tag
+#: would read 93.3% against the honest 88.7% -- **4.5 points of the wrong thing**,
+#: and the wrong thing is large: the treasury tags have a median of $105M, which
+#: would swamp the capex line for any filer holding a securities portfolio.
+#:
+#: The first entry is the one worth remembering. 26.9% of operating filers report
+#: ``CapitalExpendituresIncurredButNotYetPaid``; its name contains
+#: "CapitalExpenditures"; it is the *unpaid accrual*. Subtracting it from
+#: operating cash flow would deduct money nobody spent. Same rule as
+#: ``TOT_PARTCP_BOY_CNT``: read the field definition, not the field name.
+NOT_CAPEX: Final[dict[str, str]] = {
+    "CapitalExpendituresIncurredButNotYetPaid":
+        "the unpaid accrual, not a cash outflow. Reported by 26.9% of filers and "
+        "named as if it were the thing itself",
+    "PaymentsToAcquireBusinessesNetOfCashAcquired":
+        "acquisitions -- the largest entry in the unmapped queue, and it must "
+        "stay there. Buying a company is not maintaining an asset base",
+    "PaymentsToAcquireBusinessesGross": "acquisitions",
+    "PaymentsToAcquireMarketableSecurities": "treasury; median $105M",
+    "PaymentsToAcquireAvailableForSaleSecuritiesDebt": "treasury",
+    "PaymentsToAcquireInvestments": "treasury",
+    "PaymentsToAcquireShortTermInvestments": "treasury",
+    "PaymentsToAcquireLongtermInvestments": "treasury",
+    "PaymentsToAcquireHeldToMaturitySecurities": "treasury",
+    "PaymentsToAcquireEquitySecuritiesFvNi": "treasury",
+    "PaymentsToAcquireOtherInvestments": "treasury",
+    "PaymentsToAcquireEquityMethodInvestments":
+        "an investment, not an asset the business operates",
+    "PaymentsToAcquireInterestInSubsidiariesAndAffiliates": "an investment",
+    "PaymentsToAcquireInterestInJointVenture": "an investment",
+    "PaymentsToAcquireNotesReceivable": "lending",
+    "PaymentsToAcquireIntangibleAssets":
+        "intangibles. Defensibly investment and definitely not PP&E; it becomes "
+        "its own concept with its own coverage if a question needs it",
+    "PaymentsToAcquireInProcessResearchAndDevelopment": "acquired IPR&D",
 }
 
 #: The pre-606 map is empty on purpose.
