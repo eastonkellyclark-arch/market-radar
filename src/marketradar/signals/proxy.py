@@ -203,6 +203,42 @@ SECTION_PATTERNS: Final[dict[str, tuple[str, ...]]] = {
         r"[\d.]+\s?%\s+premium\b",
         r"represent(?:s|ed|ing)\s+a\s+premium",
     ),
+    # **The one section that is reliably where it says it is.** Measured
+    # 2026-09-12 over the 20 cached proxies: all 15 real takeouts carry a named
+    # projections heading, all 15 have a multi-year table under it, and all 15
+    # name at least one measure a DCF could use. 100%, against 27% for the
+    # Premiums Paid Analysis.
+    #
+    # That is not luck. Sharing forecasts with a buyer triggers a disclosure
+    # obligation, so the heading is close to boilerplate -- "Certain Unaudited
+    # Prospective Financial Information" is the form of words counsel uses.
+    #
+    # Why it matters more than the other unread fields: management projections are
+    # the **only forward estimate anywhere in this system**. Everything else is
+    # as-filed history, and the DCF's weakest input is a flat growth constant that
+    # beat every rate fitted from our own 30 quarters out of sample.
+    #
+    # Measures present across the 15: EBITDA 12, revenue 10, free cash flow 7,
+    # capex 7, net income 6, EBIT 2. EBITDA is the one a banker projects.
+    # Scoped ``(?i:...)`` rather than relying on the matcher, because
+    # :func:`section_window` is **case-sensitive** -- a latent trap these patterns
+    # are the first to hit. The older two anchor on lowercase prose ("right to
+    # receive", "premium of") and never noticed; a title-case heading does, and
+    # AstroNova, Electro Sensors and CoreCard all write it in a case the
+    # case-sensitive matcher misses. 12 of 15 became 15 of 15.
+    #
+    # Not fixed globally, and that is deliberate rather than lazy. Measured
+    # 2026-09-12: making the matcher case-insensitive moves **5 of 40** existing
+    # windows -- two takeouts whose consideration window shifts, and two
+    # liquidations that would go from `no_section` to having one. Two of those
+    # documents are already read under the current behaviour, so flipping it
+    # mid-measurement would quietly invalidate results rather than improve them.
+    # It is a real improvement and it needs its own before-and-after.
+    "prospective_financial": (
+        r"(?i:(?:Certain\s+)?(?:Unaudited\s+)?Prospective\s+Financial\s+Information)",
+        r"(?i:Management(?:'s)?\s+(?:Projections|Forecasts|Financial\s+Projections))",
+        r"(?i:(?:Internal\s+)?Financial\s+(?:Projections|Forecasts))",
+    ),
     "fairness_opinion": (
         r"Opinion\s+of\s+[A-Z][^\n]{0,70}?(?:Financial\s+Advisor|"
         r"&\s*Co\.?|Securities|Partners|LLC|Inc\.)",

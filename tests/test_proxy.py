@@ -659,3 +659,63 @@ def test_the_report_separates_a_bad_quote_from_a_wrong_question() -> None:
     assert "wrong question" in text
     counts = report.by_reason("premium_pct")
     assert counts[proxy.UNCITED] == 1 and counts[proxy.MISATTRIBUTED] == 1
+
+
+# --- the projections locator --------------------------------------------
+
+
+PROJECTIONS = (
+    "CERTAIN UNAUDITED PROSPECTIVE FINANCIAL INFORMATION The Company does not "
+    "as a matter of course make public long-term projections."
+    + "filler. " * 100
+    + "Fiscal year 2027E 2028E 2029E Revenue 1,240 1,390 1,520 "
+      "Adjusted EBITDA 210 244 271 Unlevered free cash flow 96 118 133 "
+    + FIGURES
+)
+
+
+def test_the_projections_heading_is_found_whatever_its_case() -> None:
+    """**100% of the 15 real takeouts carry one**, measured 2026-09-12 -- against
+    27% for the Premiums Paid Analysis. Sharing forecasts with a buyer triggers a
+    disclosure obligation, so the heading is close to boilerplate.
+
+    It matters more than the other unread fields because management projections are
+    the only forward estimate anywhere in this system, and the DCF's weakest input
+    is a growth constant that beat every rate fitted from our own history.
+    """
+    section = proxy.section_window(PROJECTIONS, "prospective_financial")
+    assert section is not None
+    assert "EBITDA" in section.text
+    # Lower-cased and title-cased both, because a text-extracted proxy is whatever
+    # case the filer's HTML used.
+    for variant in (PROJECTIONS.lower(), PROJECTIONS.title()):
+        assert proxy.section_window(variant, "prospective_financial") is not None
+
+
+def test_section_window_is_case_sensitive_and_that_is_recorded() -> None:
+    """A latent trap the projections patterns were the first to hit.
+
+    ``section_window`` matches without ``re.IGNORECASE``. The consideration and
+    premium patterns anchor on lowercase prose and never noticed; a title-case
+    heading does, and three of fifteen takeouts write it in a case the plain
+    matcher misses. The projections patterns carry a scoped ``(?i:...)`` rather
+    than the matcher being changed, because measured 2026-09-12 a global flag moves
+    **5 of 40** existing windows -- including two documents already read under the
+    current behaviour. That is a real improvement and it needs its own
+    before-and-after rather than arriving as a side effect.
+
+    This test exists so the next person finds the decision instead of the symptom.
+    """
+    import re
+
+    plain = r"Prospective\s+Financial\s+Information"
+    assert re.search(plain, PROJECTIONS) is None, (
+        "the fixture no longer exercises the case problem")
+    assert re.search(plain, PROJECTIONS, re.IGNORECASE) is not None
+    # Every projections pattern carries the scoped flag; the others do not.
+    for pattern in proxy.SECTION_PATTERNS["prospective_financial"]:
+        assert pattern.startswith("(?i:"), pattern
+    for name in ("merger_consideration", "premium_statement"):
+        for pattern in proxy.SECTION_PATTERNS[name]:
+            assert not pattern.startswith("(?i:"), (
+                f"{name} gained a case flag; re-measure the 40 windows first")
