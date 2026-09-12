@@ -243,9 +243,13 @@ def test_the_survivorship_caveat_is_printed_with_the_numbers() -> None:
     it reads a measurement of who is still listed as a fact about deals."""
     from marketradar.screens import outcomes
 
-    text = outcomes.render([], "test study")
-    assert "biased downward" in text.lower()
-    assert "higher than this" in text.lower()
+    text = outcomes.render([], "test study").lower()
+    # The population and the direction, not one wording. The phrase this used to
+    # pin ("biased downward") went away when the caveat was rewritten to lead with
+    # what the number is measured *on*, and a test that breaks on rephrasing while
+    # the property still holds is testing the prose.
+    assert "acquirers" in text, "the caveat does not say what it is measured on"
+    assert "higher than this" in text, "the caveat does not give the direction"
 
 
 def test_the_caveat_names_the_direction_not_only_its_existence() -> None:
@@ -256,8 +260,11 @@ def test_the_caveat_names_the_direction_not_only_its_existence() -> None:
 
     caveat = outcomes.SURVIVOR_CAVEAT.lower()
     assert "delists" in caveat
-    assert "failed" in caveat
     assert "higher" in caveat
+    # And the population, which is the half a reader cannot file away as a caveat:
+    # "survivor-biased" is a disclaimer, "measured on acquirers" is what it is.
+    assert "acquirers" in caveat
+    assert "not on targets" in caveat
 
 
 def test_the_panel_marks_the_excess_columns_themselves() -> None:
@@ -272,7 +279,17 @@ def test_the_panel_marks_the_excess_columns_themselves() -> None:
         "win_rate": "0.44", "median_run_up": "0.01", "n_suspect": 3,
         "events": 10689, "priced": 8000, "benchmark": "SPY",
     }])
-    assert "biased" in page
     assert "-2.36%" in page
-    # and the direction, next to the number rather than in a tooltip alone
-    assert "correction goes" in page.lower() or "goes\n            <strong>up" in page
+    # Population and direction, as visible text beside the number rather than in a
+    # tooltip. Asserts the property, not a phrase: this used to pin "correction goes
+    # up", which went away when the three copies of the caveat were consolidated onto
+    # one -- and a test that breaks on rephrasing while the property still holds is
+    # testing the prose.
+    import re as _re
+
+    visible = _re.sub(r'\b[a-zA-Z-]+="[^"]*"', " ", page)
+    assert "acquirers" in visible, "the panel does not say what this is measured on"
+    assert "higher than this" in visible, "the panel does not give the direction"
+    # And the panel's own local evidence for the general claim: the events in this
+    # study that produced no return at all.
+    assert "2,689 events here" in page

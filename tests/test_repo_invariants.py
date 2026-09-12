@@ -588,3 +588,134 @@ def test_no_join_compares_a_raw_cik_column() -> None:
         "a believable number rather than an error. Wrap both sides -- lpad is "
         "idempotent, so there is no case where wrapping is wrong."
     )
+
+
+# --- the deal-outcome limitation, enforced rather than documented -------
+
+
+#: Columns that ARE a deal-outcome number. Rendering one of these obliges the
+#: renderer to say what population it is measured on.
+_EXCESS_COLUMNS: Final[tuple[str, ...]] = (
+    "median_excess", "mean_excess", "win_rate")
+
+
+def test_only_one_copy_of_the_survivorship_caveat_exists() -> None:
+    """**The comment promising this already existed, and was false.**
+
+    `panels.py` held its own copy under the words "One sentence, shared with the CLI
+    and the spec so the three cannot drift" -- and the two wordings had already
+    drifted: the panel's omitted "by an unknown amount" and never named the
+    population. A comment cannot keep two strings in step; the same shape as the two
+    CIK normalisers that agreed on every normal input until they did not.
+
+    So the panel imports `outcomes.SURVIVOR_CAVEAT` and this fails the build on a
+    second literal. Detected by the distinctive phrase rather than the whole
+    sentence, because a near-copy is the failure mode -- an exact duplicate would at
+    least stay correct.
+    """
+    # Long enough to be the caveat rather than a sentence about it. The first
+    # version used "delists the target", which matched a docstring in panels.py
+    # explaining why the `priced` column drops rows -- an explanation of the
+    # problem, not a second copy of the warning.
+    markers = ("weighted toward deals", "higher than this by an unknown")
+    offenders = []
+    for path in sorted(SRC.rglob("*.py")):
+        if path.name == "outcomes.py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        docstrings = set()
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None) or []
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)) and body \
+                    and isinstance(body[0], ast.Expr) \
+                    and isinstance(body[0].value, ast.Constant):
+                docstrings.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if id(node) in docstrings:
+                continue
+            if not (isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)):
+                continue
+            for marker in markers:
+                if marker in node.value:
+                    offenders.append(
+                        f"{path.relative_to(SRC.parent.parent)}:{node.lineno}: "
+                        f"{marker!r}")
+    assert not offenders, (
+        "the survivorship caveat is written out a second time instead of imported "
+        "from screens/outcomes.py:\n  " + "\n  ".join(offenders))
+
+
+def test_a_renderer_of_excess_returns_states_the_population() -> None:
+    """Any module that renders a deal-outcome number must reach for the caveat.
+
+    The rule is about *renderers*, which is why it keys on the output columns rather
+    than on the word "excess": a module that computes or persists these is not
+    showing them to anybody. A deck page or a digest block added later is caught by
+    this, which is the point -- neither renders one today, and the limitation has to
+    survive the next thing that does.
+    """
+    # **An explicit output layer, because the indirection defeats a static check.**
+    # The panel reads `r["median_excess"]` into a local and interpolates `pct(ex)`,
+    # so no f-string mentions the column and an AST scan for interpolations found
+    # nothing -- the guard passed panels.py by missing it, not by approving it.
+    # Tracking the value needs dataflow analysis, so the rule names the modules that
+    # emit an artifact instead.
+    #
+    # `dashboard/shell.py` is deliberately absent: it selects `median_excess::text`
+    # into a dict and formats nothing. The exclusion is one named module with a
+    # reason rather than a flag, so a new module does not silently inherit it.
+    output_layer = (
+        "dashboard/panels.py", "dashboard/detail.py", "decks.py", "digest.py")
+    offenders = []
+    for rel in output_layer:
+        path = SRC / rel
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if not any(col in text for col in _EXCESS_COLUMNS):
+            continue
+        # The shared constant by name, not a local that merely looks like it. A
+        # first version accepted any module containing the substring `_SURVIVOR`,
+        # which a local variable holding a hand-written copy satisfies -- so it
+        # passed exactly the module that had stopped importing the real thing.
+        if "SURVIVOR_CAVEAT" in text or "SURVIVOR_FLAG" in text:
+            continue
+        offenders.append(rel)
+    assert not offenders, (
+        "these render a deal-outcome number without the population it is measured "
+        f"on: {offenders}. Import outcomes.SURVIVOR_CAVEAT and render it beside the "
+        "figure -- the bias runs the same direction as the number, so a reader who "
+        "sees only the figure reads survivorship as a fact about deals.")
+
+
+def test_the_caveat_is_not_hover_only_in_the_panel() -> None:
+    """**"Not a footnote" is testable, so it is tested.**
+
+    The panel used to carry the caveat only inside `title=` attributes on two column
+    headers. That is a tooltip: invisible unless hovered, absent from a printout, and
+    absent from a screenshot -- a footnote wearing a hat. Strips every attribute
+    value and requires the sentence to still be there.
+    """
+    import re
+
+    from marketradar.dashboard import panels
+    from marketradar.screens import outcomes
+
+    html = panels.outcomes_html([{
+        "study": "8-K deals", "slice": "all", "horizon": 1, "n": 1200,
+        "median_ret": 0.011, "median_excess": -0.0236, "mean_excess": -0.02,
+        "win_rate": 0.48, "median_run_up": 0.004, "n_suspect": 3,
+        "events": 1200, "priced": 800,
+    }])
+    assert "-2.36%" in html, "the fixture did not render a figure"
+    # Attribute values out: what is left is what a reader sees without hovering.
+    visible = re.sub(r'\b[a-zA-Z-]+="[^"]*"', " ", html)
+    needle = "Measured on acquirers"
+    assert needle in visible, (
+        "the survivorship caveat renders only inside an attribute (a tooltip), so a "
+        "reader sees the number and not the population it is measured on")

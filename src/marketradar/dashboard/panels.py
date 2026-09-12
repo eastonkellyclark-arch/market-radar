@@ -24,6 +24,7 @@ from decimal import Decimal
 from typing import Any, Final
 
 from marketradar.digest import Digest
+from marketradar.screens import outcomes as outcomes_mod
 from marketradar.screens import volatility
 
 #: Rows rendered per list. The screens hold 20; the page shows all of them
@@ -748,12 +749,10 @@ def _bar(value: float | None) -> str:
     )
 
 
-#: One sentence, shared with the CLI and the spec so the three cannot drift.
-_SURVIVOR: Final[str] = (
-    "Biased downward: a completed deal delists the target and leaves the "
-    "sample; a collapsed one keeps trading and stays. The survivors are "
-    "weighted toward deals that failed, so the true figure is higher."
-)
+#: Imported, not copied. This used to be a local string under a comment claiming
+#: it was shared with the CLI and the spec -- it was not, and the two wordings had
+#: already drifted apart. The same shape as the two CIK normalisers.
+_SURVIVOR: Final[str] = outcomes_mod.SURVIVOR_CAVEAT
 
 
 def outcomes_html(rows: list[dict[str, Any]]) -> str:
@@ -817,15 +816,10 @@ def outcomes_html(rows: list[dict[str, Any]]) -> str:
             Benchmark {_esc(head.get("benchmark") or "SPY")}; horizons are
             trading sessions from the last close before the event, so
             <strong>+1d is the event session itself</strong>.</p>
-          <p class="note bias-note"><strong>Every excess figure below is
-            biased downward.</strong> The {events - priced:,} events that
-            produced no return did not drop out at random &mdash; completing
-            an acquisition delists the target, so it has no forward close and
-            leaves the sample, while a deal that collapsed keeps trading and
-            stays in it. What survives to be measured is weighted toward
-            deals that <em>failed</em>, which is also the population that
-            gives back the announcement move. The correction goes
-            <strong>up</strong>, by an unknown amount.</p>
+          <p class="note bias-note"><strong>What these are measured
+            on.</strong> {_esc(_SURVIVOR)} The {events - priced:,} events here
+            that produced no return are that bias in this study specifically:
+            they did not drop out at random.</p>
           <table class="rows">
             <thead><tr><th>slice</th><th class="num">h</th>
               <th class="num">n</th><th class="num">median</th>

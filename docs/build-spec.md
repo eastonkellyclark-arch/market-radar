@@ -2155,6 +2155,95 @@ you have to remember.
   filter rather than a deletion — but it is a known hole in the weak tier
   rather than a surprise.
 
+### Point-in-time price history: priced, declined 2026-09-12
+
+**Declined.** Recorded with the numbers so it is decidable later without
+re-deriving it, the same treatment as the GDELT news decline.
+
+The ticker map made this pricable for the first time: we can now name the symbols,
+so the quote is for a real list rather than an estimate. **2,473 `(cik, ticker)`
+pairs over 2000-03-28 to 2026-09-10**, recovered from filing cover pages.
+
+**Cheapest adequate option: Sharadar Prices, $99/yr** ($9/mo), delisted history to
+December 1997, `permaticker` as a permanent issuer identifier. Alternatives priced
+the same day:
+
+| vendor | price | delisted back to | permanent identifier |
+|---|---|---|---|
+| Sharadar Prices | **$99/yr** | Dec 1997 | `permaticker` |
+| EODHD All-World | $199/yr | ~30y, EOD-only pre-2018 | **none found** |
+| Norgate Platinum | $630/yr | 1990 | `assetid` + `-YYYYMM` delisting suffix |
+| Norgate Diamond | $787.50/yr | 1950 | same |
+
+**Depth is not the differentiator.** Our window opens 2000-03-28 and **0 of the
+2,473 pairs fall before any candidate's floor**, so Norgate Diamond's extra forty
+years buys nothing. The identifier is what separates them: EODHD's documented flow
+lists delisted symbols with `delisted=1` and then queries the plain code with no
+suffix or namespace, which reproduces the recycling collision at vendor scale. (That
+is the docs not mentioning disambiguation rather than a confirmed absence — it is the
+one thing to ask their support if EODHD is ever reconsidered.) Whether Sharadar's
+`TICKERS` carries **CIK** is unconfirmed and is the highest-value question to ask,
+because our map is keyed on CIK and a CIK column would remove ticker matching from
+the path entirely.
+
+**What $99/yr buys, measured:**
+
+- **1,352 deal filings across 873 companies** become measurable. Population is
+  filers that stopped filing after their own deal 8-K, which is the same test
+  `deal_multiples` uses for `acquired_whole`. 148 are measurable today.
+- **Beta coverage 282 → up to ~2,400** stopped filers, for backward-looking work
+  only: a stopped filer's beta ends at its delisting, which is right for a
+  historical question and wrong for discounting cash flows today.
+- What bars give is the **realized move** — undisturbed price through announcement
+  to last trade. That is an event study, not the board's stated premium; the stock
+  trades near but below the offer until closing. A disclosed premium from
+  `proxy_figure` and a computed one would have to stay separate columns, because
+  their denominators differ.
+
+**Nothing else moves.** Deal multiples stay at **43** — a multiple is a stated price
+over a reported figure, so it needs XBRL revenue rather than bars, and the binding
+stages are "target appears in XBRL" (loaded range starts 2019q1) and "target
+identity confirmed". The volatility screens, the action audit and the Form 5500 work
+ask nothing about companies that no longer trade.
+
+**Reopen when takeout returns are needed for something real** — not on price, and
+not on coverage. The decision is that ~873 companies of event-return history plus
+backward-looking beta is not worth a recurring line item today.
+
+### Mutation proves a test examines what it claims, not that the fixture is complete
+
+Recorded 2026-09-12, because it is the limit of the rule in CLAUDE.md that every
+invariant must be shown to fail, and the limit is not obvious from the rule.
+
+`usable_prices` classified 37 rows as `other_owner_bars` -- the one fate a price
+purchase cannot fix -- when they were `before_our_history`, which a purchase fixes.
+The CASE tested presence before the window, so a symbol in the price file under its
+current owner, whose own observed window closed before our history opens, got the
+wrong label. It understated what buying data buys, in the direction that would have
+changed a spending decision.
+
+It shipped with **five mutations, all of which correctly went red.** Every one of
+them probed a case the fixture already had. Nothing probed a row that was both in
+the price file and pre-window, so reordering the CASE changed no expected value and
+both orderings passed.
+
+It was found by **two counts of the same quantity disagreeing** -- a measurement
+script said 77 and the function said 114 -- and not by any test.
+
+So the two checks are different questions and a suite needs both:
+
+- *mutation* asks whether a test examines what it claims to. It cannot see a case
+  the fixture omits, because it only perturbs code the fixture already reaches.
+- *a second, independent count of the same quantity* asks whether the fixture is
+  complete. Two paths to one number that disagree is the only signal that found
+  this, and the cheapest place to get it is a measurement script that computes
+  something the code also computes.
+
+Practically: when a function classifies, enumerate the *combinations* of its
+conditions rather than one case per output value -- the 37 rows were a combination
+(in the file AND pre-window) that no single-value fixture reaches. And when a
+number gets read aloud, compute it twice by different routes.
+
 **Operational:**
 
 Six free tiers means six ways to silently stop returning data while the job

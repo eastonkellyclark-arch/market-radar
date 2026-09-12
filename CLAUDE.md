@@ -165,6 +165,19 @@ say in the test's docstring what you broke and what it did. A test whose
 docstring records its own mutation is a test the next person can trust without
 repeating the exercise.
 
+**And mutation has one limit worth knowing: it says nothing about what the
+fixture omits.** `usable_prices` shipped with five mutations that all correctly
+went red, and still mislabelled 37 rows -- because every mutation probed a case
+the fixture already had, and nothing probed a row that was both in the price file
+and before our history began. Reordering the CASE changed no expected value.
+
+It was caught by **two counts of the same quantity disagreeing** — a measurement
+script said 77 and the function said 114 — not by any test. So: mutation asks
+whether a test examines what it claims to; a second independent count asks
+whether the fixture is complete, and only the second one finds a missing case.
+When a function classifies, enumerate the *combinations* of its conditions rather
+than one case per output value. Full write-up in docs/build-spec.md.
+
 **Every pipeline stage ends with a freshness assertion.** Row count and max
 timestamp against expectation, and it must raise — not warn, not log. A job
 that exits green on empty data is the failure mode we care most about. This has

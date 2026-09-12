@@ -62,15 +62,28 @@ log = logging.getLogger(__name__)
 #: Sessions after the pre-event close. ``1`` is the event session itself.
 DEFAULT_HORIZONS: Final[tuple[int, ...]] = (1, 5, 30)
 
-#: The survivorship caveat, in one sentence, so the CLI, the panel and the
-#: spec cannot drift apart on it. Anything that renders an excess return
-#: renders this next to it.
+#: The survivorship caveat: **the population first, then the direction of the
+#: error.** The only copy. The panel used to hold its own under a comment saying
+#: the three could not drift apart, and they had already drifted -- so a test now
+#: fails the build on a second copy, and on any renderer that shows an excess
+#: return without this beside it.
+#:
+#: It names the population because "survivor-biased" alone is a caveat a reader
+#: can file away. "Measured on acquirers and collapsed deals" is a statement about
+#: what the number *is*, and it is harder to read past.
 SURVIVOR_CAVEAT: Final[str] = (
-    "Survivor-biased downward: a completed deal delists the target and "
-    "leaves the sample, a collapsed one keeps trading and stays. What is "
-    "left is weighted toward deals that failed, so the true figure is "
-    "higher than this by an unknown amount."
+    "Measured on acquirers and deals that collapsed -- not on targets. "
+    "Completing a deal delists the target, so the bars that would measure it "
+    "do not exist: the target leaves the sample and the failed deal keeps "
+    "trading and stays. The survivors are weighted toward deals that did not "
+    "happen, so the true figure is higher than this by an unknown amount, and "
+    "the bias runs in the same direction as the number."
 )
+
+#: The short form, for a column header or a chip where the sentence will not fit.
+#: Never a substitute for the sentence: it marks that a caveat exists, which is
+#: what a footnote does, and the rule here is that the sentence renders too.
+SURVIVOR_FLAG: Final[str] = "measured on acquirers, biased low"
 
 #: Sessions before the anchor, reported alongside. A signal that only shows
 #: up after the move already happened is a different thing from one that
