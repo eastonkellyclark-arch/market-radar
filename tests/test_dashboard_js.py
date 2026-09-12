@@ -117,21 +117,69 @@ def _digest() -> digest_mod.Digest:
 #: Day numbers are days since 2016-01-01, which is what the chart's EPOCH is.
 _T0 = (date(2026, 8, 3) - date(2016, 1, 1)).days
 
+#: Two years of sessions, which is what makes the timeframes distinguishable: a
+#: 24-point fixture would give the same candle count for 3M, 1Y and All, and a test
+#: that cannot tell them apart cannot tell a working button from a dead one.
+_SESSIONS: int = 500
+
+#: A gap inside the window, so the bands and the "candles do not span a hole"
+#: behaviour are exercised rather than asserted about.
+_GAP_AT: int = 300
+_GAP_DAYS: int = 120
+
+
+def _bars() -> list[tuple[date, float, float, float, float, int]]:
+    """Daily OHLCV with a deliberate shape.
+
+    Sub-$1 prices on purpose: the y-axis has to hold 0.0751 to 0.98 without
+    flattening, which is the band this system exists for, and a fixture priced at
+    $100 would never exercise it. One spike near the end, so a test can check that
+    it does not compress the rest to a flat line.
+    """
+    from datetime import timedelta
+
+    out: list[tuple[date, float, float, float, float, int]] = []
+    day = date(2026, 8, 3) - timedelta(days=_SESSIONS + _GAP_DAYS + 400)
+    for i in range(_SESSIONS):
+        if i == _GAP_AT:
+            day += timedelta(days=_GAP_DAYS)
+        while day.weekday() >= 5:
+            day += timedelta(days=1)
+        base = 0.0751 + (0.9 * i / _SESSIONS)
+        spike = 4.0 if i == _SESSIONS - 3 else 1.0
+        o = round(base, 6)
+        c = round(base * (1.02 if i % 3 else 0.98) * spike, 6)
+        out.append((day, o, round(max(o, c) * 1.01, 6), round(min(o, c) * 0.99, 6),
+                    c, 100_000 + i * 137))
+        day += timedelta(days=1)
+    return out
+
 
 def _details() -> dict:
     """Chart payload for one symbol only.
 
-    One, deliberately: the panel has rows for eight tickers, so a payload
-    covering every row could not tell a working click apart from a click that
-    opened the panel regardless of whether there was anything to draw.
+    One, deliberately: the panel has rows for eight tickers, so a payload covering
+    every row could not tell a working click apart from a click that opened the
+    panel regardless of whether there was anything to draw.
+
+    The weekly and monthly series come from `tickers.aggregate`, not from a
+    hand-written list. A fixture that states what the aggregation should produce
+    tests my arithmetic against itself; running the real function means the DOM test
+    also covers the thing that turns sessions into candles.
     """
-    series = [[_T0 + i, 100.0 + i] for i in range(24)]
+    from marketradar.dashboard import tickers as tk_mod
+
+    bars = _bars()
+    daily = [(tk_mod._d(d), o, h, l, c, v) for d, o, h, l, c, v in bars]
+    gap_from = tk_mod._d(bars[_GAP_AT - 1][0])
+    gap_to = tk_mod._d(bars[_GAP_AT][0])
     return {
         "BIG": {
-            "s": series,
-            "r": [[_T0 + 23, 122.0, 124.0, 121.0, 123.0, 500_000]],
-            "a": [[_T0 + 10, 1.0, 0.25]],
-            "g": [[_T0 + 4, _T0 + 9, 5]],
+            "d": [list(b) for b in daily[-tk_mod.DAILY_SESSIONS:]],
+            "w": [list(b) for b in tk_mod.aggregate(bars, tk_mod._week)],
+            "m": [list(b) for b in tk_mod.aggregate(bars, tk_mod._month)],
+            "a": [[tk_mod._d(bars[10][0]), 1.0, 0.25]],
+            "g": [[gap_from, gap_to, gap_to - gap_from]],
         }
     }
 
@@ -534,7 +582,12 @@ def test_a_ticker_row_opens_the_ticker_panel_and_draws_into_it(report) -> None:
     assert s["drawerSymbol"] == "BIG"
     assert s["drawerHidden"] is False, "the drawer opened still hidden"
     assert s["chartNodes"] > 0, "the ticker panel opened with an empty chart"
-    assert s["barRows"] == 1
+    # The recent-bars table is the tail of the daily series, not a second copy of it
+    # shipped alongside -- `r` used to carry the same numbers again, and two copies
+    # of one fact is the defect this codebase keeps finding.
+    from marketradar.dashboard import tickers as _tk
+
+    assert s["barRows"] == _tk.RECENT_BARS
 
 
 def test_closing_the_ticker_returns_to_the_panel_it_came_from(report) -> None:
@@ -599,3 +652,116 @@ def test_the_only_unimplemented_calls_are_scrolling(report) -> None:
     """
     kinds = {m.split(":")[1].strip() for m in report["notImplemented"]}
     assert all("scroll" in k.lower() for k in kinds), kinds
+
+
+# --- candles and timeframes, driven in a real DOM -----------------------
+
+
+def test_the_chart_draws_candles_not_a_line(report) -> None:
+    """**OHLC is in the row; a line discards three quarters of every bar.**
+
+    Counts bodies, wicks and volume bars rather than looking for a `<path>`: the
+    previous chart was a single path per continuous run, so "there are nodes in the
+    SVG" passed for both shapes and could not tell them apart.
+    """
+    s = step(report, "tf:default")
+    assert s["bodies"] > 0, "no candle bodies in the chart"
+    assert s["wicks"] == s["bodies"], (
+        f"{s['wicks']} wicks against {s['bodies']} bodies -- every candle has both")
+    assert s["vols"] == s["bodies"], (
+        "the volume strip must have one bar per candle, sharing the x-axis")
+
+
+def test_the_default_timeframe_is_three_months(report) -> None:
+    """Not the widest. The widest view of eleven years is monthly candles, and the
+    question a screen row raises is what the last few months did."""
+    s = step(report, "tf:default")
+    assert s["pressed"] == "3M", f"default timeframe is {s['pressed']!r}"
+    assert s["reportedTf"] == "3M"
+
+
+def test_each_timeframe_changes_the_candle_count(report) -> None:
+    """A button that repaints the same window changed nothing, whatever it painted.
+
+    Monotonic, which is the stronger claim: 1D < 1M < 1Y, each window a superset of
+    the last. It is deliberately not asserted across the 1Y/5Y boundary, because
+    that is where the resolution changes from daily to weekly and five years of
+    weekly bars is legitimately fewer marks than one year of daily ones -- the
+    count going *down* there is the aggregation working.
+    """
+    counts = {tf: step(report, f"tf:{tf}")["bodies"]
+              for tf in ("1D", "1M", "1Y", "5Y", "All")}
+    assert counts["1D"] == 1, (
+        f"1D drew {counts['1D']} candles; with end-of-day bars it is one session")
+    assert counts["1D"] < counts["1M"] < counts["1Y"], counts
+    assert counts["5Y"] > 0 and counts["All"] > 0, counts
+    assert len(set(counts.values())) > 1, "every timeframe drew the same chart"
+
+
+def test_the_long_timeframes_aggregate_and_say_so(report) -> None:
+    """**A monthly candle read as a daily one is a wrong answer about what a day
+    did.** So the chart states its resolution, and states the aggregation rule --
+    open of the first session, close of the last, max high, min low, summed volume --
+    rather than leaving it inferable from tick spacing.
+
+    Aggregation rather than sampling is the whole reason this is here: a *sampled*
+    candle is a bar that never traded, with its four prices taken from one arbitrary
+    session standing in for a month.
+    """
+    assert "daily" in step(report, "tf:1M")["resolution"]
+    weekly = step(report, "tf:5Y")["resolution"]
+    monthly = step(report, "tf:All")["resolution"]
+    assert "weekly" in weekly, weekly
+    assert "monthly" in monthly, monthly
+    for note in (weekly, monthly):
+        assert "open of the first" in note and "summed volume" in note, note
+
+
+def test_the_timeframe_survives_a_ticker_switch(report) -> None:
+    """Asked for directly: looking at 1M and clicking a different name keeps 1M."""
+    after = step(report, "tf:after-reopen")
+    assert after["pressed"] == "1M", (
+        f"the timeframe reset to {after['pressed']!r} on reopening")
+    assert after["reportedTf"] == "1M"
+    assert after["bodies"] > 0, "the chart came back empty after the switch"
+
+
+def test_the_chosen_timeframe_is_written_to_storage(report) -> None:
+    """So it survives a reload, not only a ticker switch.
+
+    Split out because the in-memory variable masks this: mutation showed that
+    deleting the `remember()` call left the across-switch test green, since that
+    behaviour rests on the module-level variable alone. Two mechanisms, two tests.
+
+    Guarded in the runtime because a `file://` page is an opaque origin where
+    touching localStorage throws rather than returning null -- the file origin in
+    `ORIGINS` is what proves the guard, so here only the http case is asserted.
+    """
+    if "mr.test" not in report["url"]:
+        assert step(report, "tf:stored")["storedTf"] in (None, "threw", "1M")
+        return
+    assert step(report, "tf:stored")["storedTf"] == "1M", (
+        "the timeframe was not persisted, so it will not survive a reload")
+
+
+def test_the_gap_bands_survive_the_candles(report) -> None:
+    """**A candle chart must not silently close a 3,000-day hole.**
+
+    This is the reason the x-axis is time rather than bar ordinal. Laying candles
+    out evenly -- what most charting libraries do -- would close the gap by
+    construction and look tidier doing it. The band is drawn from the payload, so it
+    is present whenever the window contains one.
+    """
+    wide = step(report, "tf:All")
+    assert wide["gapBands"] >= 1, "the gap band vanished at All"
+
+
+def test_the_log_toggle_redraws(report) -> None:
+    """Sub-$1 names run 0.0751 to 0.98 and one spike must not flatten the rest. The
+    toggle is the explicit answer; the y-window being per-timeframe rather than
+    whole-history is the implicit one."""
+    on = step(report, "tf:log-on")
+    off = step(report, "tf:log-off")
+    assert "log" in on["resolution"], on["resolution"]
+    assert "log" not in off["resolution"], off["resolution"]
+    assert on["bodies"] == off["bodies"], "the log toggle changed the window too"

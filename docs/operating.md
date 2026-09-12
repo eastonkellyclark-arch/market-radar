@@ -41,6 +41,14 @@ uv run mr dashboard          # build and open the local dashboard
 
 That is the main way to look at the system. Everything else is occasional.
 
+It takes about **five minutes** and writes a **~5.8 MB** file, because the ticker
+chart reads all eleven price partitions rather than the two a screen needs — a 5Y
+button on two years of data would be a lie. Candle timeframes are 1D through All,
+default 3M, and the selection follows you from one ticker to the next. At 5Y and All
+the candles are weekly and monthly **aggregates** (open of the first session, close
+of the last, max high, min low, summed volume) and the chart says which; `log` is
+there for the sub-$1 names, where a 0.0751-to-0.98 range otherwise reads flat.
+
 **Enrichment that must stay local.** yfinance is rate-limited by IP and Actions
 runners sit on datacenter ranges. Any job importing it is unreachable from
 `.github/workflows/` on purpose, and the market-cap step for the Tier 2 shortlist

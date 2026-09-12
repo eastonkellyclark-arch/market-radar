@@ -208,6 +208,55 @@ if (hit) {
     barRows: $$('#tk-bars tbody tr').length,
   }));
 
+  /* --- the timeframe buttons ----------------------------------------- */
+
+  /* What a candle chart is, counted: bodies, wicks and volume bars, plus the
+     pressed button and the stated resolution. A timeframe that changes none of
+     these changed nothing, whatever it painted. */
+  const chart = () => ({
+     bodies: $$('#tk-chart rect.ck-body').length,
+     wicks: $$('#tk-chart line.ck-wick').length,
+     vols: $$('#tk-chart rect.ck-vol').length,
+     pressed: ($$('#tk-tfs button[aria-pressed="true"]')[0] || {}).textContent || null,
+     resolution: $('#tk-res') ? $('#tk-res').textContent.trim() : null,
+     gapBands: $$('#tk-chart rect[fill="var(--gapfill)"]').length,
+     yLabels: $$('#tk-chart text').length,
+     reportedTf: typeof window.__MR_TK_TF__ === 'function' ? window.__MR_TK_TF__() : null,
+  });
+
+  steps.push(snapshot('tf:default', chart()));
+
+  for (const name of ['1D', '1M', '1Y', '5Y', 'All']) {
+    const btn = $(`#tk-tfs button[data-tf="${name}"]`);
+    if (!btn) { continue; }
+    click(btn);
+    steps.push(snapshot(`tf:${name}`, chart()));
+  }
+
+  /* --- log axis ------------------------------------------------------- */
+  const logBox = $('#tk-log');
+  if (logBox) {
+    logBox.checked = true;
+    logBox.dispatchEvent(new window.Event('change', { bubbles: true }));
+    steps.push(snapshot('tf:log-on', chart()));
+    logBox.checked = false;
+    logBox.dispatchEvent(new window.Event('change', { bubbles: true }));
+    steps.push(snapshot('tf:log-off', chart()));
+  }
+
+  /* --- the selection survives a ticker switch -------------------------- */
+  /* Set a non-default timeframe, leave, come back. The payload covers one symbol,
+     so "switch" means closing to the panel and clicking the row again -- which is
+     the same code path a different name takes. */
+  click($('#tk-tfs button[data-tf="1M"]'));
+  let storedTf = null;
+  try { storedTf = window.localStorage.getItem('mr.tk.tf'); } catch (e) { storedTf = 'threw'; }
+  steps.push(snapshot('tf:stored', { storedTf }));
+  click($('#tk-x'));
+  const again = rowsHere().find((r) => known.has(r.getAttribute('data-ticker')));
+  if (again) { click(again); }
+  steps.push(snapshot('tf:after-reopen', chart()));
+
   /* --- and close comes back to the panel it was opened from ---------- */
   click($('#tk-x'));
   steps.push(snapshot('click:close'));

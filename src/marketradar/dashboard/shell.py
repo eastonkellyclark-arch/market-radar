@@ -1090,7 +1090,7 @@ def render(
         parts.append(
             "window.__TK__=" + json.dumps(details, separators=(",", ":")) + ";"
         )
-        parts.append(tk.SCRIPT)
+        parts.append(tk.script())
     # Last, and unconditional. Every script above only *registers* a binder;
     # this is the one that calls them, and it is what moves the page from
     # fourteen stacked panels to one. Appending it before a registration
@@ -1260,13 +1260,34 @@ table.rows th.num {{ text-align:right; }}
 table.rows td {{ padding:3px 8px 3px 0; border-bottom:1px solid var(--rule); }}
 td.tk {{ font-weight:600; font-variant-numeric:tabular-nums; }}
 td.new {{ color:#0ca30c; font-size:9.5px; font-weight:700; width:26px; }}
-:root {{ --series:#2a78d6; --axis:#c3c2b7; --gapfill:rgba(250,178,25,.14); }}
+/* --cup / --cdown are the candle directions. Two hues either side of
+   unchanged, not the status palette -- a down day is not a warning, and
+   reusing good/serious here would say it was. Defined on bare :root as well as
+   both dark paths: a colour whose only definition sits inside a media query
+   is absent in the un-stamped default, which is the classic unreadable-chart
+   bug. */
+:root {{ --series:#2a78d6; --axis:#c3c2b7; --gapfill:rgba(250,178,25,.14);
+  --cup:#1d7a4c; --cdown:#b1402f; }}
 @media (prefers-color-scheme: dark) {{
   :root:not([data-theme="light"]) {{ --series:#3987e5; --axis:#383835;
-    --gapfill:rgba(250,178,25,.10); }}
+    --gapfill:rgba(250,178,25,.10); --cup:#35b877; --cdown:#e2684f; }}
 }}
 :root[data-theme="dark"] {{ --series:#3987e5; --axis:#383835;
-  --gapfill:rgba(250,178,25,.10); }}
+  --gapfill:rgba(250,178,25,.10); --cup:#35b877; --cdown:#e2684f; }}
+/* The timeframe row. `aria-pressed` carries the selection rather than a class,
+   so the state is in the accessibility tree and not only in the paint. */
+.tkbar {{ display:flex; align-items:center; justify-content:space-between;
+  gap:12px; margin:0 0 8px; flex-wrap:wrap; }}
+.tfs {{ display:inline-flex; gap:2px; flex-wrap:wrap; }}
+.tfs button {{ font:inherit; font-size:11.5px; padding:2px 8px; cursor:pointer;
+  color:var(--ink-2); background:var(--plane);
+  border:1px solid var(--rule); border-radius:3px; }}
+.tfs button:hover {{ color:var(--ink); }}
+.tfs button[aria-pressed="true"] {{ color:var(--surface);
+  background:var(--ink); border-color:var(--ink); }}
+.tflog {{ font-size:11.5px; color:var(--ink-2); display:inline-flex;
+  align-items:center; gap:4px; cursor:pointer; }}
+.ck-wick, .ck-body, .ck-vol {{ shape-rendering:crispEdges; }}
 .tk {{ border:1px solid var(--rule); border-radius:8px; padding:12px 14px;
        margin:8px 0 12px; background:var(--plane); }}
 .tkhead {{ display:flex; align-items:baseline; gap:12px; margin-bottom:8px; }}

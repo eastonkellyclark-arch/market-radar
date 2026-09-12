@@ -231,6 +231,37 @@ def read_prices(
     return rel
 
 
+def read_all_prices(
+    con: duckdb.DuckDBPyConnection,
+) -> duckdb.DuckDBPyRelation:
+    """Every declared price partition, for a consumer that needs the whole history.
+
+    **Deliberately not what a screen reads.** `read_prices` takes the current year
+    and the prior one, which is everything a day's move needs and is the right read
+    for a nightly job. A chart with a 5Y and an All button needs all eleven, and
+    reusing the screen's relation quietly made both of those buttons mean "the last
+    two calendar years" -- measured 2026-09-12 as 21 monthly bars for a ticker with
+    1,371 sessions on disk.
+
+    So the two reads are separate, and the difference is the point rather than an
+    oversight: the cost is eleven partition reads on a hand-run command instead of
+    two on a scheduled one.
+    """
+    years = sorted(
+        r.partition for r in manifest.datasets() if r.dataset == DATASET
+    )
+    if not years:
+        raise ValueError(
+            f"no {DATASET} partitions are declared, so there is no history to read. "
+            "An empty relation here would render an empty chart, which looks exactly "
+            "like a ticker with no bars."
+        )
+    rel = storage.read_dataset(DATASET, years[0], con=con)
+    for year in years[1:]:
+        rel = rel.union(storage.read_dataset(DATASET, year, con=con))
+    return rel
+
+
 def read_actions(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
     """Corporate actions from Postgres.
 

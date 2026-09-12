@@ -1454,8 +1454,12 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
         try:
             names = {m.ticker for sl in digest.screen.lists for m in sl.rows}
+            # **The whole history, not the screen's two-year window.** The
+            # chart's 5Y and All buttons are meaningless on two partitions, and
+            # reusing `read_prices` made both of them mean "the last two calendar
+            # years" without saying so.
             details = tickers.build(
-                con, volatility.read_prices(con, digest.day), names,
+                con, volatility.read_all_prices(con), names,
                 actions=volatility.read_actions(con),
             )
         except Exception as exc:
