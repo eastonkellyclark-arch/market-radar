@@ -2235,6 +2235,179 @@ def multiples_html(
       {stages}"""
 
 
+#: What each promotion leg is keyed on, in the order the run reports them.
+#: Shared by value with `screens/promote.REASONS` rather than imported as a map:
+#: the wording is a sentence for a reader and the identifiers are the contract,
+#: and a test asserts the two sets of keys agree so a new leg cannot render as a
+#: blank row.
+_PROMOTION_LEGS: Final[dict[str, str]] = {
+    "volatility": "ticker resolved through company_tickers, then the CIK",
+    "deal_filing": "the deals.cik column, which the loader wrote",
+    "form4_cluster": "the CIK inside signals.accession -- the only place a "
+                     "stored cluster carries one",
+}
+
+
+# --- U16: today's promoted set ------------------------------------------
+
+
+def promoted_html(
+    rows: list[dict[str, Any]],
+    stats: dict[str, Any] | None = None,
+    funnel: dict[str, Any] | None = None,
+) -> str:
+    """The Tier 2 population for one session: promoted, gated, rendered.
+
+    **Three independent facts per row, and the gaps between them are the panel.**
+    *Promoted* comes from three sentinels, *deckable* from the DCF population, and
+    *rendered* from a directory listing taken as this page was written. A row that
+    is deckable with no file means the scheduled task has not run for this
+    session; every row like that means it has not run at all -- which is the exact
+    objection that was raised against automating decks in the first place, and the
+    only place on the dashboard that answers it.
+
+    This panel exists because the other two were a different slice. The DCF table
+    shows its top 20 by evidence quality and the deck preview its top 20 by
+    substitution depth; the promoted set is neither, so on the measured session
+    two rows in the entire dashboard carried a deck link while 30 filers had one.
+    A link that appears for reasons a reader cannot reconstruct is a decoration.
+    """
+    stats = stats or {}
+    if stats.get("error"):
+        return ('<p class="why"><span class="why-k">refused</span> '
+                f'{_esc(str(stats["error"]))}</p>')
+    if not rows:
+        return ('<p class="why"><span class="why-k">waiting</span> No promoted '
+                "set. It is computed from the day's volatility screen, so it "
+                "needs the screens to have been built &mdash; "
+                "<code>mr dashboard</code> without <code>--fast</code>.</p>")
+
+    promoted = int(stats.get("promoted") or 0)
+    deckable = int(stats.get("deckable") or 0)
+    rendered = int(stats.get("rendered") or 0)
+    legs = stats.get("legs") or {}
+    unresolved = stats.get("unresolved") or {}
+
+    body = []
+    for row in rows[:ROWS_PER_LIST]:
+        reasons = " ".join(
+            f'<span class="collapsed">{_esc(r)}</span>'
+            for r in row.get("reasons") or [])
+        # The reason lives on the row, not in a tooltip. A promoted name whose
+        # reason is hover-only is a name nobody can audit from a screenshot --
+        # the same rule the survivorship caveat is held to.
+        why = "; ".join(str(v) for v in (row.get("why") or {}).values())
+        symbols = list(row.get("tickers") or [])
+        sym = _esc(str(row.get("ticker") or "--"))
+        if len(symbols) > 1:
+            sym += f' <span class="note">+{len(symbols) - 1}</span>'
+        if row.get("deck_href"):
+            deck = (f'<a class="decklink" href="{_esc(row["deck_href"])}" '
+                    f'title="Open the deck rendered in the '
+                    f'{_esc(str(row.get("deck_run") or ""))} run">'
+                    "deck &#8599;</a>")
+        elif row.get("deckable"):
+            deck = ('<span class="pending" title="Has a valuation, so a deck '
+                    'can be drawn -- but none is on disk. Run '
+                    '`mr decks --promoted`.">not rendered</span>')
+        else:
+            deck = ('<span class="note" title="No DCF valuation, so nine of the '
+                    'ten pages would carry no number. Reported, not rendered.">'
+                    "gated out</span>")
+        ev = row.get("enterprise_value")
+        body.append(
+            f'<tr data-deckable="{"1" if row.get("deckable") else "0"}">'
+            f'<td class="tk">{_esc(str(row.get("company") or ""))}</td>'
+            f"<td>{sym}</td>"
+            f"<td>{reasons}</td>"
+            f'<td class="num">{_money(str(ev)) if ev else "--"}</td>'
+            f"<td>{deck}</td>"
+            # **Not truncated.** A 150-character cap cut the tail off exactly
+            # one row in the fixture, and the tail was "a warrant does not move
+            # with its common share" -- the caveat, not the padding. A cell that
+            # wraps is cheaper than a caveat that is sometimes there.
+            f'<td class="note">{_esc(why)}</td>'
+            "</tr>"
+        )
+
+    leg_rows = "".join(
+        f'<tr><td class="tk">{_esc(name)}</td>'
+        f'<td class="num">{int(legs.get(name) or 0)}</td>'
+        f'<td class="num">{int(unresolved.get(name) or 0)}</td>'
+        f'<td class="note">{_esc(_PROMOTION_LEGS.get(name, ""))}</td></tr>'
+        for name in _PROMOTION_LEGS
+    )
+    stages = _funnel_html(funnel) if funnel else ""
+    # Built here rather than inline in the template: wrapping it across
+    # source lines put a newline inside "1 rendered", which reads fine in a
+    # browser and is invisible to anything checking the page for the phrase.
+    # **The table's own cap, stated.** Every panel here shows 20 rows and this
+    # one is a list of 186, deckable first -- so a reader seeing twenty links
+    # would reasonably conclude twenty is all there is. A bounded list that does
+    # not say what it bounded reads as complete coverage, which is the funnel
+    # rule applied to the table rather than to the screen.
+    shown = (f"Showing the first {min(len(rows), ROWS_PER_LIST):,} of "
+             f"{len(rows):,} promoted filers, the ones with a deck first. "
+             f"The counts above are over all {promoted:,}.")
+    counts = (f"{promoted:,} promoted, {deckable:,} deckable, "
+              f"{rendered:,} rendered")
+    gap = deckable - rendered
+    if not rendered:
+        health = ('<strong>nothing rendered for this session.</strong> '
+                  "<code>mr decks --promoted</code> has not run since this "
+                  "screen, or the scheduled task is not registered")
+    elif gap > 0:
+        health = (f"<strong>{gap:,} of the {deckable:,} deckable names have no "
+                  "file</strong>, so the last run predates this session")
+    else:
+        health = (f"every deckable name has a file &mdash; the run is current "
+                  f"with the {_esc(str(stats.get('day') or ''))} session")
+
+    return f"""
+      <p class="why"><span class="why-k">how to read this</span>
+        Three facts per row, each from somewhere else: <strong>promoted</strong> by
+        the three sentinels, <strong>deckable</strong> by the DCF population, and
+        <strong>rendered</strong> by a directory listing taken as this page was
+        written. For {_esc(str(stats.get("day") or ""))}:
+        <strong>{counts}</strong> &mdash; and {health}.</p>
+      <p class="note">{promoted - deckable:,} promoted names have no valuation and
+        are <em>reported rather than rendered</em>. A deck of one of them would be
+        ten pages of &ldquo;no valuation&rdquo;, &ldquo;no peer set&rdquo; and an
+        empty candle chart, and a deck is the easiest artifact here to mistake for
+        an authoritative one. 85% leaving at that stage is the DCF population, not
+        a broken filter &mdash; read the funnel below rather than the length of
+        the list.</p>
+      <table class="rows">
+        <thead><tr><th>filer</th><th>symbol</th><th>promoted by</th>
+          <th class="num">enterprise value</th><th>deck</th>
+          <th>why, as the run logged it</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+      <p class="note">{shown}</p>
+      <h5>the three legs, before the union</h5>
+      <table class="rows">
+        <thead><tr><th>leg</th><th class="num">filers</th>
+          <th class="num">unkeyed</th><th>what it is keyed on</th></tr></thead>
+        <tbody>{leg_rows}</tbody>
+      </table>
+      <p class="note">A <code>form4_cluster</code> is promoted on a
+        <strong>{int(stats.get("form4_window") or 0)}-day window</strong> over
+        <code>occurred_at</code>, which is the cluster's first <em>purchase</em>
+        and not the day it became visible. Over 19,127 historical clusters that
+        gap is a median of 3 days and a p90 of 7, so the window is the p90 and
+        about a decile of clusters land outside it. Asking for clusters stamped
+        today found <strong>0 with 28 in the table</strong>.</p>
+      <p class="note">A filer with more than one symbol shows the one that earned
+        the promotion &mdash; the largest move &mdash; with a count of the rest.
+        <strong>Not the primary listing</strong>, which is not knowable from what
+        is stored: 527 of 1,452 multi-symbol filers have a shortest symbol that is
+        not a prefix of the others, and shortest-then-alphabetical resolves
+        JPMorgan to <code>AMJB</code>. So a promoted symbol can be a warrant, and
+        the deck then draws the warrant's chart under the company's
+        fundamentals.</p>
+      {stages}"""
+
+
 # --- U14: deck preview ---------------------------------------------------
 
 

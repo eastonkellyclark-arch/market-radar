@@ -58,6 +58,7 @@ from typing import Any, Final, Iterable, Iterator
 import httpx
 
 from marketradar import manifest
+from marketradar.entities.cik import cik_bare, cik_key
 from marketradar.freshness import StaleDataError, assert_fresh, utc_today
 from marketradar.signals.edgar_rss import (
     EdgarError,
@@ -287,7 +288,11 @@ def parse_header(
             event = None
     return Filing(
         accession=accession,
-        cik=cik.lstrip("0") or "0",
+        # `deals.cik` is stored unpadded, and `cik_bare` is what says so.
+        # This was `cik.lstrip("0") or "0"`, which turned an empty CIK into
+        # the string "0" -- a real-looking identifier for a filing that
+        # carried none.
+        cik=cik_bare(cik),
         company=company,
         form=form,
         filed=filed,
@@ -1180,8 +1185,11 @@ def filings_for_cik(
     proxies costs nothing either.
     """
     archives = manifest.get("edgar", "archives").location
+    # The submissions endpoint is `CIK##########.json`, so this one is padded.
+    # Four lines from a `lstrip("0")` that is not, which is exactly why both
+    # spellings now come from `entities/cik.py` rather than from here.
     url = manifest.get("sec_submissions", "company").location.format(
-        cik=str(cik).lstrip("0").zfill(10)
+        cik=cik_key(cik)
     )
     headers = {"User-Agent": user_agent(), "Accept-Encoding": "gzip, deflate"}
     con, owns = _client(client)
@@ -1212,9 +1220,11 @@ def filings_for_cik(
                     continue
                 bare = accession.replace("-", "")
                 target_side.append(TargetFiling(
-                    accession=accession, cik=str(cik).lstrip("0"),
+                    accession=accession, cik=cik_bare(cik),
                     company=company, form=form, filed_date=filed,
-                    url=(f"{archives}/edgar/data/{str(cik).lstrip('0')}/"
+                    # EDGAR's archive paths are unpadded: /edgar/data/66740/
+                    # resolves and /edgar/data/0000066740/ does not.
+                    url=(f"{archives}/edgar/data/{cik_bare(cik)}/"
                          f"{bare}/{accession}.txt"),
                 ))
                 continue
@@ -1235,7 +1245,7 @@ def filings_for_cik(
             if since is not None and filed < since:
                 continue
             bare = accession.replace("-", "")
-            base = f"{archives}/edgar/data/{str(cik).lstrip('0')}/{bare}/"
+            base = f"{archives}/edgar/data/{cik_bare(cik)}/{bare}/"
             pacer.wait()
             try:
                 page = con.get(base + accession + "-index-headers.html",
@@ -1245,7 +1255,7 @@ def filings_for_cik(
                 log.warning("skipping %s: %s", accession, exc)
                 continue
             filing = parse_header(
-                page.text, accession=accession, cik=str(cik).lstrip("0"),
+                page.text, accession=accession, cik=cik_bare(cik),
                 company=company, form=form, filed=filed, base=base,
             )
             if filing.is_deal_item:

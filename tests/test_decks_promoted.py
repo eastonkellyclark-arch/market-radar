@@ -326,3 +326,178 @@ def test_the_scheduled_task_runs_the_command_the_parser_accepts(repo_root):
     assert args.promoted is True, (
         f"the wrapper runs `mr decks {' '.join(flags)}`, which is not a "
         "promoted run")
+
+
+# --- the promoted-set panel ---------------------------------------------
+
+
+def test_the_panel_leg_names_are_the_promotion_legs() -> None:
+    """The wording is a sentence and the identifiers are the contract.
+
+    `_PROMOTION_LEGS` is keyed by value rather than imported as a map, because
+    what it holds is prose for a reader and `REASONS` is the code's answer. So
+    something has to assert the two sets of keys agree: a fourth leg added to
+    `promote.REASONS` would otherwise render as a leg table missing a row, and a
+    leg renamed there would render as a row with a blank explanation.
+
+    Mutated to confirm it fires: dropping `form4_cluster` from `_PROMOTION_LEGS`
+    turns it red and names the missing key.
+    """
+    from marketradar.screens import promote
+
+    assert set(panels._PROMOTION_LEGS) == set(promote.REASONS), (
+        "the panel's leg table and promote.REASONS disagree: "
+        f"panel-only={sorted(set(panels._PROMOTION_LEGS) - set(promote.REASONS))}, "
+        f"code-only={sorted(set(promote.REASONS) - set(panels._PROMOTION_LEGS))}")
+    # Order too, because the table renders in dict order and the run reports in
+    # REASONS order. Two different orders for the same three things is the kind
+    # of drift nobody notices and everybody has to re-read.
+    assert tuple(panels._PROMOTION_LEGS) == promote.REASONS
+
+
+def test_the_panel_reports_rendered_separately_from_deckable() -> None:
+    """**The gap between deckable and rendered is the only health signal.**
+
+    "27 promoted names can produce a deck" is true of a machine whose deck job
+    stopped last Tuesday. "27 can, 1 has a file" is not. So the two counts are
+    rendered separately and the sentence between them says which case this is.
+    """
+    from conftest import PROMOTED_ROWS
+
+    html = panels.promoted_html(PROMOTED_ROWS["rows"], PROMOTED_ROWS["stats"],
+                                PROMOTED_ROWS["funnel"])
+    assert "186 promoted, 27 deckable, 1 rendered" in html
+    assert "26 of the 27 deckable names have no file" in html
+    assert "the last run predates this session" in html
+
+
+def test_a_deckable_name_with_no_file_says_so_rather_than_nothing() -> None:
+    """Three states, three different cells, because they mean three things.
+
+    A link means open it. "not rendered" means the job owes you a file. "gated
+    out" means it never will, and why. An empty cell for the middle case would
+    read as the third.
+    """
+    from conftest import PROMOTED_ROWS
+
+    html = panels.promoted_html(PROMOTED_ROWS["rows"], PROMOTED_ROWS["stats"])
+    assert 'class="decklink"' in html          # the rendered one
+    assert "not rendered" in html              # deckable, no file
+    assert "gated out" in html                 # no valuation
+    assert "0000320193_clean.pptx" in html
+
+
+def test_nothing_rendered_at_all_names_the_command_and_the_task() -> None:
+    """The case that says the scheduled task was never registered.
+
+    Distinct from "the last run predates this session": one is a stale run and
+    the other is no run, and only the second is a setup problem.
+    """
+    from conftest import PROMOTED_ROWS
+
+    rows = [dict(r, deck_href="", deck_run="") for r in PROMOTED_ROWS["rows"]]
+    stats = dict(PROMOTED_ROWS["stats"], rendered=0)
+    html = panels.promoted_html(rows, stats)
+    assert "nothing rendered for this session" in html
+    assert "mr decks --promoted" in html
+    assert "scheduled task is not registered" in html
+    assert 'class="decklink"' not in html
+
+
+def test_the_promotion_reason_is_on_the_row_not_in_a_tooltip() -> None:
+    """A reason that is hover-only is absent from a screenshot.
+
+    Same rule the deal-outcome caveat is held to by
+    `test_the_caveat_is_not_hover_only_in_the_panel`: strip every attribute and
+    the text still has to be there, because a promoted name nobody can audit is
+    a name that gets trusted by default.
+    """
+    import re as _re
+
+    from conftest import PROMOTED_ROWS
+
+    html = panels.promoted_html(PROMOTED_ROWS["rows"], PROMOTED_ROWS["stats"])
+    stripped = _re.sub(r'\s(?:title|data-[\w-]+)="[^"]*"', "", html)
+    assert "+8.5% on 2026-09-11" in stripped
+    assert "a warrant does not move with its common share" in stripped
+    assert "volatility" in stripped and "form4_cluster" in stripped
+
+
+def test_the_panel_carries_the_funnel_rather_than_just_a_count() -> None:
+    """A short list is either selective or broken.
+
+    85% of the promoted set leaves at one stage. Without the stage counts beside
+    it, "27" is indistinguishable from a filter that emptied the population --
+    which is the failure the funnel module exists for, one layer out.
+    """
+    from conftest import PROMOTED_ROWS
+
+    html = panels.promoted_html(PROMOTED_ROWS["rows"], PROMOTED_ROWS["stats"],
+                                PROMOTED_ROWS["funnel"])
+    for stage in ("sentinel hits", "not an ETF", "keyed on a CIK",
+                  "has a valuation"):
+        assert stage in html, f"the funnel is missing the {stage!r} stage"
+    assert "353" in html and "216" in html
+
+
+def test_the_panel_states_the_form4_window_and_the_symbol_limitation() -> None:
+    """Two measured caveats, rendered where the numbers are.
+
+    The Form 4 window drops about a decile of clusters and the promoted symbol
+    can be a warrant. Both change what a row means, so neither is a footnote.
+    """
+    from conftest import PROMOTED_ROWS
+
+    html = panels.promoted_html(PROMOTED_ROWS["rows"], PROMOTED_ROWS["stats"])
+    assert "7-day window" in html
+    assert "median of 3 days and a p90 of 7" in html
+    assert "527 of 1,452" in html
+    assert "AMJB" in html
+
+
+def test_a_promoted_panel_with_no_screen_waits_rather_than_lying() -> None:
+    """`--fast` skips the digest, so there is no screen and no promoted set.
+
+    Empty, not zero. "0 promoted" would be a claim about the market; "waiting"
+    is a claim about this build, and only one of them is true.
+    """
+    html = panels.promoted_html([], {})
+    assert "waiting" in html
+    assert "without <code>--fast</code>" in html
+
+
+def test_a_refusal_from_the_promotion_reaches_the_panel(monkeypatch) -> None:
+    """`PromoteError` is a refusal, and a refusal is not a waiting state.
+
+    The volatility leg raises when 0 of N tickers resolve, because an empty join
+    is the one result that looks like a correct answer. The panel has to show
+    that as a refusal rather than as a quiet day.
+    """
+    html = panels.promoted_html(
+        [{"cik": "1", "company": "X", "reasons": [], "why": {}}],
+        {"error": "0 of 208 stock tickers in the 2026-09-11 screen resolved"})
+    assert "refused" in html
+    assert "0 of 208 stock tickers" in html
+
+
+def test_the_table_says_what_it_capped() -> None:
+    """**Twenty links out of 186 rows reads as "twenty is all there is".**
+
+    Every panel here caps at `ROWS_PER_LIST`, and on this one the list is the
+    whole Tier 2 population sorted deckable-first -- so the cap hides exactly the
+    rows that would show the gap the panel exists to show. A bounded list that
+    does not say what it bounded is a silent cap, which CLAUDE.md bans for a
+    workflow and which is the same mistake here.
+
+    Mutated to confirm it fires: removing the `{shown}` line from the template
+    leaves the twenty rows and the counts, and nothing saying the two disagree.
+    """
+    from conftest import PROMOTED_ROWS
+
+    rows = PROMOTED_ROWS["rows"] * 60          # 240 rows, well past the cap
+    html = panels.promoted_html(rows, PROMOTED_ROWS["stats"])
+    assert f"Showing the first {panels.ROWS_PER_LIST:,} of 240 promoted filers" \
+        in html
+    assert "The counts above are over all 186." in html
+    # And the cap is real: the table must not quietly render all 240.
+    assert html.count("<tr data-deckable") == panels.ROWS_PER_LIST

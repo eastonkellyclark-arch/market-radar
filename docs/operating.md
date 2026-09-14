@@ -138,11 +138,15 @@ checkpoint. `mr symbols` prints `N of M chunks done` so you can see that it did.
    7 sessions. A jump in it means missing corporate actions, not a market event.
    The residual backlog is ~3,300 unexplained jumps and ~1,200 falls across ~1,600
    tickers, so a change matters more than the level.
-4. **`uv run mr dashboard`** if you want to look at anything in detail. The
-   deck panel's first line says how many filers have a rendered deck and **what
-   the newest automated run was dated** — that date is the check that separates
-   a quiet night from a generator that stopped. Rows whose filer has a deck link
-   straight to it.
+4. **`uv run mr dashboard`** if you want to look at anything in detail. Read
+   **Today's promoted set** first: it is the only panel that is an inventory
+   rather than a sample, and its three numbers come from three places —
+   *promoted* by the sentinels, *deckable* by the DCF population, *rendered* by a
+   directory listing taken as the page was written. A row reading **`not
+   rendered`** means the deck job owes you a file; every row reading it means the
+   scheduled task has not run. The DCF and deck panels link a deck too, but they
+   show their top 20 by evidence quality, so what they link is a different slice
+   from what was generated.
 
 That's it. Most mornings are steps 1 and 3.
 
@@ -193,7 +197,11 @@ else here can be trusted.
   home, by licence. There is deliberately no flag to relax that.
 - **Most DCF rows offer a command, not a link.** The nightly run renders 27 of
   2,569 valuations on purpose. A row with no file is not a filer that cannot have
-  a deck; it is one nothing promoted.
+  a deck; it is one nothing promoted. **Today's promoted set** is the panel that
+  answers "what exists"; the DCF table answers "what is worth reading", and they
+  overlap by about two rows.
+- **The promoted table shows 20 of 186.** Deckable first, and it says so under
+  the table. The counts and the funnel above it are over the whole set.
 - **The Form 4 leg is usually the smallest, often zero.** `mr form4` is hand-run,
   so the leg is only as fresh as the last time you ran it — and a cluster's
   stored date is its first *purchase*, which precedes the filing that revealed it

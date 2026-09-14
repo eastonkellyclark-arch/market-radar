@@ -554,6 +554,7 @@ the build goes red naming both.
 | Analysis | Deal multiples | `multiples` | live | U12. What a target sold for over what it last reported. The list is short because the population is &mdash; 1.7% of filers whose 10-K history ended appear in the deals table at all |
 | Analysis | Historical outcomes | `outcomes` | live | W3-T3. The survivorship caveat renders beside the number, not in a docstring |
 | Analysis | DCF / 3-statement | `dcf` | live | U13. Enterprise values with every substitution on the row. No row has zero: the ERP and the growth rate are constants on all of them, so the page opens at the cohort clean apart from those two |
+| Analysis | Today's promoted set | `promoted` | live | U16. The Tier 2 population for one session &mdash; promoted by three sentinels, gated on having a valuation, rendered or not. The three numbers come from three places, and the chip reports the *rendered* count because that is the one a stopped deck job changes |
 | Analysis | Pitch decks | `decks` | live | U14. What a deck would say before it is a file. Ten pages; the provenance footer runs on every one from a single code path. Rows whose filer has a rendered deck link to it, from a directory listing taken as the page is written &mdash; never a stored index, because the prune deletes runs. See "Decks on promotion" |
 
 #### Blocking issue, ahead of the backfill
@@ -2118,10 +2119,53 @@ all were; a deck is none of them. `.gitattributes` even carried a
 `*.pptx binary` line, written so a force-added deck would not be line-ending
 mangled — the repo had thought about the file type and only about its encoding.
 
-`test_no_rendered_vendor_artifact_is_tracked` asks the question a pattern list
-cannot: is one tracked right now, read from `git ls-files` rather than from
-`.gitignore`. Untracking them removes them from `HEAD`; **they remain in the
-history**, which is a rewrite-and-force-push decision rather than a code change.
+`test_no_tracked_file_has_the_shape_of_a_vendor_artifact` asks the question a
+pattern list cannot — is one tracked right now, read from `git ls-files` rather
+than from `.gitignore` — and it asks it two ways that fail independently:
+
+- the path matches a glob `.gitattributes` itself marks `binary`, **derived from
+  that file rather than from a list kept here.** A hand-kept list of artifact
+  types is the same mistake one level up, and `.gitattributes` is the file that
+  said `*.pptx binary` while six decks sat in the tree, so it is the list. A
+  future `*.xlsx binary` line arms the check with no edit.
+- the bytes contain a NUL in the first 8 KB — a binary file however it is named,
+  which catches the parquet called `notes.txt` that no extension list can.
+
+Mutated three ways: run before `git rm --cached` it named all six; with the
+`*.pptx binary` line deleted the NUL sniff caught them anyway; and a NUL byte in
+a file named `.py` is caught with no attribute involved.
+
+`VENDOR_ALLOWLIST` is the carve-out CLAUDE.md permits for parser fixtures, and it
+is **empty and size-capped** — "small, deliberately chosen" is a rule, so it has
+a number (256 KB), and adding a fixture is a diff naming the file rather than a
+directory that accepts whatever is dropped in.
+
+#### And they were never actually published
+
+Checked before rewriting anything, 2026-09-13, because the remediation depends on
+it: **`origin/main` was 13 commits behind and `3083eb8` had never been pushed.**
+`git ls-remote` plus `git fetch --tags` and then `cat-file -e` on all six blobs
+says GitHub never held any of them, and the ancestry confirms the direction —
+`origin/main` is an ancestor of the deck commit, not a descendant. So the
+licensing exposure was local, and the force-push the rewrite seemed to require was
+not needed for it.
+
+The history was rewritten anyway, with `git filter-repo --invert-paths --path
+.decks/`, because the blobs being in *local* history means the next push carries
+them. Two things about how that went are worth recording:
+
+- **filter-repo only renames the commits it has to.** `.decks/` existed in exactly
+  one commit, so 74 of the 87 kept their SHAs, `origin/main` stayed an ancestor of
+  the rewritten `main`, and the push **fast-forwarded**. No force, and the four
+  Release tags — `form5500`, `reference-data`, `selftest-fixture`, `xbrl`, which
+  the manifest resolves assets through — stayed inside `main`'s history. A
+  force-push would have orphaned them.
+- **A partial-history rewrite is the thing to check for, not to assume.** Had the
+  tags pointed at commits the rewrite renamed, the old history would have stayed
+  reachable through them and the whole exercise would have been theatre.
+
+Verified from a fresh `--mirror` clone of GitHub: no `.pptx` path, no `.decks`
+path, and `cat-file -e` absent on all six blob SHAs.
 
 ### Comps — peer sets, measured 2026-09-12
 
@@ -2284,6 +2328,7 @@ is not a comparison.
   on target financials, which are disclosed in under 10% of deals
 - `U13` DCF / 3-statement panel
 - `U14` deck preview — the generated pitch deck, before it is a file
+- `U16` today's promoted set — what the nightly deck run was given, what it drew, and the gap
 
 The placeholders for all of these exist from `U0`. They say "not built yet"
 and which weekend, so the shell is a roadmap you can look at rather than one

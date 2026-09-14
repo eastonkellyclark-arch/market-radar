@@ -40,6 +40,7 @@ import duckdb
 import httpx
 
 from marketradar import manifest, storage
+from marketradar.entities.cik import cik_key
 from marketradar.freshness import assert_fresh
 
 log = logging.getLogger(__name__)
@@ -183,7 +184,10 @@ def parse_feed(xml: str, form_type: str) -> list[Filing]:
         cik = None
         cik_match = re.search(r"\((\d{7,10})\)", company)
         if cik_match:
-            cik = cik_match.group(1).zfill(10)
+            # Padded, because `Filing.cik` is compared and stored. Through
+            # the helper rather than `.zfill(10)`: the two agree on a
+            # seven-digit CIK and the helper is the one that is a rule.
+            cik = cik_key(cik_match.group(1))
             company = company[: cik_match.start()].strip()
 
         out.append(

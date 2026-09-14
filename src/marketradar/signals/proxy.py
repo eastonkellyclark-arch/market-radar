@@ -78,6 +78,7 @@ from dataclasses import dataclass, field as dc_field
 from datetime import date
 from typing import Any, Final
 
+from marketradar.entities.cik import cik_bare
 from marketradar.llm import router
 
 log = logging.getLogger(__name__)
@@ -1098,7 +1099,8 @@ def fetch_document(
     if pacer is not None:
         pacer.wait()
     listing = client.get(
-        INDEX_JSON.format(archives=archives, cik=str(cik).lstrip("0"),
+        # Unpadded: EDGAR's archive paths are, and only these paths are.
+        INDEX_JSON.format(archives=archives, cik=cik_bare(cik),
                           bare=bare),
         headers=headers,
     )
@@ -1115,7 +1117,7 @@ def fetch_document(
     if pacer is not None:
         pacer.wait()
     doc = client.get(
-        f"{archives}/edgar/data/{str(cik).lstrip('0')}/{bare}/{docs[0]}",
+        f"{archives}/edgar/data/{cik_bare(cik)}/{bare}/{docs[0]}",
         headers=headers,
     )
     doc.raise_for_status()

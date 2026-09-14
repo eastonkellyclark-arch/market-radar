@@ -180,6 +180,10 @@ class Context:
     multiples: dict[str, Any] = field(default_factory=dict)
     #: Deck subjects, their substitution depth and the page list.
     decks: dict[str, Any] = field(default_factory=dict)
+    #: Today's promoted Tier 2 set: what three sentinels noticed, what cleared
+    #: the gate, and what is actually on disk for each. Needs the day's screen,
+    #: so it is empty under `--fast`.
+    promoted: dict[str, Any] = field(default_factory=dict)
     #: ``{cik: {href, run, name, kb}}`` for every deck actually on disk, from a
     #: directory listing taken when the page was rendered. What turns a row's
     #: copy-the-command button into a link, and what lets the deck panel report
@@ -565,6 +569,31 @@ def _probe_multiples(ctx: Context) -> tuple[str, str]:
     )
 
 
+def _probe_promoted(ctx: Context) -> tuple[str, str]:
+    """Live once a promoted set exists, and it reports the *rendered* count.
+
+    Not the promoted count and not the deckable count. Those two say what the
+    sentinels found and what the DCF can value, and both are true of a machine
+    whose deck job stopped running last Tuesday. The number that separates a
+    quiet night from a broken generator is how many files are on disk for *this*
+    session, so that is the one in the chip.
+    """
+    stats = (ctx.promoted or {}).get("stats") or {}
+    if (ctx.promoted or {}).get("error"):
+        return WAITING, str((ctx.promoted or {})["error"])[:60]
+    promoted = int(stats.get("promoted") or 0)
+    if not promoted:
+        return WAITING, "needs the day's screen -- run without --fast"
+    deckable = int(stats.get("deckable") or 0)
+    rendered = int(stats.get("rendered") or 0)
+    tail = ("none rendered -- the deck job has not run for this session"
+            if not rendered else
+            f"{rendered:,} rendered" if rendered >= deckable else
+            f"only {rendered:,} rendered, so the last run predates it")
+    return LIVE, (f"{promoted:,} promoted for {stats.get('day', '')}, "
+                  f"{deckable:,} deckable; {tail}")
+
+
 def _probe_decks(ctx: Context) -> tuple[str, str]:
     """Live once deck subjects exist, and it reports substitution depth.
 
@@ -743,6 +772,13 @@ PANELS: Final[tuple[Panel, ...]] = (
           "from those two.",
           engine="marketradar.screens.dcf",
           probe=_probe_dcf),
+    Panel("promoted", "Today's promoted set", "Analysis",
+          "The Tier 2 population for one session: which filers three sentinels "
+          "promoted, which of them have enough behind them to draw, and which "
+          "have a deck on disk. Three facts from three places, and the gaps "
+          "between them are the panel.",
+          engine="marketradar.screens.promote",
+          probe=_probe_promoted),
     Panel("decks", "Pitch decks", "Analysis",
           "What a deck would say, before it is a file. Ten pages, and the "
           "provenance footer runs on every one from a single code path -- there "
@@ -1103,6 +1139,12 @@ def render(
         (ctx.multiples or {}).get("stats") or {},
         (ctx.multiples or {}).get("funnel"),
     )
+    bodies["promoted"] = body_html.promoted_html(
+        (ctx.promoted or {}).get("rows") or [],
+        ((ctx.promoted or {}).get("stats") or {})
+        | {"error": (ctx.promoted or {}).get("error")},
+        (ctx.promoted or {}).get("funnel"),
+    )
     bodies["decks"] = body_html.decks_html(
         (ctx.decks or {}).get("rows") or [],
         (ctx.decks or {}).get("stats") or {},
@@ -1387,6 +1429,9 @@ td.new {{ color:#0ca30c; font-size:9.5px; font-weight:700; width:26px; }}
   border:1px solid currentColor; border-radius:3px; text-decoration:none;
   vertical-align:middle; white-space:nowrap; }}
 .decklink:hover {{ text-decoration:underline; }}
+/* Deckable with no file. Amber rather than grey: "not rendered" is a thing to
+   act on, and "gated out" -- which is grey -- is not. */
+.pending {{ font-size:10px; color:#fab219; }}
 /* The participant sparkline. A year the sponsor did not file is a *gap* --
    drawn as an empty slot rather than a zero-height bar, because the whole
    point of the series is that an absence is not a headcount of nothing. */

@@ -358,6 +358,76 @@ DECK_ROWS: dict = {
 }
 
 
+#: A loaded promoted-set panel. Four rows, and each one is a branch the panel
+#: renders differently: deckable *and* rendered, deckable with no file, gated out
+#: for want of a valuation, and a filer whose common share and warrant were both
+#: in the screen. A fixture of four rendered decks would leave three of the four
+#: untested -- and the "deckable with no file" row is the one that carries the
+#: only health signal on the page.
+PROMOTED_ROWS: dict = {
+    "rows": [
+        {"cik": "0000320193", "company": "CLEAN MATURE CORP", "ticker": "CMC",
+         "tickers": ["CMC"], "reasons": ["volatility", "deal_filing"],
+         "why": {"volatility": "CMC +8.5% on 2026-09-11 in the $10+ band, "
+                               "+91 ticks",
+                 "deal_filing": "8-K items 1.01,9.01 filed 2026-09-11, "
+                                "operating, filer is acquirer"},
+         "deckable": True, "enterprise_value": "801100000000",
+         "substitutions": ["erp_constant", "growth_constant"],
+         "deck_href": "../.decks/promoted/2026-09-11/0000320193_clean.pptx",
+         "deck_run": "2026-09-11"},
+        {"cik": "0001823584", "company": "WARRANT AND SHARE INC",
+         "ticker": "AENTW", "tickers": ["AENT", "AENTW"],
+         "reasons": ["volatility"],
+         "why": {"volatility": "AENTW +24.6% on 2026-09-11 in the sub$1 band, "
+                               "+617 ticks -- 2 of this filer's symbols were in "
+                               "the screen (AENT, AENTW), and a warrant does "
+                               "not move with its common share"},
+         "deckable": True, "enterprise_value": "90500000000",
+         "substitutions": ["peer_beta", "erp_constant", "growth_constant"],
+         "deck_href": "", "deck_run": ""},
+        {"cik": "0001853070", "company": "NO VALUATION CORP", "ticker": "SOAR",
+         "tickers": ["SOAR"], "reasons": ["deal_filing"],
+         "why": {"deal_filing": "8-K items 2.01,9.01 filed 2026-09-11, "
+                                "division_sale, filer is seller"},
+         "deckable": False, "enterprise_value": None, "substitutions": [],
+         "deck_href": "", "deck_run": ""},
+        {"cik": "0002007919", "company": "INSIDER CLUSTER LTD", "ticker": "",
+         "tickers": [], "reasons": ["form4_cluster"],
+         "why": {"form4_cluster": "3 insider buyers from 2026-09-08"},
+         "deckable": False, "enterprise_value": None, "substitutions": [],
+         "deck_href": "", "deck_run": ""},
+    ],
+    "stats": {
+        "day": "2026-09-11", "promoted": 186, "deckable": 27, "rendered": 1,
+        "legs": {"volatility": 178, "deal_filing": 7, "form4_cluster": 1},
+        "unresolved": {"volatility": 25, "deal_filing": 0, "form4_cluster": 0},
+        "form4_window": 7, "optional": {"peer set": 24}, "multi": 1,
+    },
+    "funnel": {
+        "screen": "promote",
+        "stages": [
+            {"name": "sentinel hits", "remaining": 353,
+             "why": "every screen row, deal filing and cluster",
+             "removed": 0, "share": 0.0, "collapsed": False},
+            {"name": "not an ETF", "remaining": 216,
+             "why": "an ETF files no 10-K and has no CIK",
+             "removed": 137, "share": 0.388, "collapsed": False},
+            {"name": "keyed on a CIK", "remaining": 191,
+             "why": "never through a name", "removed": 25, "share": 0.116,
+             "collapsed": False},
+            {"name": "distinct filers", "remaining": 186,
+             "why": "one row per CIK", "removed": 5, "share": 0.026,
+             "collapsed": False},
+            {"name": "has a valuation", "remaining": 27,
+             "why": "the one input a deck cannot substitute for",
+             "removed": 159, "share": 0.855, "collapsed": False},
+        ],
+        "emptied": None,
+    },
+}
+
+
 def loaded_context(**overrides):
     """A dashboard Context with every source present and nothing empty.
 
@@ -429,6 +499,7 @@ def loaded_context(**overrides):
         proxy=PROXY_ROWS,
         multiples=MULTIPLES_ROWS,
         decks=DECK_ROWS,
+        promoted=PROMOTED_ROWS,
     )
     base.update(overrides)
     ctx = shell.Context(**base)

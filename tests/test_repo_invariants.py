@@ -8,11 +8,13 @@ failing the moment the first source module is written incorrectly.
 from __future__ import annotations
 
 import ast
+import fnmatch
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Final
 
-SRC = Path(__file__).resolve().parents[1] / "src" / "marketradar"
+REPO = Path(__file__).resolve().parents[1]
+SRC = REPO / "src" / "marketradar"
 SOURCES = SRC / "sources"
 SCREENS = SRC / "screens"
 
@@ -594,60 +596,172 @@ def test_no_join_compares_a_raw_cik_column() -> None:
 #: A rendered artifact that carries vendor data out of the warehouse in a
 #: portable file. A deck's price page is thousands of sessions of raw Tiingo
 #: OHLCV and its fundamentals page is XBRL, so the file *is* the data.
-_VENDOR_ARTIFACTS: Final[tuple[str, ...]] = (".pptx", ".xlsx")
+#: Tracked paths allowed to be a binary artifact, with a size ceiling each.
+#: Deliberately **empty**. CLAUDE.md permits "a small, deliberately chosen set of
+#: parser test fixtures -- never a bulk archive", so when the first one arrives it
+#: is added here by hand: a diff naming the file and its reason, rather than a
+#: directory that silently accepts whatever is dropped into it.
+VENDOR_ALLOWLIST: Final[dict[str, int]] = {}
+
+#: How much of a file to read when deciding whether it is binary. A NUL in the
+#: first 8 KB is what git's own heuristic uses.
+_SNIFF: Final[int] = 8192
+
+#: The ceiling on an allowlisted fixture. "Small, deliberately chosen" is a rule
+#: in CLAUDE.md and was previously unenforced, which is how "one parser fixture"
+#: becomes a bulk archive one commit at a time.
+FIXTURE_MAX_BYTES: Final[int] = 256 * 1024
 
 
-def test_no_rendered_vendor_artifact_is_tracked() -> None:
-    """**Six decks were committed, and no rule noticed.**
+def _tracked_files() -> list[str]:
+    """Every path in the index, from git rather than from a walk.
 
-    Found 2026-09-13 while automating deck generation: `3083eb8` added
-    `.decks/*.pptx` and `.decks/before/*.pptx` to a **public** repo. Each one
-    carries a price page built from thousands of sessions of raw Tiingo OHLCV and
-    a fundamentals page from XBRL, which makes it vendor data in a portable file
-    -- the exact thing the R2 boundary exists for, and the exact reason
-    `.dashboard/` is gitignored. A public repo's contents are downloadable, so a
-    committed deck is redistribution under terms that forbid it.
-
-    Why the existing rules missed it, which is the part worth recording: the
-    gitignore invariant checks that *patterns* are present, and `*.parquet`,
-    `*.zip` and `.dashboard/` all were. A deck is none of those. `.gitattributes`
-    even had a `*.pptx binary` line, written so a force-added deck would not be
-    mangled -- the repo had thought about the file type and only about its
-    encoding.
-
-    So this asks the question the pattern list cannot: **is one tracked right
-    now.** `git ls-files` rather than a `.gitignore` grep, because what matters is
-    the index and not the intention. Test fixtures are exempt by the same
-    force-add carve-out `tests/fixtures/**` already has.
-
-    Mutated to confirm it fires: run before `git rm --cached`, it named all six.
+    The index is the thing that gets pushed. A filesystem walk would see the
+    27 gitignored decks sitting in `.decks/` and a `.gitignore` grep would see
+    only the intention -- neither is the fact this rule is about.
     """
     import subprocess
 
     try:
         out = subprocess.run(
-            ["git", "ls-files", "-z"], cwd=SRC.parents[1],
-            capture_output=True, text=True, timeout=60, check=True).stdout
+            ["git", "ls-files", "-z"], cwd=REPO, capture_output=True,
+            text=True, timeout=60, check=True).stdout
     except Exception as exc:                       # no git, or not a checkout
         import pytest
 
         pytest.skip(f"git is not available to read the index: {exc}")
+    return [p for p in out.split("\0") if p]
 
-    tracked = [p for p in out.split("\0") if p]
+
+def _binary_attribute_patterns() -> list[str]:
+    """The glob patterns `.gitattributes` itself marks `binary`.
+
+    **Derived rather than listed, and that is the whole repair.** The rule this
+    replaces carried its own tuple of extensions, which is the same mistake one
+    level up: a hand-kept list of artifact types is a list that the next artifact
+    type is missing from. `.gitattributes` already enumerates every binary shape
+    this repo expects to see -- it is the file that said `*.pptx binary` while six
+    decks sat in the tree -- so it is the list, and adding a type there now arms
+    this check for free.
+    """
+    path = REPO / ".gitattributes"
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) > 1 and "binary" in parts[1:]:
+            out.append(parts[0])
+    return out
+
+
+def test_no_tracked_file_has_the_shape_of_a_vendor_artifact() -> None:
+    """**Six decks were committed to a public repo, and no rule was asking.**
+
+    Found 2026-09-13 while automating deck generation. `3083eb8` added
+    `.decks/*.pptx` and `.decks/before/*.pptx`; each one carries a price page
+    built from 2,688 sessions of raw Tiingo OHLCV and a fundamentals page from
+    XBRL, so the file *is* the data. That is the boundary the R2 bucket exists
+    for and the reason `.dashboard/` is ignored, and a public repo's contents are
+    downloadable, which makes a committed deck redistribution under terms that
+    forbid it.
+
+    **Why every existing rule missed it, because that is the part that generalises.**
+    `test_gitignore_covers_secrets_and_data` checks that *patterns are present* --
+    `*.parquet`, `*.zip`, `.dashboard/` all were, and a deck is none of them. And
+    `.gitattributes` carried a `*.pptx binary` line, added so a force-added deck
+    would not be line-ending mangled. The repo had already identified the file
+    type; it had thought about the *encoding* and not about the exposure.
+
+    So the question here is neither "is the pattern listed" nor "is this
+    extension on my list". It is **does any tracked file have the shape of an
+    artifact**, answered two ways that fail independently:
+
+    - its path matches a glob `.gitattributes` marks `binary` -- the repo's own
+      enumeration, so a future `*.xlsx binary` line arms this check with no edit
+      here
+    - its bytes contain a NUL in the first 8 KB -- a binary file however it is
+      named, which catches the parquet called `notes.txt` that no extension list
+      can
+
+    `git ls-files`, never a filesystem walk: 27 gitignored decks are sitting in
+    `.decks/` as this runs and none of them is the index.
+
+    Mutated to confirm it fires, three ways: run before `git rm --cached` it
+    named all six decks; deleting the `*.pptx binary` line from `.gitattributes`
+    leaves the NUL sniff catching them anyway; and a text file with a NUL byte
+    committed under a `.py` name is caught by the sniff with no attribute at all.
+    """
+    tracked = _tracked_files()
     assert tracked, "the invariant is vacuous; git listed no tracked files"
-    offenders = [
-        p for p in tracked
-        if p.lower().endswith(_VENDOR_ARTIFACTS)
-        and not p.startswith("tests/fixtures/")
-    ]
+    patterns = _binary_attribute_patterns()
+    assert patterns, (
+        ".gitattributes declares no binary types, so half this check is "
+        "vacuous. It listed *.parquet, *.zip and *.pptx when this was written.")
+
+    offenders: dict[str, str] = {}
+    for rel in tracked:
+        allowed = VENDOR_ALLOWLIST.get(rel)
+        path = REPO / rel
+        for pattern in patterns:
+            if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(
+                    PurePosixPath(rel).name, pattern):
+                offenders[rel] = f"matches `{pattern} binary` in .gitattributes"
+                break
+        if rel not in offenders and path.is_file():
+            try:
+                head = path.read_bytes()[:_SNIFF]
+            except OSError:                        # unreadable is not a pass
+                offenders[rel] = "could not be read to check whether it is binary"
+                continue
+            if b"\0" in head:
+                offenders[rel] = "contains a NUL byte, so it is a binary file"
+        if rel in offenders and allowed is not None:
+            size = path.stat().st_size if path.is_file() else 0
+            if size <= allowed:
+                del offenders[rel]
+            else:
+                offenders[rel] = (
+                    f"is allowlisted at {allowed:,} bytes but is {size:,}; "
+                    '"small, deliberately chosen" is the rule and this is a '
+                    "bulk archive")
+
     assert not offenders, (
-        "these rendered artifacts are tracked in a public repo:\n  "
-        + "\n  ".join(offenders)
-        + "\n\nA deck carries raw Tiingo prices and XBRL in a portable file, so "
-        "committing one is redistributing vendor data from a repo anyone can "
-        "clone. Untrack it (`git rm --cached`) and let .gitignore hold it. "
-        "Vendor data goes to R2; nothing vendor-derived goes anywhere public."
+        "these tracked files have the shape of a vendor artifact:\n  "
+        + "\n  ".join(f"{p}: {why}" for p, why in sorted(offenders.items()))
+        + "\n\nThe repo holds code and SQL. A deck, a parquet or a workbook "
+        "carries Tiingo prices or XBRL in a portable file, and this repo is "
+        "public, so committing one redistributes vendor data to anyone who can "
+        "clone it. Untrack it (`git rm --cached`) and let .gitignore hold it; "
+        "vendor data goes to R2.\n\nIf the file genuinely is not vendor-derived "
+        "-- a parser fixture -- add it to VENDOR_ALLOWLIST with a size ceiling, "
+        "so that it is a diff somebody reviewed rather than a directory that "
+        "accepts anything."
     )
+
+
+def test_an_allowlisted_fixture_is_capped_rather_than_trusted() -> None:
+    """"Small, deliberately chosen" is a rule, so it has a number.
+
+    The allowlist is empty today, which makes this vacuous -- the same way the
+    source rules passed trivially while `sources/` was empty, and for the same
+    reason: an empty-passing rule now beats a retrofitted one later. What it
+    guards is the drift where one 4 KB parser fixture becomes a 40 MB archive
+    across six commits nobody read together.
+    """
+    assert FIXTURE_MAX_BYTES <= 1024 * 1024, (
+        "the fixture ceiling has grown past a megabyte, which is no longer "
+        "'small'. A bulk archive belongs in R2 or a Release, per CLAUDE.md.")
+    for rel, ceiling in VENDOR_ALLOWLIST.items():
+        assert ceiling <= FIXTURE_MAX_BYTES, (
+            f"{rel} is allowlisted at {ceiling:,} bytes, above the "
+            f"{FIXTURE_MAX_BYTES:,} ceiling")
+        assert (REPO / rel).is_file(), (
+            f"{rel} is allowlisted but is not in the tree. A stale allowlist "
+            "entry is a hole waiting for a file with that name.")
 
 
 #: `cik_sql(column) = ?` -- the helper on one side of a comparison and a bind
@@ -704,6 +818,98 @@ def test_no_cik_comparison_wraps_only_its_column() -> None:
         "fails silently in the direction that looks like data: a blank page, or "
         "worse, a caveat about missing capex on a filer that reports it. Wrap "
         "both sides -- `cik_sql('?')` is idempotent and already the idiom."
+    )
+
+
+
+#: Every hand-rolled spelling of a CIK normaliser. Found by grepping for the
+#: *operation* rather than for the word "cik", which is how six of them had
+#: survived a rule whose docstring said there must be one.
+_HAND_ROLLED_CIK: Final[tuple[tuple[str, str], ...]] = (
+    (r"lstrip\(\s*['\"]0['\"]\s*\)", "lstrip('0')"),
+    (r"\.zfill\(\s*10\s*\)", ".zfill(10)"),
+    (r"\.rjust\(\s*10", ".rjust(10, '0')"),
+    (r":010d", 'f"{...:010d}"'),
+    # **Width ten, not `lpad(` on its own.** The first version of this list
+    # flagged `selftest.py`'s `lpad((i % 250)::VARCHAR, 4, '0')`, which pads a
+    # synthetic *ticker* to four and has nothing to do with a CIK.
+    #
+    # Zero-padding to ten is only ever a CIK here -- an accession is eighteen
+    # characters and a ticker is five -- so the width is what makes the pattern
+    # specific. Narrowing it to "lines that mention cik" was the other option and
+    # it is worse: it would miss a helper named `_pad`, which is exactly the shape
+    # the next hand-rolled normaliser takes once the obvious ones are gone.
+    (r"lpad\s*\([^;]*?,\s*10\s*,", "lpad(x, 10) instead of cik_sql"),
+    (r"ltrim\s*\([^;]*?,\s*['\"]0['\"]", "ltrim(x, '0') instead of cik_sql"),
+)
+
+
+def test_cik_key_is_the_only_way_to_normalise_a_cik() -> None:
+    """**The seventh occurrence, and the one that says the rule was unfinished.**
+
+    `entities/cik.py` existed, its docstring said "a convention is not a rule, it
+    is a hope", and a repo rule enforced the helper at every *join*. Measured
+    2026-09-13 by grepping for the operation instead of for the word: **fifteen
+    hand-rolled normalisers across five modules, in six different spellings.**
+
+    - `sources/sec_trading_symbols.py` held
+      `str(cik).strip().lstrip("0").rjust(10, "0")` -- `cik_key`'s body, copied
+    - `signals/deals.py` produced two *different* forms four lines apart,
+      `str(cik).lstrip("0").zfill(10)` for one field and `str(cik).lstrip("0")`
+      for another
+    - `screens/comps.py` had a sixth, `str(k).strip().lstrip("0")`, with a comment
+      recording the failure it had already caused: 0 peer betas from 5,499 real
+      ones
+    - and `sources/sec_trading_symbols.py` also had `f"{int(cik):010d}"`, which
+      additionally raised on any CIK that was not already an integer
+
+    None of them was wrong on the day it was written, which is the whole problem:
+    each was correct for its own call site and none was a rule, so the next one
+    was written from scratch too. The join rule could not see any of them --
+    there is no join in `f"{int(cik):010d}"`.
+
+    So the answer to "can the parameter side be caught" is that catching
+    parameters is not enough: **the helper has to be the only thing in the
+    codebase that knows how a CIK is spelled.** There are exactly two canonical
+    forms, `cik_key` padded and `cik_bare` unpadded, and `cik_sql` for SQL. This
+    bans every other way of producing one.
+
+    Mutated to confirm it fires: restoring any one of the fifteen turns it red and
+    names the file and line. The `.zfill(10)` in `edgar_rss` and the `.rjust(10)`
+    in `sec_trading_symbols` were each reverted and each caught.
+    """
+    offenders: list[str] = []
+    scanned = 0
+    for path in sorted(SRC.rglob("*.py")):
+        if path.relative_to(SRC).as_posix() == "entities/cik.py":
+            continue                       # the helper defines the spelling
+        scanned += 1
+        for lineno, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1):
+            # Comments are stripped first, for the same reason the `any_value`
+            # ban strips SQL comments: the note explaining the rule must not be
+            # the thing that trips it. This scan flagged its own explanation in
+            # four modules before the strip was added.
+            code = line.split("#", 1)[0]
+            if not code.strip():
+                continue
+            for pattern, name in _HAND_ROLLED_CIK:
+                if re.search(pattern, code, flags=re.I):
+                    offenders.append(
+                        f"{path.relative_to(SRC.parent.parent)}:{lineno}: "
+                        f"{name} -- {code.strip()[:72]}")
+
+    assert scanned, "the invariant is vacuous; no modules were scanned"
+    assert not offenders, (
+        "a CIK is being normalised by hand:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nThere are two canonical spellings and both live in "
+        "entities/cik.py: `cik_key` padded to ten, for comparisons, dict keys "
+        "and anything stored; `cik_bare` unpadded, for EDGAR's archive paths "
+        "and the deals.cik column. `cik_sql` wraps a column or a bind parameter "
+        "for SQL.\n\nThis is not style. Fifteen hand-rolled normalisers in six "
+        "spellings is how the same defect reaches its seventh occurrence, and "
+        "every one of them fails as a believable number rather than an error."
     )
 
 

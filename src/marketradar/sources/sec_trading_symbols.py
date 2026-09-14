@@ -45,6 +45,7 @@ from datetime import date, datetime
 from typing import Any, Final, Iterable
 
 from marketradar import manifest
+from marketradar.entities.cik import cik_key
 from marketradar.freshness import assert_fresh
 
 log = logging.getLogger(__name__)
@@ -309,7 +310,9 @@ def cover_filings(cik: str, *, client: Any, pacer: Any = None,
     # declared -- `sec_submissions/company` and `edgar/archives` -- so this module
     # holds no URL of its own, which is the whole point of that file.
     endpoint = manifest.get("sec_submissions", "company").location
-    resp = client.get(endpoint.format(cik=f"{int(cik):010d}"), headers=headers)
+    # `cik_key`, not `f"{int(cik):010d}"`: the endpoint wants the padded form
+    # and the f-string also raised on any CIK that was not already an int.
+    resp = client.get(endpoint.format(cik=cik_key(cik)), headers=headers)
     resp.raise_for_status()
     recent = (resp.json().get("filings") or {}).get("recent") or {}
     wanted = set(forms)
@@ -351,7 +354,10 @@ def fetch(
     headers = {"User-Agent": user_agent(), "Accept-Encoding": "gzip, deflate"}
     for cik in ciks:
         asked += 1
-        padded = str(cik).strip().lstrip("0").rjust(10, "0")
+        # This line was `cik_key`'s body, reimplemented -- the drift the
+        # module docstring in entities/cik.py forbids, found by grepping for
+        # the normaliser rather than by any test.
+        padded = cik_key(cik)
         try:
             filings = cover_filings(cik, client=client, pacer=pacer)
             requests += 1

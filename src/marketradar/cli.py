@@ -1435,6 +1435,85 @@ def _multiples_rows(con: Any, out_dir: Path) -> dict[str, Any]:
     }
 
 
+def _promoted_rows(con: Any, screen_result: Any, out_dir: Path,
+                   decks: dict[str, dict[str, str]] | None = None,
+                   ) -> dict[str, Any]:
+    """Today's promoted set, gated, with what is on disk for each name.
+
+    **This panel exists because the other two were a different slice.** The DCF
+    table shows its top 20 by evidence quality and the deck preview its top 20 by
+    substitution depth; the promoted 27 are neither, so on the measured session
+    exactly two rows in the whole dashboard carried a deck link out of 30 filers
+    that had one. A reader could not tell from any page what the nightly run had
+    actually produced -- which makes a deck link a decoration rather than an
+    inventory.
+
+    So this reads the *same* promotion the command does, off the *same* screen
+    result the digest rendered, and then asks the disk. Three facts per row and
+    all three from a different place: promoted (the sentinels), deckable (the DCF
+    population), rendered (a directory listing).
+
+    The gap between the second and the third is the one worth seeing. A promoted
+    filer that clears the gate and has no file means the scheduled task has not
+    run for this session yet; every row showing that means it has not run at all.
+    """
+    from marketradar.screens import promote as promote_mod
+
+    if screen_result is None:
+        return {}
+    built = _dcf_rows(con, out_dir)
+    valued = {cik_key(r["cik"]): r for r in (built.get("rows") or [])}
+    try:
+        promotion = promote_mod.promote(con, screen_result=screen_result)
+    except promote_mod.PromoteError as exc:
+        return {"error": str(exc)[:200]}
+    gated = promote_mod.gate(
+        promotion, valued=set(valued), with_comps=_served_comp_ciks(con))
+
+    decks = decks or {}
+    kept = {p.cik for p in gated.kept}
+    rows = []
+    for row in promotion.rows:
+        got = decks.get(row.cik) or {}
+        valuation = valued.get(row.cik) or {}
+        rows.append({
+            "cik": row.cik,
+            "company": row.company,
+            "ticker": row.ticker or "",
+            # Every symbol, not just the promoted one: a warrant and its common
+            # share are one CIK and two facts, and the deck draws one of them.
+            "tickers": list(row.tickers),
+            "reasons": list(row.reasons),
+            "why": dict(row.why),
+            "deckable": row.cik in kept,
+            "enterprise_value": valuation.get("enterprise_value"),
+            "substitutions": list(valuation.get("substitutions") or []),
+            "deck_href": got.get("href", ""),
+            "deck_run": got.get("run", ""),
+        })
+    # Deckable first, then most reasons, then name. A reader opening this wants
+    # the names that produced something; an explicit key, so two builds of the
+    # same session order it the same way.
+    rows.sort(key=lambda r: (not r["deckable"], -len(r["reasons"]),
+                             r["company"], r["cik"]))
+    rendered = sum(1 for r in rows if r["deck_href"])
+    return {
+        "rows": rows,
+        "stats": {
+            "day": str(promotion.day),
+            "promoted": len(promotion.rows),
+            "deckable": len(gated.kept),
+            "rendered": rendered,
+            "legs": dict(promotion.legs),
+            "unresolved": dict(promotion.unresolved),
+            "form4_window": promotion.form4_window,
+            "optional": dict(gated.optional),
+            "multi": sum(1 for p in promotion.rows if p.multi),
+        },
+        "funnel": gated.funnel.as_dict(),
+    }
+
+
 def _deck_rows(con: Any, out_dir: Path) -> dict[str, Any]:
     """Deck subjects: what a deck would say, without rendering a file."""
     from marketradar import decks as decks_mod
@@ -2240,6 +2319,16 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         ctx.decks = _deck_rows(con, Path(".cache/xbrl/out"))
     except Exception as exc:
         ctx.notes.append(f"Deck subjects unavailable: {str(exc)[:140]}")
+    # U16. Reads the digest's *own* screen result rather than screening again, so
+    # the promoted set and the morning email cannot disagree about which names
+    # moved -- the same contract `promote()` has with `mr decks --promoted`. Empty
+    # under `--fast`, which is why the probe reads waiting rather than zero.
+    try:
+        ctx.promoted = _promoted_rows(
+            con, None if digest is None else digest.screen,
+            Path(".cache/xbrl/out"), ctx.deck_files)
+    except Exception as exc:
+        ctx.notes.append(f"Promoted set unavailable: {str(exc)[:140]}")
 
     private, private_stats = _private_rows(series=series)
     try:

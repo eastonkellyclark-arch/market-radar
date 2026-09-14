@@ -291,6 +291,45 @@ deck honest produced the most authoritative-looking wrong thing in it. So the
 invariant now rejects `cik_sql(column) = ?` as its own shape: `cik_sql('?')` is
 the fix and costs a function call.
 
+**Seventh, and it is the answer to "can the parameter side be caught".** Catching
+parameters is necessary and it is not the rule. Asking how the sixth was possible
+turned up **fifteen hand-rolled normalisers across five modules, in six
+spellings**: `sources/sec_trading_symbols.py` held
+`str(cik).strip().lstrip("0").rjust(10, "0")`, which is `cik_key`'s body copied;
+`signals/deals.py` produced two *different* forms four lines apart,
+`.lstrip("0").zfill(10)` for one field and `.lstrip("0")` for another; and
+`screens/comps.py` had a sixth whose own comment recorded the failure it had
+already caused, 0 peer betas from 5,499 real ones. None was wrong on the day it
+was written, which is why each was written from scratch.
+
+So: **`entities/cik.py` is the only thing in this codebase that knows how a CIK
+is spelled.** Two canonical forms, and the second one is new because pretending
+there was one is what left the others hand-rolled:
+
+- `cik_key` — padded to ten. Comparisons, dict keys, sets, anything stored.
+- `cik_bare` — unpadded. Two uses, both forced from outside: EDGAR's archive
+  paths (`/edgar/data/66740/` resolves, `/edgar/data/0000066740/` does not) and
+  the `deals.cik` column, which was loaded unpadded and which `cik_sql`
+  normalises at every join rather than requiring a migration.
+- `cik_sql` — either side of any SQL comparison, column or bind parameter.
+
+`test_cik_key_is_the_only_way_to_normalise_a_cik` bans every other way of
+producing one: `lstrip("0")`, `.zfill(10)`, `.rjust(10`, `:010d`, and a
+hand-written `lpad(x, 10` or `ltrim(x, '0')`. Width ten rather than `lpad(` alone,
+because `selftest.py` legitimately pads a synthetic ticker to four.
+
+**And one half remains unenforceable, which is worth saying rather than hiding.**
+A scan cannot tell a CIK-shaped string from any other string, so a Python-side
+`d[raw]` or `set_a & set_b` is invisible to it -- and that is the shape that broke
+`_cmd_decks` (a padded lookup into an unpadded dict) and would have broken
+`promote.gate`. A `str` subclass buys nothing, because `__eq__` and `__hash__` are
+inherited and the lookup still misses silently. What works is **normalising at the
+producer** so the two spellings never coexist in Python, and the normaliser ban is
+what makes that checkable: there is one function to normalise with, so a producer
+that does not call it is visible in review. Where two stores must be compared
+directly, assert a non-zero match count -- an empty join is the one result that
+looks like a correct answer about the data.
+
 **No exceptions, and that is what makes it readable.** `lpad` is idempotent, so
 wrapping an already-consistent pair costs a function call; "wrap it only where
 the two sides might differ" costs the judgement that has been wrong four times,

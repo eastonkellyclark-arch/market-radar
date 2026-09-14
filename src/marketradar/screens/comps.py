@@ -63,7 +63,7 @@ from typing import Any, Final
 
 import duckdb
 
-from marketradar.entities.cik import cik_sql
+from marketradar.entities.cik import cik_key, cik_sql
 from marketradar.screens import funnel as funnel_mod
 
 log = logging.getLogger(__name__)
@@ -487,13 +487,14 @@ def peer_median(
         return {}
     con.execute("drop table if exists _comps_value")
     con.execute("create temp table _comps_value (cik varchar, val double)")
-    # Unpadded, to match the XBRL partitions. The caller's keys may be
-    # zero-padded -- Postgres stores them that way and the parquet does not -- and
-    # a mismatch here returns an empty dict rather than an error, which is how a
-    # first run produced 0 peer betas from 5,499 real ones.
+    # `cik_key`, and the *matching* is no longer this line's job. This read
+    # `str(k).strip().lstrip("0")` -- a sixth spelling of the normaliser, written
+    # to match the XBRL partitions' unpadded form back when the join compared raw
+    # columns. That mismatch is how a first run produced 0 peer betas from 5,499
+    # real ones, and the fix was `cik_sql` on both sides of the join below, which
+    # makes the stored spelling irrelevant so long as it is *a* canonical one.
     con.executemany("insert into _comps_value values (?, ?)",
-                    [(str(k).strip().lstrip("0"), float(v))
-                     for k, v in values.items()])
+                    [(cik_key(k), float(v)) for k, v in values.items()])
     con.execute("drop table if exists _comps_base")
     con.execute(f"""
     create temp table _comps_base as
