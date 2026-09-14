@@ -12,13 +12,16 @@ import argparse
 import datetime as _dt
 import logging
 import os
+import re
 import sys
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 
-from marketradar.entities.cik import cik_sql
+from marketradar.entities.cik import cik_key, cik_sql
+from marketradar.screens import promote
 from marketradar import __version__
 
 EXIT_OK = 0
@@ -212,10 +215,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_decks = sub.add_parser(
         "decks",
-        help="render a pitch deck for one filer, or for a named archetype")
+        help="render a pitch deck for one filer, a named archetype, or the "
+             "day's promoted Tier 2 set")
     p_decks.add_argument(
         "--cik", nargs="*", default=[], metavar="CIK",
         help="one or more CIKs to render")
+    p_decks.add_argument(
+        "--promoted", action="store_true",
+        help="render today's promoted set: every filer in a volatility screen "
+             "list, throwing a qualifying deal filing, or in a Form 4 cluster, "
+             "gated on having a valuation to draw. Writes to "
+             f"<out>/{PROMOTED_DIR}/<date>/ and prunes older runs")
+    p_decks.add_argument(
+        "--date", type=_iso_date, default=None, metavar="YYYY-MM-DD",
+        help="the session to promote for; defaults to the newest one the price "
+             "partitions hold, never to the calendar")
+    p_decks.add_argument(
+        "--form4-window", type=int, default=promote.FORM4_WINDOW_DAYS,
+        metavar="N",
+        help="how far back a Form 4 cluster still promotes, in days over "
+             f"occurred_at (default {promote.FORM4_WINDOW_DAYS}, the measured "
+             "p90 of the gap between a cluster's first buy and the filing that "
+             "made it visible)")
+    p_decks.add_argument(
+        "--keep-runs", type=int, default=KEEP_RUNS, metavar="N",
+        help=f"dated promoted runs to keep (default {KEEP_RUNS}; about 55 KB a "
+             "deck, so 30 runs of 40 is roughly 68 MB)")
     p_decks.add_argument(
         "--archetype", nargs="*", default=[], metavar="NAME",
         choices=["clean", "growth_mismatch", "heavy"],
@@ -441,6 +466,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_dash.add_argument(
         "--fast", action="store_true",
         help="panel map only -- skip the screens, which read prices from R2",
+    )
+    p_dash.add_argument(
+        "--decks", default=".decks", metavar="DIR",
+        help="where to look for rendered decks (default .decks). A row whose "
+             "filer has one links to the file; the rest offer the command",
     )
 
     p_backfill = sub.add_parser("backfill", help="drain N queue items")
@@ -1450,65 +1480,265 @@ ARCHETYPES: Final[dict[str, str]] = {
 }
 
 
-def _deck_subject(row: dict[str, Any], con: Any, out_dir: Path) -> Any:
-    """One fully-populated Subject from a stored DCF row.
+@dataclass
+class _DeckInputs:
+    """Everything every deck in one run reads, fetched once.
 
-    **Assembled here, not in `decks.py`.** A deck must be reproducible -- given the
-    same Subject, the same file -- so the renderer takes a dataclass and never a live
-    connection. This is the function that does the querying, once, before any slide
-    is laid out.
+    **Built once per invocation, because the per-deck version does not scale and
+    the measurement said so.** `_deck_subject` used to call
+    `volatility.read_all_prices` itself, which unions all eleven remote price
+    partitions; measured 2026-09-13 at **9-11 seconds of subject assembly per
+    deck against 0.4-0.8 seconds of rendering**. Forty decks a night would be six
+    minutes of re-reading the same eleven files and twenty seconds of drawing.
+
+    The peer sets, the clusters and the deal history are here for a second reason
+    on top of cost: each is a whole-population read, and a screen run forty times
+    is forty chances for the same input to come back differently.
     """
-    from datetime import date as _date
 
-    from marketradar import decks as decks_mod
+    #: ``{cik: {...}}`` peer sets, keyed by `cik_key`. From `screens/comps`.
+    peers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: ``{concept: coverage rate}`` over the newest loaded quarter. A concept at
+    #: 51% and one at 99% are both just a number in a column otherwise.
+    coverage: dict[str, float] = field(default_factory=dict)
+    #: ``{cik: [cluster, ...]}`` Form 4 purchase clusters.
+    insiders: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    #: ``{cik: [deal, ...]}`` the 8-K deal history.
+    deals: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    #: ``{cik: {...}}`` the point-in-time filer universe, for identity.
+    filers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: ``{cik: ticker}``, current listings first, recovered map second.
+    tickers: dict[str, str] = field(default_factory=dict)
+    #: ``{ticker: [(date, o, h, l, c, v), ...]}`` raw OHLCV, already filtered to
+    #: the tickers this run needs.
+    prices: dict[str, list[tuple]] = field(default_factory=dict)
+    #: ``{ticker: unexplained one-session moves}``, from the action audit run over
+    #: the same filtered price table rather than over the whole market.
+    unexplained: dict[str, int] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+
+def _deck_inputs(con: Any, out_dir: Path, subjects: list[dict[str, Any]],
+                 *, with_prices: bool = True,
+                 tickers: dict[str, str] | None = None) -> _DeckInputs:
+    """Assemble :class:`_DeckInputs` for a named set of DCF rows.
+
+    Every block is independently guarded and records a note rather than raising:
+    a deck whose peer page says "no peer set" is a deck with one page missing,
+    and a run that dies because one read failed is a night with no decks at all.
+    The notes are printed, so a missing page is never silent.
+    """
+    import json as _json
+
     from marketradar import storage
-    from marketradar.entities.cik import cik_sql
+    from marketradar.screens import promote as promote_mod
     from marketradar.screens import volatility as vol_mod
 
-    cik = row["cik"]
-    glob = (out_dir / COMPS_GLOB).as_posix()
-    con.execute(
-        f"create or replace view _deck_xb as select * from read_parquet('{glob}')")
+    inputs = _DeckInputs()
+    ciks = {cik_key(r["cik"]) for r in subjects} - {""}
+    if not ciks:
+        return inputs
+    A = storage.PG_ALIAS
 
-    facts: dict[str, dict[str, Any]] = {}
-    ident: dict[str, Any] = {}
+    # --- peer sets, one screen over the population ----------------------
     try:
-        for concept, value, status, tag, period in con.execute("""
-            select concept, value, status, tag, period_end from _deck_xb
-            where lpad(cast(cik as varchar), 10, '0') = ?
-            -- Newest period per concept, with an explicit tiebreak: two rows at
-            -- the same period_end would otherwise be separated by row order.
-            qualify row_number() over (partition by concept
-                                       order by period_end desc, tag) = 1
-        """, [cik]).fetchall():
-            facts[concept] = {"value": value, "status": status, "tag": tag,
-                              "period_end": period}
-        got = con.execute("""
-            -- max_by on an explicit key, never any_value: which spelling of a
-            -- name wins decided a join once already, and three loads of
-            -- identical input produced three different review counts.
-            select max_by(company, period_end), max(sic),
-                   min(period_end), max(period_end)
-            from _deck_xb where lpad(cast(cik as varchar), 10, '0') = ?
-        """, [cik]).fetchone()
-        if got:
-            ident = {"sic": got[1], "first_period": got[2], "last_period": got[3]}
-    except Exception as exc:                               # a missing column, say
-        log.warning("deck fundamentals unavailable for %s: %s", cik, exc)
+        for row in (_comps_rows(con, out_dir).get("rows") or []):
+            key = cik_key(row["cik"])
+            if key in ciks:
+                inputs.peers[key] = row
+    except Exception as exc:
+        inputs.notes.append(f"peer sets unavailable: {str(exc)[:120]}")
 
-    # **Two sources, in this order, and the order is the whole point.**
-    # `company_ticker_history` only covers filers that have *stopped* -- it was built
-    # from the cover pages of delisted companies -- so asking it alone returned
-    # nothing for every active filer, and the price chart silently drew empty for
-    # 3M. Current listings live in `company_tickers`; the recovered map is the
-    # fallback for the delisted half, which is exactly the population `companies`
-    # has a 97% hole in.
-    ticker = None
+    # --- per-concept coverage -------------------------------------------
+    try:
+        for entry in (_xbrl_coverage(con, out_dir).get("coverage") or []):
+            inputs.coverage[entry["concept"]] = float(entry["rate"])
+    except Exception as exc:
+        inputs.notes.append(f"concept coverage unavailable: {str(exc)[:120]}")
+
+    # --- identity, from the filer universe and not the fundamentals -----
+    #
+    # `deal_multiples` learned this the expensive way: CleanSpark read as an
+    # acquired target because it had left the *narrow* fundamentals table when
+    # its SIC moved into a financial class. "Disappeared from the narrow table"
+    # is not "stopped filing", and only the wide universe can tell them apart.
+    universe = out_dir / "sec_filers.parquet"
+    if universe.is_file():
+        try:
+            for cik10, company, sic, first, last, status in con.execute(f"""
+                select {cik_sql('cik')} as cik10, company, sic,
+                       first_period, last_period, status
+                from read_parquet('{universe.as_posix()}')
+            """).fetchall():
+                key = cik_key(cik10)
+                if key in ciks:
+                    inputs.filers[key] = {
+                        "company": company, "sic": sic, "first_period": first,
+                        "last_period": last, "still_filing": status == "filing",
+                    }
+            _note_empty_match(inputs.filers, ciks, "the filer universe",
+                              inputs.notes)
+        except Exception as exc:
+            inputs.notes.append(f"filer universe unavailable: {str(exc)[:120]}")
+    else:
+        inputs.notes.append(
+            f"no {universe.name}; the identity page falls back to the "
+            "fundamentals, which cannot tell 'stopped filing' from 'left the "
+            "operating-company table'")
+
+    # --- Form 4 clusters ------------------------------------------------
+    #
+    # The whole table, then bucketed in Python: the issuer CIK lives inside
+    # `signals.accession` as part of a composite key, so there is no column to
+    # index a per-CIK lookup on. See `promote.cluster_cik` for why the key is the
+    # only place it exists.
+    try:
+        for accession, on_day, payload in con.execute(f"""
+            select accession, (occurred_at at time zone 'UTC')::date as on_day,
+                   payload
+            from {A}.signals
+            where kind = 'form4_cluster' and accession is not null
+        """).fetchall():
+            key = promote_mod.cluster_cik(str(accession))
+            if key not in ciks:
+                continue
+            body = payload if isinstance(payload, dict) else _json.loads(payload)
+            inputs.insiders.setdefault(key, []).append({
+                "role": body.get("role"), "n_buyers": body.get("n_buyers"),
+                "value": body.get("value"),
+                "first": body.get("first") or on_day,
+                "last": body.get("last"), "fund_like": body.get("fund_like"),
+            })
+        for rows in inputs.insiders.values():
+            # Newest first, on an explicit key. `sorted` is stable, so leaving the
+            # tiebreak out would order two same-day clusters by the order Postgres
+            # happened to return them.
+            rows.sort(key=lambda r: (str(r.get("first") or ""),
+                                     str(r.get("role") or "")), reverse=True)
+    except Exception as exc:
+        inputs.notes.append(f"Form 4 clusters unavailable: {str(exc)[:120]}")
+
+    # --- the 8-K deal history -------------------------------------------
+    try:
+        for cik10, filed, items, deal_type, value_usd, role in con.execute(f"""
+            select {cik_sql('cik')} as cik10, filed_date, items, deal_type,
+                   value_usd, filer_role
+            from {A}.deals
+        """).fetchall():
+            key = cik_key(cik10)
+            if key in ciks:
+                inputs.deals.setdefault(key, []).append({
+                    "filed": filed, "items": items, "deal_type": deal_type,
+                    "value_usd": value_usd, "filer_role": role,
+                })
+        for rows in inputs.deals.values():
+            rows.sort(key=lambda r: (str(r["filed"]), str(r["items"])),
+                      reverse=True)
+    except Exception as exc:
+        inputs.notes.append(f"deal history unavailable: {str(exc)[:120]}")
+
+    # **A seeded ticker wins, and that is the promoted symbol.** A filer's
+    # symbols are not interchangeable: on 2026-09-11 Alliance Entertainment's
+    # AENTW warrant moved +24.6% and its AENT common share +16.5%, and the price
+    # page draws one of them.
+    #
+    # The promoted symbol is the one that put the name in front of you, which is
+    # a fact about the day rather than a guess at the primary listing -- and it
+    # can therefore be a warrant. That is stated on the row rather than resolved,
+    # because `company_tickers` carries no exchange and no primary flag: measured
+    # 2026-09-13, shortest-then-alphabetical resolves JPMorgan to AMJB.
+    # `_deck_ticker`'s fallback is deterministic but arbitrary among a filer's
+    # classes, which is all that is available when nothing promoted it.
+    for cik in sorted(ciks):
+        got = (tickers or {}).get(cik) or _deck_ticker(con, cik)
+        if got:
+            inputs.tickers[cik] = got
+    inputs.notes.append(
+        f"{len(inputs.tickers)} of {len(ciks)} filers carry a ticker")
+    if not with_prices or not inputs.tickers:
+        return inputs
+
+    # --- prices, one pass over the eleven partitions --------------------
+    #
+    # Materialised into a local table rather than left as a relation, because two
+    # things read it -- the candles and the action audit -- and a relation over
+    # eleven remote parquets would be scanned twice.
+    #
+    # `distinct` for the reason `tickers.build` needs it: the price staging holds
+    # 2,042 (ticker, date) pairs twice, identical in OHLCV, and a candle
+    # aggregate would double their volume.
+    wanted = sorted(set(inputs.tickers.values()))
+    values = ", ".join("'" + t.replace("'", "''") + "'" for t in wanted)
+    try:
+        con.register("_deck_px_all", vol_mod.read_all_prices(con))
+        con.execute(
+            f"create or replace temp table _deck_px as "
+            f"select distinct ticker, date, open, high, low, close, volume "
+            f"from _deck_px_all where ticker in ({values})")
+        for ticker, d, o, h, lo, c, v in con.execute(
+            "select ticker, date, open, high, low, close, volume from _deck_px "
+            "order by ticker, date").fetchall():
+            inputs.prices.setdefault(ticker, []).append(
+                (d, float(o), float(h), float(lo), float(c), int(v)))
+        _note_empty_match(inputs.prices, set(wanted), "the price partitions",
+                          inputs.notes)
+    except Exception as exc:
+        inputs.notes.append(f"prices unavailable: {str(exc)[:120]}")
+        return inputs
+
+    # The audit runs over the same local table, not over the market. The number
+    # on the price page is per-ticker and a whole-market scan would be an hour to
+    # answer a question about forty names.
+    try:
+        from marketradar.screens import action_audit
+
+        found = action_audit.candidates(
+            con, con.table("_deck_px"), vol_mod.read_actions(con))
+        con.register("_deck_cand", found)
+        inputs.unexplained = {
+            t: int(n) for t, n in con.execute(
+                "select ticker, count(*) from _deck_cand group by 1").fetchall()
+        }
+    except Exception as exc:
+        inputs.notes.append(f"action audit unavailable: {str(exc)[:120]}")
+    return inputs
+
+
+def _note_empty_match(got: dict[str, Any], wanted: set[str], what: str,
+                      notes: list[str]) -> None:
+    """An empty join is the one result that looks like a correct answer.
+
+    Not a raise: a deck run must survive one input being absent, and every one of
+    these is optional to a page. But zero of N is the exact shape a CIK
+    representation mismatch makes -- six occurrences in this codebase, every one
+    a believable number -- so it is said out loud rather than left as a blank
+    page that reads like a fact about the company.
+    """
+    if wanted and not got:
+        notes.append(
+            f"0 of {len(wanted)} keys matched {what}. That is the shape of a "
+            "representation mismatch, not of a quiet day -- check both sides "
+            "went through entities.cik before believing the blank pages.")
+
+
+def _deck_ticker(con: Any, cik: str) -> str | None:
+    """The ticker for one filer, current listings first.
+
+    **Two sources, in this order, and the order is the whole point.**
+    `company_ticker_history` only covers filers that have *stopped* -- it was
+    built from the cover pages of delisted companies -- so asking it alone
+    returned nothing for every active filer, and the price chart silently drew
+    empty for 3M. Current listings live in `company_tickers`; the recovered map
+    is the fallback for the delisted half, which is exactly the population
+    `companies` has a 97% hole in.
+    """
+    from marketradar import storage
+
     A = storage.PG_ALIAS
     for sql in (
         f"select t.ticker from {A}.company_tickers t join {A}.companies c "
         f"on c.id = t.company_id where {cik_sql('c.cik')} = {cik_sql('?')} "
-        "order by t.last_seen desc nulls last, t.ticker limit 1",
+        "order by t.last_seen desc, t.ticker limit 1",
         f"select ticker from {A}.company_ticker_history "
         f"where {cik_sql('cik')} = {cik_sql('?')} "
         "order by last_seen desc, ticker limit 1",
@@ -1519,32 +1749,87 @@ def _deck_subject(row: dict[str, Any], con: Any, out_dir: Path) -> Any:
             log.warning("ticker lookup failed for %s: %s", cik, exc)
             continue
         if hit and hit[0]:
-            ticker = hit[0]
-            break
+            return str(hit[0])
+    return None
 
-    prices: list[tuple[_date, float]] = []
-    if ticker:
-        try:
-            rel = vol_mod.read_all_prices(con)
-            con.register("_deck_px", rel)
-            # `distinct`, for the same reason tickers.build needs it: the price
-            # staging holds 2,042 (ticker, date) pairs twice, identical in OHLCV,
-            # and a candle aggregate would double their volume.
-            prices = [
-                (d, float(o), float(h), float(lo), float(c), int(v))
-                for d, o, h, lo, c, v in con.execute(
-                    "select distinct date, open, high, low, close, volume "
-                    "from _deck_px where ticker = ? order by date",
-                    [ticker]).fetchall()
-            ]
-        except Exception as exc:
-            log.warning("deck prices unavailable for %s: %s", ticker, exc)
+
+def _deck_subject(row: dict[str, Any], con: Any, out_dir: Path,
+                  inputs: "_DeckInputs | None" = None) -> Any:
+    """One fully-populated Subject from a stored DCF row.
+
+    **Assembled here, not in `decks.py`.** A deck must be reproducible -- given the
+    same Subject, the same file -- so the renderer takes a dataclass and never a live
+    connection. This is the function that does the querying, once, before any slide
+    is laid out.
+
+    ``inputs`` is the once-per-run read. Left unset it is built for this subject
+    alone, which is what `--cik` wants and what a nightly run must not do.
+    """
+    from marketradar import decks as decks_mod
+
+    cik = cik_key(row["cik"])
+    if inputs is None:
+        inputs = _deck_inputs(con, out_dir, [row])
+    glob = (out_dir / COMPS_GLOB).as_posix()
+    con.execute(
+        f"create or replace view _deck_xb as select * from read_parquet('{glob}')")
+
+    facts: dict[str, dict[str, Any]] = {}
+    ident: dict[str, Any] = {}
+    try:
+        # **`cik_sql` on the parameter as well as on the column.** This read was
+        # `lpad(cast(cik as varchar), 10, '0') = ?` against a CIK the DCF rows
+        # carry *unpadded*, so it matched nothing for every deck ever rendered:
+        # four of the ten pages came out blank and no page said why. Measured
+        # 2026-09-13, directly against the partitions: 0 rows for '66740' and 56
+        # for '0000066740'. The sixth occurrence of this failure and the first on
+        # the parameter side, which is why the repo invariant now rejects
+        # `cik_sql(column) = ?`.
+        for concept, value, status, tag, period in con.execute(f"""
+            select concept, value, status, tag, period_end from _deck_xb
+            where {cik_sql('cik')} = {cik_sql('?')}
+            -- Newest period per concept, with an explicit tiebreak: two rows at
+            -- the same period_end would otherwise be separated by row order.
+            qualify row_number() over (partition by concept
+                                       order by period_end desc, tag) = 1
+        """, [cik]).fetchall():
+            facts[concept] = {
+                "value": value, "status": status, "tag": tag,
+                "period_end": period,
+                # Every concept carries its own coverage wherever it is consumed:
+                # individually most clear 90%, and all ten on one filer is 64.2%.
+                # A page that averaged them would be wrong in both directions.
+                "coverage": inputs.coverage.get(concept),
+            }
+        got = con.execute(f"""
+            -- max_by on an explicit key, never any_value: which spelling of a
+            -- name wins decided a join once already, and three loads of
+            -- identical input produced three different review counts.
+            select max_by(company, period_end), max(sic),
+                   min(period_end), max(period_end)
+            from _deck_xb where {cik_sql('cik')} = {cik_sql('?')}
+        """, [cik]).fetchone()
+        if got:
+            ident = {"sic": got[1], "first_period": got[2], "last_period": got[3]}
+    except Exception as exc:                               # a missing column, say
+        log.warning("deck fundamentals unavailable for %s: %s", cik, exc)
+
+    # The wide universe wins where it has a row: it covers every form type and
+    # every SIC, so it is the only source that can tell a filer which stopped
+    # from one which merely left the operating-company table.
+    universe = inputs.filers.get(cik) or {}
+    ticker = inputs.tickers.get(cik) or _deck_ticker(con, cik)
 
     return decks_mod.Subject(
         cik=cik, company=row["company"], ticker=ticker,
-        sic=ident.get("sic"), first_period=ident.get("first_period"),
-        last_period=ident.get("last_period"),
+        sic=universe.get("sic") or ident.get("sic"),
+        first_period=universe.get("first_period") or ident.get("first_period"),
+        last_period=universe.get("last_period") or ident.get("last_period"),
+        still_filing=universe.get("still_filing"),
         fundamentals=facts,
+        peers=inputs.peers.get(cik) or {},
+        insiders=inputs.insiders.get(cik) or [],
+        deals=inputs.deals.get(cik) or [],
         valuation={
             "enterprise_value": row.get("enterprise_value"),
             "wacc": row.get("wacc"), "terminal_share": row.get("terminal_share"),
@@ -1554,7 +1839,8 @@ def _deck_subject(row: dict[str, Any], con: Any, out_dir: Path) -> Any:
             "substitutions": row.get("substitutions") or [],
             "source": row.get("source") or {},
         },
-        prices=prices,
+        prices=inputs.prices.get(ticker or "") or [],
+        unexplained_moves=int(inputs.unexplained.get(ticker or "", 0)),
     )
 
 
@@ -1585,15 +1871,38 @@ def _pick_archetypes(rows: list[dict[str, Any]], names: list[str]) -> list[dict]
     return out
 
 
-def _cmd_decks(args: argparse.Namespace) -> int:
-    """Render a deck per filer, **on demand and never on a schedule**.
+#: Where an automated run writes, under `--out`. Dated, one directory per
+#: session, because that is what makes a prune a directory removal rather than a
+#: per-file age test -- and what lets the dashboard say *when* a deck was made.
+PROMOTED_DIR: Final[str] = "promoted"
 
-    2,564 valuations is 2,564 files nobody opens, and a directory of decks generated
-    nightly is indistinguishable from one where the generator broke last Tuesday. So
-    there is no workflow step for this and no `--all`: a deck is produced because
-    somebody asked for that filer.
+#: How many dated promoted-run directories to keep. Measured 2026-09-13 at
+#: **54-58 KB a deck**, so a 40-deck night is about 2.3 MB and thirty nights is
+#: about 68 MB. Kept rather than deleted on the day because the useful question
+#: is often "what did this look like last week", and a month of decks is cheaper
+#: than one price partition.
+KEEP_RUNS: Final[int] = 30
+
+
+def _cmd_decks(args: argparse.Namespace) -> int:
+    """Render decks: one filer by name, or today's promoted set.
+
+    **The rule this used to state has been narrowed rather than dropped.** It read
+    "on demand and never on a schedule", because 2,569 valuations is 2,569 files
+    nobody opens and a directory generated nightly is indistinguishable from one
+    where the generator broke last Tuesday. Both halves still hold, and `--all`
+    still does not exist.
+
+    What changed is that there is now a population between "one filer" and "the
+    whole valued universe": the names three sentinels promoted today, which the
+    architecture sizes at 15-40 and which measured 27 on 2026-09-11. That is a
+    day's reading rather than a directory nobody opens. The second half of the
+    objection -- a broken generator looking like a quiet night -- is answered by
+    the funnel and the leg counts, not by refusing to run: a night that emits four
+    decks prints the stage that took 185 names to four.
     """
     from marketradar import storage
+    from marketradar.screens import promote as promote_mod
 
     con = storage.connect()
     built = _dcf_rows(con, Path(args.data))
@@ -1603,10 +1912,15 @@ def _cmd_decks(args: argparse.Namespace) -> int:
               "`mr dcf` first", file=sys.stderr)
         return EXIT_ERROR
 
-    by_cik = {r["cik"]: r for r in rows}
+    # **Keyed on both sides.** `_dcf_rows` returns CIKs unpadded and every CIK a
+    # human types is padded, so the old `by_cik` was a padded lookup into an
+    # unpadded dict: `mr decks --cik 0000066740` -- the command in
+    # docs/operating.md -- answered "has no valuation" for a filer that has one,
+    # in both spellings, for as long as the flag has existed.
+    by_cik = {cik_key(r["cik"]): r for r in rows}
     wanted: list[dict[str, Any]] = []
     for cik in args.cik:
-        key = cik.strip().lstrip("0").rjust(10, "0")
+        key = cik_key(cik)
         if key not in by_cik:
             print(f"mr decks: {cik} has no valuation, so there is nothing to draw. "
                   "A deck of a filer the DCF could not value would be a deck of "
@@ -1614,33 +1928,220 @@ def _cmd_decks(args: argparse.Namespace) -> int:
             return EXIT_ERROR
         wanted.append(by_cik[key])
     wanted.extend(_pick_archetypes(rows, args.archetype))
-    if not wanted:
-        print("mr decks: name a --cik or an --archetype. Nothing is rendered by "
-              "default, because a deck per filer is 2,564 files nobody opens.",
-              file=sys.stderr)
+
+    out_dir = Path(args.out)
+    promotion = gated = None
+    if args.promoted:
+        if wanted:
+            print("mr decks: --promoted renders the day's set; naming a --cik or "
+                  "an --archetype as well would mix a chosen filer into a dated "
+                  "run. Do them separately.", file=sys.stderr)
+            return EXIT_ERROR
+        promotion, gated = _promoted_set(
+            con, by_cik, window=args.form4_window, as_of=args.date)
+        if promotion is None:
+            return EXIT_ERROR
+        for line in promote_mod.render(promotion, gated):
+            print(line)
+        print()
+        wanted = [by_cik[p.cik] for p in gated.kept]
+        out_dir = out_dir / PROMOTED_DIR / gated.day.isoformat()
+        if not wanted:
+            # Not an error. A session where nothing promoted clears the gate is a
+            # real answer, and the funnel above says which stage it died at.
+            print("mr decks: nothing in today's promoted set has a valuation, so "
+                  "no deck is written. The funnel above says where it went.")
+            return EXIT_OK
+    elif not wanted:
+        print("mr decks: name a --cik, an --archetype, or --promoted for today's "
+              "Tier 2 set. Nothing is rendered by default, because a deck per "
+              "filer is 2,569 files nobody opens.", file=sys.stderr)
         return EXIT_ERROR
 
     from marketradar import decks as decks_mod
 
-    out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    t0 = _dt.datetime.now()
+    promoted_tickers = ({p.cik: p.ticker for p in gated.kept if p.ticker}
+                        if gated is not None else None)
+    inputs = _deck_inputs(con, Path(args.data), wanted,
+                          tickers=promoted_tickers)
+    setup = (_dt.datetime.now() - t0).total_seconds()
+    for note in inputs.notes:
+        print(f"  note: {note}")
+    print(f"  inputs assembled in {setup:.1f}s for {len(wanted)} subject(s)")
+    print()
+
     made: list[Path] = []
+    render_seconds = 0.0
     for row in wanted:
-        subject = _deck_subject(row, con, Path(args.data))
+        subject = _deck_subject(row, con, Path(args.data), inputs)
         dest = out_dir / f"{subject.cik}_{_slug(subject.company)}.pptx"
+        t1 = _dt.datetime.now()
         try:
             made.append(decks_mod.build(subject, dest))
         except decks_mod.DeckError as exc:
             print(f"mr decks: {subject.company}: {exc}", file=sys.stderr)
             return EXIT_ERROR
+        render_seconds += (_dt.datetime.now() - t1).total_seconds()
         subs = subject.substitutions
         print(f"  {dest.name}")
+        if promotion is not None:
+            hit = next((p for p in gated.kept if p.cik == subject.cik), None)
+            if hit is not None:
+                print(f"    promoted by {', '.join(hit.reasons)}")
+                for reason in hit.reasons:
+                    print(f"      {reason}: {hit.why[reason]}")
         print(f"    {len(decks_mod.PAGES)} pages; {len(subs)} substitution(s): "
               f"{', '.join(subs) or 'none'}")
         print(f"    weakest: {subject.weakest}")
     print()
+    total = sum(p.stat().st_size for p in made)
     print(f"{len(made)} deck(s) in {out_dir}")
+    # Rendering cost and disk, every run. The two numbers that decide whether a
+    # nightly job is viable are the two nobody measures until it is not.
+    print(f"  {setup:.1f}s of shared reads + {render_seconds:.1f}s of rendering "
+          f"({render_seconds / max(1, len(made)):.2f}s per deck)")
+    print(f"  {total / 1024:.0f} KB on disk "
+          f"({total / 1024 / max(1, len(made)):.0f} KB per deck)")
+
+    if args.promoted:
+        freed, dropped = _prune_promoted(Path(args.out) / PROMOTED_DIR,
+                                         keep=args.keep_runs)
+        if dropped:
+            print(f"  pruned {len(dropped)} run(s) older than the newest "
+                  f"{args.keep_runs}, freeing {freed / 1024 / 1024:.1f} MB: "
+                  f"{', '.join(dropped)}")
+        else:
+            print(f"  nothing to prune; {args.keep_runs} runs kept")
     return EXIT_OK
+
+
+def _promoted_set(con: Any, by_cik: dict[str, dict[str, Any]], *,
+                  window: int, as_of: date | None) -> tuple[Any, Any]:
+    """Today's promoted set, gated on having something to draw.
+
+    The volatility leg reads `read_prices` -- two partitions -- and not the
+    eleven-partition history the deck chart needs. They are different questions:
+    a day's move needs the current year and the prior one, and reusing the wide
+    read here would put an hour of remote scanning in front of the screen.
+    """
+    from marketradar import storage
+    from marketradar.screens import promote as promote_mod
+    from marketradar.screens import volatility as vol_mod
+
+    try:
+        prices = vol_mod.read_prices(con, as_of)
+        screen = vol_mod.screen(con, as_of=as_of, prices=prices,
+                                actions=vol_mod.read_actions(con))
+    except Exception as exc:
+        print(f"mr decks: the volatility leg failed: {exc}", file=sys.stderr)
+        print("  A promoted set missing its largest leg is not a small promoted "
+              "set, it is a wrong one, so this refuses rather than degrades.",
+              file=sys.stderr)
+        return None, None
+
+    try:
+        promotion = promote_mod.promote(
+            con, screen_result=screen, day=as_of, alias=storage.PG_ALIAS,
+            form4_window=window)
+    except promote_mod.PromoteError as exc:
+        print(f"mr decks: {exc}", file=sys.stderr)
+        return None, None
+
+    gated = promote_mod.gate(
+        promotion,
+        valued=set(by_cik),
+        with_comps=_served_comp_ciks(con),
+    )
+    return promotion, gated
+
+
+def _served_comp_ciks(con: Any) -> set[str]:
+    """CIKs with a usable peer set, for the gate's optional-input count."""
+    try:
+        return {cik_key(r["cik"])
+                for r in (_comps_rows(con, Path(".cache/xbrl/out")).get("rows")
+                          or [])}
+    except Exception:
+        return set()
+
+
+def _prune_promoted(root: Path, *, keep: int) -> tuple[int, list[str]]:
+    """Keep the newest ``keep`` dated run directories; delete the rest.
+
+    **By run rather than by age, and by name rather than by mtime.** A dated
+    directory name is the session it is a deck of; an mtime is when the file
+    system last touched it, which a backup or a virus scan can move. Keeping runs
+    rather than days also means a month of weekends does not silently expire a
+    month of decks.
+    """
+    import shutil
+
+    if not root.is_dir() or keep < 1:
+        return 0, []
+    runs = sorted(
+        (p for p in root.iterdir()
+         if p.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.name)),
+        key=lambda p: p.name)
+    doomed = runs[:-keep] if len(runs) > keep else []
+    freed = 0
+    for path in doomed:
+        freed += sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        shutil.rmtree(path)
+    return freed, [p.name for p in doomed]
+
+
+def _deck_index(root: Path, relative_to: Path) -> dict[str, dict[str, str]]:
+    """``{cik: {"href":…, "run":…}}`` for every deck on disk.
+
+    **Scanned, never indexed.** A written index is a second copy of a fact and
+    this one would go stale in the direction that matters: the prune deletes files
+    and an index would keep offering links to them, which on a `file://` page is a
+    dead link where a reader expects a deck. A directory listing cannot disagree
+    with the directory.
+
+    The href is relative, so the dashboard keeps working if the tree moves and no
+    absolute home path is baked into the HTML.
+    """
+    # Imported here rather than at the top of the module: `panels` pulls the
+    # digest and two screens, and nothing else in the CLI's import path needs
+    # them. The constant lives there because that is where it is rendered.
+    from marketradar.dashboard.panels import ON_DEMAND
+
+    if not root.is_dir():
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for path in sorted(root.rglob("*.pptx")):
+        key = cik_key(path.stem.split("_", 1)[0])
+        if not key:
+            continue
+        parent = path.parent.name
+        dated = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", parent))
+        run = parent if dated else ON_DEMAND
+        prior = out.get(key)
+        # **A dated run wins, then the newest date.** `max` on an explicit key
+        # rather than "whichever the walk reached last", so two decks for one
+        # filer resolve the same way on every build -- a dashboard that linked a
+        # different night's deck each time would look exactly like one that
+        # linked the right one.
+        #
+        # The dated flag leads the key because only a dated deck can be *shown*
+        # to be current: a hand-made one carries no session, and an mtime is not
+        # a fact about the data -- a backup or a virus scanner moves it. So the
+        # tie goes to the file that can say when it was made, not to the one that
+        # merely sorts higher (`"on demand" > "2026-09-11"` as a string, which is
+        # what the first version of this did).
+        rank = (dated, run, path.name)
+        if prior is None or rank > (prior["run"] != ON_DEMAND, prior["run"],
+                                    prior["name"]):
+            try:
+                href = os.path.relpath(path, relative_to).replace("\\", "/")
+            except ValueError:            # a different drive; no relative form
+                href = path.as_uri()
+            out[key] = {"href": href, "run": run, "name": path.name,
+                        "kb": f"{path.stat().st_size / 1024:.0f}"}
+    return out
 
 
 def _slug(name: str) -> str:
@@ -1660,6 +2161,14 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
     con = storage.connect()
     ctx = shell.gather(con)
+
+    # **The deck links come from a directory listing, taken now.** Relative to
+    # the page's own directory, so the tree can move and no home path is baked
+    # into the HTML -- and re-read on every build, because the prune deletes runs
+    # and a stored index would go on offering links to files it removed. On a
+    # `file://` page that is a dead link where a reader expects a deck.
+    target = Path(args.out) if args.out else shell.DEFAULT_OUTPUT
+    ctx.deck_files = _deck_index(Path(args.decks), target.parent)
 
     # The digest is the single reader for health, macro and the screens, so
     # the two surfaces cannot disagree about what today's moves were. If it

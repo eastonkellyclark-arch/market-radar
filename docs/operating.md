@@ -7,12 +7,35 @@ what to do when something is red.
 
 ## What runs unattended
 
-Two workflows, chained. Nothing else is scheduled.
+Two workflows in the cloud, chained, plus one scheduled task on this machine.
 
 | | when | what it does |
 |---|---|---|
 | **`prices`** | `30 3 * * 2-6` — 03:30 UTC, Tue–Sat | Sweeps the whole market from Tiingo (~12k requests, ~95 min), publishes the year partition to R2, writes `dataset_stats`. |
 | **`digest`** | when `prices` **succeeds** | `mr fred`, renders and sends the email, then `mr manifest --verify`. |
+| **`Market Radar decks`** | daily 01:30 local, **local scheduled task** | `mr decks --promoted`: renders a deck for every name three sentinels promoted and gated, prunes runs past the newest 30. Logs to `.decks/run.log`. |
+
+**Why the deck job is local and not a third workflow.** A deck's price page is
+raw Tiingo OHLCV and its fundamentals page is XBRL, so the file is vendor data.
+Release assets on a public repo are downloadable, which would make publishing one
+redistribution; and a static dashboard opened from `file://` cannot read the
+private R2 bucket either. There is nowhere in the cloud for a deck to go and
+still be useful, so it is written next to the dashboard that links it. Same
+reason yfinance never runs in an Action, arrived at from the licence rather than
+from the rate limit.
+
+01:30 local is chosen against the sweep, not against the clock: `prices` starts
+03:30 UTC and takes about 95 minutes, so the partition republishes around 00:05
+US-Central. Running earlier would promote *yesterday's* session and look
+completely normal doing it. Register it with:
+
+```
+schtasks /create /tn "Market Radar decks" /tr "%CD%\scripts\run_decks.cmd" /sc daily /st 01:30 /f
+```
+
+The machine has to be awake. For a laptop that sleeps,
+`schtasks /change /tn "Market Radar decks" /ri 60 /du 08:00` retries hourly
+through the morning instead.
 
 Two things about that chain are deliberate and worth knowing, because they look
 like bugs otherwise:
@@ -69,14 +92,33 @@ uv run mr form5500                   # DOL plan data, resolved by EIN
 uv run mr symbols                    # recover tickers for stopped filers
 uv run mr backfill --budget 200      # drain N queue items, low priority
 uv run mr decks --cik 0000066740     # one pitch deck, on demand
+uv run mr decks --promoted           # today's Tier 2 set (the scheduled task's job)
 ```
 
-**Decks are on demand and there is no `--all`.** 2,564 valuations is 2,564 files
-nobody opens, and a directory generated nightly is indistinguishable from one where
-the generator broke last Tuesday. `--archetype clean growth_mismatch heavy` picks a
-filer by evidence quality instead of making you hunt a CIK. The `deck` button beside
-a row in the DCF panel **copies the command** rather than running it — the dashboard
-is a static file with no server, so a button claiming to generate would be lying.
+**Decks are automated on *promotion*, and there is still no `--all`.** 2,569
+valuations is 2,569 files nobody opens. What runs nightly is the set three
+sentinels promoted — a volatility screen list, a qualifying deal filing, or a
+Form 4 cluster — gated on having a valuation to draw. Measured 2026-09-11: **186
+promoted, 27 with a valuation, 159 reported rather than rendered.** 72 seconds
+end to end, 58 KB a deck.
+
+The 159 matter more than the 27. A filer with no valuation renders ten pages of
+"no valuation", "no peer set" and an empty chart, and a deck is the easiest thing
+here to mistake for an authoritative one — so the gate prints the count and
+writes nothing. Run it by hand any time; `--date` picks an older session,
+`--keep-runs` changes the retention, `--form4-window` changes the cluster
+lookback.
+
+`--archetype clean growth_mismatch heavy` still picks a filer by evidence quality
+instead of making you hunt a CIK, and `--cik` still renders anything at all —
+promoted or not.
+
+**The `deck` control in the DCF and deck panels is two controls.** A filer with a
+rendered deck gets a **link** to the file; everything else gets a button that
+**copies the command**. Which one you see is a fact about the disk, read as the
+page is written — never a stored index, because the prune deletes runs and an
+index would go on offering links to files it removed. Nothing in the dashboard
+generates: it is a static file with no server.
 
 **Rule for all of them: a long sweep resumes by default.** `--restart` is always
 explicit. If one dies at request 9,000, run it again — it picks up from the
@@ -96,7 +138,11 @@ checkpoint. `mr symbols` prints `N of M chunks done` so you can see that it did.
    7 sessions. A jump in it means missing corporate actions, not a market event.
    The residual backlog is ~3,300 unexplained jumps and ~1,200 falls across ~1,600
    tickers, so a change matters more than the level.
-4. **`uv run mr dashboard`** if you want to look at anything in detail.
+4. **`uv run mr dashboard`** if you want to look at anything in detail. The
+   deck panel's first line says how many filers have a rendered deck and **what
+   the newest automated run was dated** — that date is the check that separates
+   a quiet night from a generator that stopped. Rows whose filer has a deck link
+   straight to it.
 
 That's it. Most mornings are steps 1 and 3.
 
@@ -145,3 +191,14 @@ else here can be trusted.
 - **Ages render as `≥N years`.** Form 5500's `PLAN_EFF_DATE` is a floor, not an age.
 - **FRED data never leaves the machine.** `macro_series` in Postgres is its only
   home, by licence. There is deliberately no flag to relax that.
+- **Most DCF rows offer a command, not a link.** The nightly run renders 27 of
+  2,569 valuations on purpose. A row with no file is not a filer that cannot have
+  a deck; it is one nothing promoted.
+- **The Form 4 leg is usually the smallest, often zero.** `mr form4` is hand-run,
+  so the leg is only as fresh as the last time you ran it — and a cluster's
+  stored date is its first *purchase*, which precedes the filing that revealed it
+  by 3 days at the median. The 7-day window is that lag's p90, and the run says
+  so.
+- **Decks and `.decks/` are gitignored.** A deck carries Tiingo prices and XBRL,
+  so it is vendor data and the repo is public. Six were committed in `3083eb8`
+  before this was noticed; they are out of `HEAD` and still in the history.

@@ -69,6 +69,7 @@ uv run mr digest --dry-run          # render email, don't send
 uv run mr backfill --budget 200     # drain N queue items
 uv run mr xbrl --quarter 2024q1     # normalize one quarter of fundamentals
 uv run mr symbols                   # recover tickers for stopped filers
+uv run mr decks --promoted          # decks for today's promoted Tier 2 set
 ```
 
 Every job runs standalone from CLI. If it only works inside a GitHub Action,
@@ -79,8 +80,8 @@ and its output read. This is a separate rule from the mutation rule because it
 catches a different failure: the mutation rule asks whether a test examines what
 it claims to, and this asks whether anything at all has exercised the path.
 
-Twice now a command has shipped reporting success while writing nothing, with a
-passing test beside it each time:
+Three times now a command has shipped reporting success while doing nothing
+useful, with a passing test beside it each time:
 
 - `mr proxy` printed "3 documents located" and wrote **zero rows** three times.
   `proxy_section` and `proxy_projection` turned out never to have written
@@ -91,10 +92,26 @@ passing test beside it each time:
   `args.command`, so invoking it produced `KeyError: 'symbols'`. The restart-flag
   test beside it passed throughout, because parsing arguments says nothing about
   whether anything acts on them.
+- `mr decks --cik` **had never worked at all.** The documented example in
+  docs/operating.md, `--cik 0000066740`, printed "has no valuation, so there is
+  nothing to draw" for a filer that has one -- a refusal, in the project's own
+  voice, about data that was there. `by_cik` was built from unpadded CIKs and the
+  lookup padded its key, so no spelling of any CIK could match. Every deck that
+  existed had come from `--archetype`, and three of them were sitting on disk
+  looking like proof the command worked.
 
-Both were found by running the thing, and neither was reachable by reading it. So
-run it, read the output, and check the row count in the place it claims to have
-written -- a command whose output nobody has read is a command nobody has run.
+All three were found by running the thing and none was reachable by reading it.
+So run it, read the output, and check the row count in the place it claims to
+have written -- a command whose output nobody has read is a command nobody has
+run.
+
+**And "read the output" now means the artifact, not the console.** The decks that
+`--archetype` did produce reported "10 pages" and were 10 pages. Four of those
+pages were blank -- no SIC, no filing window, seven concepts reading "not read",
+no peer set -- because a CIK comparison inside `_deck_subject` wrapped its column
+and not its parameter. The console said nothing wrong because nothing was wrong
+with the console. For a command whose product is a file, the check is opening the
+file.
 
 ---
 
@@ -138,6 +155,20 @@ because a flag is the thing that gets forgotten.
 manifest, per the rule above. Repo holds code and SQL only. The one exception
 is a small, deliberately chosen set of parser test fixtures — never a bulk
 archive.
+
+**And "data file" is about what is inside it, not about the extension.** Six
+`.pptx` decks were committed in `3083eb8`. A deck's price page is 2,688 sessions
+of raw Tiingo OHLCV and its fundamentals page is XBRL, so the file *is* vendor
+data — the same boundary that put prices in R2 and gitignored `.dashboard/`. The
+pattern list could not catch it: `*.parquet`, `*.zip` and `.dashboard/` were all
+present and a deck is none of them, while `.gitattributes` carried a
+`*.pptx binary` line written so a force-added deck would not be mangled. The repo
+had considered the file type and only its encoding.
+
+So the check is now "is one tracked", read from `git ls-files` rather than from
+`.gitignore` — because a pattern list records the intention and the index records
+the fact. Before adding a rendered artifact to the tree, ask what a reader of
+that file could reconstruct from it.
 
 **A new invariant is not a test until it has been shown to fail.** Write it,
 then break the thing it guards and watch it go red. If it stays green, it is
@@ -244,6 +275,21 @@ hope.** Both forms now live in `entities/cik.py` -- `cik_key()` for Python and
 `cik_sql()` for SQL -- and a repo invariant fails the build on any join that
 compares a raw `cik` column, on `USING (cik)` (the one join shape that cannot
 wrap its own columns), and on a `cik10` alias not produced by the helper.
+
+**Sixth, 2026-09-13: the parameter is a side of the comparison.** `_deck_subject`
+read `where {cik_sql('cik')} = ?` and passed a CIK the DCF rows carry unpadded.
+The column went through the helper, so the join rule saw nothing to complain
+about -- and there is no join, so it was not looking. 0 rows for `'66740'`
+against 56 for `'0000066740'`, measured directly against the partitions.
+
+The damage is worth recording because it is not the usual blank. 3M's cash-flow
+page printed *"Absent capex is not zero capex ... this free cash flow is an upper
+bound"* for a filer reporting $910M of capex, because `status != "stated"` is
+true of a dict a failed join left empty. **A caveat fired by a broken join reads
+exactly like a fact about the company.** The machinery that exists to keep the
+deck honest produced the most authoritative-looking wrong thing in it. So the
+invariant now rejects `cik_sql(column) = ?` as its own shape: `cik_sql('?')` is
+the fix and costs a function call.
 
 **No exceptions, and that is what makes it readable.** `lpad` is idempotent, so
 wrapping an already-consistent pair costs a function call; "wrap it only where

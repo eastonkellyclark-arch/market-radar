@@ -24,6 +24,7 @@ from decimal import Decimal
 from typing import Any, Final
 
 from marketradar.digest import Digest
+from marketradar.entities.cik import cik_key
 from marketradar.screens import outcomes as outcomes_mod
 from marketradar.screens import volatility
 
@@ -1747,30 +1748,62 @@ def _dcf_subs_html(subs: list[str]) -> str:
     return " ".join(out)
 
 
+#: What the deck index calls a deck rendered by hand rather than by a nightly
+#: run. **One definition, here rather than in the CLI**, because this is the
+#: string a reader sees: the CLI's index imports it so the two cannot drift into
+#: "on demand" on one side and "manual" on the other, which is the shape the
+#: survivorship caveat took before it was made single-source.
+#:
+#: Not a date, deliberately. Nothing in a hand-made deck's path says when it was
+#: made, and inventing one from an mtime would be a fact about the file system
+#: rather than about the data.
+ON_DEMAND: Final[str] = "on demand"
+
 #: The command a deck button copies. One definition, so the button and the docs
 #: cannot drift -- and it names `uv run` because that is how every other command in
 #: this project is invoked.
 DECK_COMMAND: Final[str] = "uv run mr decks --cik {cik}"
 
 
-def deck_button(cik: str) -> str:
-    """A small button that copies the deck command for one filer.
+def deck_button(cik: str, on_disk: dict[str, dict[str, str]] | None = None) -> str:
+    """Open the deck if one has been rendered for this filer; otherwise copy the
+    command that would render it.
 
-    **Copies rather than generates, and says so on hover.** The dashboard is a static
-    file with no server, so there is nothing here that could run a renderer; a button
-    labelled "generate" would be claiming to have done something it cannot. Rendering
-    is on demand by design anyway -- 2,564 decks nightly is 2,564 files nobody opens.
+    **Two buttons, and which one you get is a fact about the disk rather than a
+    setting.** `mr decks --promoted` writes a dated directory every night, so most
+    Tier 2 names have a file sitting next to the dashboard and the useful action is
+    "open it", not "here is a command to type. The copy button stays for everything
+    else: 2,569 valuations is 2,569 files nobody opens, and the nightly run
+    deliberately renders only what three sentinels promoted.
+
+    The href is **relative and computed at render time from a directory listing**,
+    never from a stored index. The prune deletes runs, and an index would go on
+    offering links to files it had removed -- which on a `file://` page is a dead
+    link where a reader expects a deck. A listing cannot disagree with the
+    directory it just read.
+
+    Still nothing here generates. The dashboard is a static file with no server;
+    a button labelled "generate" would be claiming to have done something it
+    cannot.
     """
     if not cik:
         return ""
+    got = (on_disk or {}).get(cik)
+    if got:
+        return (f'<a class="decklink" href="{_esc(got["href"])}" '
+                f'data-deck-href="{_esc(got["href"])}" '
+                f'title="Open {_esc(got["name"])} -- {_esc(got["kb"])} KB, '
+                f'from the {_esc(got["run"])} run">deck &#8599;</a>')
     return (f'<button class="deckbtn" type="button" data-deck-cik="{_esc(cik)}" '
-            f'title="Copy: {_esc(DECK_COMMAND.format(cik=cik))}">deck</button>')
+            f'title="No deck on disk for this filer. Copy: '
+            f'{_esc(DECK_COMMAND.format(cik=cik))}">deck</button>')
 
 
 def dcf_html(
     rows: list[dict[str, Any]],
     stats: dict[str, Any] | None = None,
     funnel: dict[str, Any] | None = None,
+    decks: dict[str, dict[str, str]] | None = None,
 ) -> str:
     """Enterprise values, best-evidence first, with every substitution on the row.
 
@@ -1798,7 +1831,11 @@ def dcf_html(
             f'data-depth="{len(subs)}" '
             f'data-cik="{_esc(str(row.get("cik") or ""))}">'
             f'<td class="tk">{_esc(str(row.get("company") or ""))}'
-            f'{deck_button(str(row.get("cik") or ""))}</td>'
+            # `cik_key` on the lookup as well as on the index. The DCF rows carry
+            # a CIK unpadded and every other store pads it, which is the one
+            # mismatch in this codebase that has never once produced an error --
+            # only a believable blank.
+            f'{deck_button(cik_key(row.get("cik")), decks)}</td>'
             f'<td class="num">{_money(str(ev)) if ev else "--"}</td>'
             f'<td class="num">'
             f'{"--" if row.get("wacc") is None else f"{float(row["wacc"]) * 100:.1f}%"}'
@@ -2201,9 +2238,43 @@ def multiples_html(
 # --- U14: deck preview ---------------------------------------------------
 
 
+def _deck_runs_html(on_disk: dict[str, dict[str, str]]) -> str:
+    """What is actually on disk, and when the last automated run was.
+
+    **This is the line that answers the original objection to running nightly.**
+    The argument against automation was that a directory generated every night is
+    indistinguishable from one where the generator broke last Tuesday. It is
+    indistinguishable from the *directory*; it is perfectly distinguishable from
+    the newest run's date, which is why this renders the date rather than only the
+    count.
+    """
+    if not on_disk:
+        return ('<p class="why"><span class="why-k">nothing on disk</span> No '
+                "deck has been rendered. <code>mr decks --promoted</code> writes "
+                "the day's Tier 2 set; <code>mr decks --cik &lt;cik&gt;</code> "
+                "writes one filer. Until then every row below offers the command "
+                "rather than a link.</p>")
+    runs = sorted({d["run"] for d in on_disk.values()
+                   if d["run"] != ON_DEMAND})
+    manual = sum(1 for d in on_disk.values() if d["run"] == ON_DEMAND)
+    kb = sum(float(d["kb"]) for d in on_disk.values())
+    newest = runs[-1] if runs else None
+    where = (f"newest automated run <strong>{_esc(newest)}</strong>, "
+             f"{len(runs)} run(s) kept" if newest
+             else "no automated run yet")
+    return (f'<p class="why"><span class="why-k">on disk</span> '
+            f'{len(on_disk):,} filers have a rendered deck &mdash; {where}, '
+            f'{manual:,} rendered by hand, {kb / 1024:.1f} MB total. Rows with a '
+            f'file link to it; the rest offer the command. '
+            f'<strong>The link comes from a directory listing taken as this page '
+            f'was written</strong>, not from a stored index &mdash; the prune '
+            f'deletes old runs and an index would keep pointing at them.</p>')
+
+
 def decks_html(
     rows: list[dict[str, Any]],
     stats: dict[str, Any] | None = None,
+    on_disk: dict[str, dict[str, str]] | None = None,
 ) -> str:
     """What a deck would say about each filer, before it is a file.
 
@@ -2215,6 +2286,7 @@ def decks_html(
     and footers carry.
     """
     stats = stats or {}
+    on_disk = on_disk or {}
     if not rows:
         return ('<p class="why"><span class="why-k">waiting</span> No deck '
                 "subjects assembled. Run <code>mr dcf</code> first &mdash; a deck "
@@ -2226,7 +2298,8 @@ def decks_html(
         cls = "note" if len(subs) <= 2 else "collapsed"
         body.append(
             "<tr>"
-            f'<td class="tk">{_esc(str(row.get("company") or ""))}</td>'
+            f'<td class="tk">{_esc(str(row.get("company") or ""))}'
+            f'{deck_button(cik_key(row.get("cik")), on_disk)}</td>'
             f'<td class="num">{_money(str(row.get("enterprise_value") or "") or None)}</td>'
             f'<td class="num">{len(subs)}</td>'
             f'<td class="{cls}">{_esc(worst)}</td>'
@@ -2247,6 +2320,7 @@ def decks_html(
         from a single code path</strong> &mdash; <code>add_page</code> is the only
         function that creates a slide and it calls the footer itself, which means
         there is no way to render a page without its caveats.</p>
+      {_deck_runs_html(on_disk)}
       <table class="rows">
         <thead><tr><th>subject</th><th class="num">enterprise value</th>
           <th class="num">subs</th><th>weakest input, as the cover states it</th>

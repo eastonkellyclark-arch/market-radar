@@ -322,11 +322,17 @@ MULTIPLES_ROWS: dict = {
 #: subject, plus the page list. The worst case is the reason the panel exists.
 DECK_ROWS: dict = {
     "rows": [
-        {"company": "WALMART INC.", "enterprise_value": "353400000000",
+        # `cik` is on the row because `_deck_rows` puts it there, and the panel
+        # needs it to look a filer up in the on-disk deck index. It was missing
+        # from this fixture, which made `deck_button` return "" for every row and
+        # left the whole link path untested -- unpadded on purpose, because that
+        # is the spelling `_dcf_rows` hands over.
+        {"cik": "104169", "company": "WALMART INC.",
+         "enterprise_value": "353400000000",
          "substitutions": ["erp_constant", "growth_constant"],
          "weakest": "clean apart from two constants with no free source",
          "pages": 10},
-        {"company": "ADAMS RESOURCES & ENERGY, INC.",
+        {"cik": "2178", "company": "ADAMS RESOURCES & ENERGY, INC.",
          "enterprise_value": "890770388",
          "substitutions": ["peer_beta", "comp_depth_fallback", "absent_capex",
                            "erp_constant", "growth_constant",

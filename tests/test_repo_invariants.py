@@ -590,6 +590,123 @@ def test_no_join_compares_a_raw_cik_column() -> None:
     )
 
 
+
+#: A rendered artifact that carries vendor data out of the warehouse in a
+#: portable file. A deck's price page is thousands of sessions of raw Tiingo
+#: OHLCV and its fundamentals page is XBRL, so the file *is* the data.
+_VENDOR_ARTIFACTS: Final[tuple[str, ...]] = (".pptx", ".xlsx")
+
+
+def test_no_rendered_vendor_artifact_is_tracked() -> None:
+    """**Six decks were committed, and no rule noticed.**
+
+    Found 2026-09-13 while automating deck generation: `3083eb8` added
+    `.decks/*.pptx` and `.decks/before/*.pptx` to a **public** repo. Each one
+    carries a price page built from thousands of sessions of raw Tiingo OHLCV and
+    a fundamentals page from XBRL, which makes it vendor data in a portable file
+    -- the exact thing the R2 boundary exists for, and the exact reason
+    `.dashboard/` is gitignored. A public repo's contents are downloadable, so a
+    committed deck is redistribution under terms that forbid it.
+
+    Why the existing rules missed it, which is the part worth recording: the
+    gitignore invariant checks that *patterns* are present, and `*.parquet`,
+    `*.zip` and `.dashboard/` all were. A deck is none of those. `.gitattributes`
+    even had a `*.pptx binary` line, written so a force-added deck would not be
+    mangled -- the repo had thought about the file type and only about its
+    encoding.
+
+    So this asks the question the pattern list cannot: **is one tracked right
+    now.** `git ls-files` rather than a `.gitignore` grep, because what matters is
+    the index and not the intention. Test fixtures are exempt by the same
+    force-add carve-out `tests/fixtures/**` already has.
+
+    Mutated to confirm it fires: run before `git rm --cached`, it named all six.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=SRC.parents[1],
+            capture_output=True, text=True, timeout=60, check=True).stdout
+    except Exception as exc:                       # no git, or not a checkout
+        import pytest
+
+        pytest.skip(f"git is not available to read the index: {exc}")
+
+    tracked = [p for p in out.split("\0") if p]
+    assert tracked, "the invariant is vacuous; git listed no tracked files"
+    offenders = [
+        p for p in tracked
+        if p.lower().endswith(_VENDOR_ARTIFACTS)
+        and not p.startswith("tests/fixtures/")
+    ]
+    assert not offenders, (
+        "these rendered artifacts are tracked in a public repo:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nA deck carries raw Tiingo prices and XBRL in a portable file, so "
+        "committing one is redistributing vendor data from a repo anyone can "
+        "clone. Untrack it (`git rm --cached`) and let .gitignore hold it. "
+        "Vendor data goes to R2; nothing vendor-derived goes anywhere public."
+    )
+
+
+#: `cik_sql(column) = ?` -- the helper on one side of a comparison and a bind
+#: parameter or a plain interpolation on the other. In the scanned form every
+#: non-`cik_sql` interpolation has already collapsed to `?`, so this one pattern
+#: catches a literal bind marker and an unwrapped f-string alike.
+_HALF_WRAPPED_CIK: Final[re.Pattern[str]] = re.compile(
+    rf"{CIK_TOKEN}\s*(?:=|<>|!=)\s*\?|\?\s*(?:=|<>|!=)\s*{CIK_TOKEN}")
+
+
+def test_no_cik_comparison_wraps_only_its_column() -> None:
+    """**The sixth occurrence, and the first one the ON-clause rule could not
+    see.**
+
+    `_deck_subject` read ``where lpad(cast(cik as varchar), 10, '0') = ?`` and
+    passed a CIK the DCF rows carry unpadded. The column went through the helper
+    and the *parameter* did not, so the two strings never compared: measured
+    2026-09-13 directly against the partitions, 0 rows for `'66740'` and 56 for
+    `'0000007332'`-style padding.
+
+    Nothing raised, and the damage was invisible in the place it landed. Every
+    deck ever rendered came out with a blank fundamentals page, a blank cash-flow
+    page, no SIC and a filing window of "? to ?" -- and the cash-flow page went
+    further than blank, printing "Absent capex is not zero capex ... this free
+    cash flow is an upper bound" for 3M, which reports $910M of capex. A caveat
+    fired by a failed join reads exactly like a fact about the company.
+
+    `test_no_join_compares_a_raw_cik_column` could not catch it: there is no join
+    here, and the column *did* go through `cik_sql`. Half-wrapped is its own
+    shape, so it gets its own rule. `cik_sql('?')` is the fix and was already the
+    idiom two queries away in the same function.
+
+    Mutated to confirm it fires: reverting either of the two `_deck_subject`
+    reads to `= ?` turns it red and names the line.
+    """
+    offenders: list[str] = []
+    scanned = 0
+    for path in sorted(SRC.rglob("*.py")):
+        if path.name == "cik.py":                  # the helper defines the form
+            continue
+        for lineno, sql in _cik_scan_targets(path):
+            scanned += 1
+            if _HALF_WRAPPED_CIK.search(sql):
+                offenders.append(
+                    f"{path.relative_to(SRC.parent.parent)}:{lineno}: "
+                    "cik_sql on the column and a bare parameter on the other "
+                    "side")
+
+    assert scanned, "the invariant is vacuous; no SQL was scanned"
+    assert not offenders, (
+        "a CIK comparison wraps its column and not its parameter:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nThe padded and unpadded spellings do not compare, and this shape "
+        "fails silently in the direction that looks like data: a blank page, or "
+        "worse, a caveat about missing capex on a filer that reports it. Wrap "
+        "both sides -- `cik_sql('?')` is idempotent and already the idiom."
+    )
+
+
 # --- the deal-outcome limitation, enforced rather than documented -------
 
 

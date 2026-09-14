@@ -180,6 +180,12 @@ class Context:
     multiples: dict[str, Any] = field(default_factory=dict)
     #: Deck subjects, their substitution depth and the page list.
     decks: dict[str, Any] = field(default_factory=dict)
+    #: ``{cik: {href, run, name, kb}}`` for every deck actually on disk, from a
+    #: directory listing taken when the page was rendered. What turns a row's
+    #: copy-the-command button into a link, and what lets the deck panel report
+    #: whether the nightly run happened -- which is the check that tells a quiet
+    #: night from a generator that broke last Tuesday.
+    deck_files: dict[str, dict[str, str]] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -1100,6 +1106,7 @@ def render(
     bodies["decks"] = body_html.decks_html(
         (ctx.decks or {}).get("rows") or [],
         (ctx.decks or {}).get("stats") or {},
+        on_disk=ctx.deck_files or {},
     )
     bodies["proxy"] = body_html.proxy_html(
         (ctx.proxy or {}).get("rows") or [],
@@ -1109,6 +1116,7 @@ def render(
         (ctx.dcf or {}).get("rows") or [],
         (ctx.dcf or {}).get("stats") or {},
         (ctx.dcf or {}).get("funnel"),
+        decks=ctx.deck_files or {},
     )
     bodies["private"] = body_html.private_html(private or [], private_stats or {})
     bodies["mature"] = body_html.mature_html(mature or [], mature_stats or {})
@@ -1371,6 +1379,14 @@ td.new {{ color:#0ca30c; font-size:9.5px; font-weight:700; width:26px; }}
 .deckbtn[data-state="ok"] {{ color:#0ca30c; border-color:#0ca30c; }}
 .deckbtn[data-state="fail"] {{ color:#fab219; border-color:#fab219;
   font-size:9.5px; }}
+/* A deck that exists. Visibly a link rather than a button, because the actions
+   differ: one opens a file, the other hands you a command to run. Styling them
+   alike would make "which of these did something" a thing to remember. */
+.decklink {{ font-size:10px; margin-left:7px; padding:0 5px;
+  color:var(--accent, #1f6feb); background:var(--plane);
+  border:1px solid currentColor; border-radius:3px; text-decoration:none;
+  vertical-align:middle; white-space:nowrap; }}
+.decklink:hover {{ text-decoration:underline; }}
 /* The participant sparkline. A year the sponsor did not file is a *gap* --
    drawn as an empty slot rather than a zero-height bar, because the whole
    point of the series is that an absence is not a headcount of nothing. */

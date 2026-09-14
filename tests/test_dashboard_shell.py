@@ -387,3 +387,62 @@ def test_every_panel_body_renderer_handles_no_data() -> None:
         out = fn(*args)
         assert 'class="empty"' in out, f"{fn.__name__} renders nothing for []"
         assert "mr " in out, f"{fn.__name__} does not name the command to run"
+
+
+# --- the deck link, end to end through the page -------------------------
+
+
+def test_a_rendered_deck_becomes_a_link_in_both_panels_that_list_filers():
+    """**The link has to survive the whole page, not just `deck_button`.**
+
+    Two panels list filers -- the valuation table and the deck preview -- and both
+    have to offer the same control for the same filer, or a reader learns to check
+    both. The index reaches them through `Context.deck_files`, so this renders the
+    real page and looks in the real slots rather than calling the helper.
+
+    Mutated to confirm it fires: dropping `decks=ctx.deck_files` from either
+    `dcf_html` or `decks_html` in `shell.render` leaves that panel offering the
+    copy button while the other offers a link.
+    """
+    from conftest import loaded_context, panel_slot
+
+    from marketradar.dashboard import shell
+
+    # One entry per panel's first fixture row, padded -- which is the whole
+    # point of `cik_key` on the lookup: the DCF fixture spells its CIK padded
+    # and the deck fixture spells its own unpadded, exactly as the two real
+    # sources do.
+    index = {
+        cik: {"href": f"../decks/2026-09-11/{cik}_filer.pptx",
+              "run": "2026-09-11", "name": f"{cik}_filer.pptx", "kb": "58"}
+        for cik in ("0000320193", "0000104169")
+    }
+    ctx = loaded_context(deck_files=index)
+    page = shell.render(ctx)
+    for pid, cik in (("dcf", "0000320193"), ("decks", "0000104169")):
+        slot = panel_slot(page, pid)
+        assert 'class="decklink"' in slot, (
+            f"the {pid} panel did not offer a link for a filer whose deck is on "
+            "disk")
+        assert f"{cik}_filer.pptx" in slot
+        # The other filer has no file, so the command is still on offer. Both
+        # controls in one table is the whole design: 27 of 2,569 valuations get a
+        # nightly deck, so most rows will never have one.
+        assert 'class="deckbtn"' in slot
+
+
+def test_with_no_decks_on_disk_every_row_still_offers_the_command():
+    """The fallback is the point rather than a leftover.
+
+    A row offering nothing would read as "no deck is possible for this filer",
+    which is false -- the command renders one on demand.
+    """
+    from conftest import loaded_context, panel_slot
+
+    from marketradar.dashboard import shell
+
+    page = shell.render(loaded_context())
+    slot = panel_slot(page, "dcf")
+    assert 'class="decklink"' not in slot
+    assert slot.count('class="deckbtn"') == 2
+    assert "nothing on disk" in panel_slot(page, "decks")

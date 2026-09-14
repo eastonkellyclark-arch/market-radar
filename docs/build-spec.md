@@ -93,8 +93,18 @@ and thereby oversized the LLM budget:
   output. Good-tier LLM. This is the number to budget quota against, and the
   number bounded by what one person can actually read in a day.
 
-Promotion from the first to the second is a deliberate act — a screen result
-you clicked, not an automatic cascade.
+Promotion from the first to the second was written here as a deliberate act — a
+screen result you clicked, not an automatic cascade. **Measured 2026-09-13, and
+the act turned out to be the gate rather than the click.** See "Decks on
+promotion" below: the three sentinels promote 186 filers on a normal session and
+27 of them have a valuation to draw, which lands inside the 15–40 band this
+paragraph sizes Tier 2 at, with no human in the loop.
+
+The 3–5/day figure above is a **good-tier LLM** budget and still stands, because
+the shipped deck spends none of it: `decks.py` renders from rows that already
+exist and makes no model call at all. Narrative analysis is the thing that costs
+quota, it is not built, and when it is it gets its own number rather than
+inheriting this one.
 
 ### Storage
 
@@ -544,7 +554,7 @@ the build goes red naming both.
 | Analysis | Deal multiples | `multiples` | live | U12. What a target sold for over what it last reported. The list is short because the population is &mdash; 1.7% of filers whose 10-K history ended appear in the deals table at all |
 | Analysis | Historical outcomes | `outcomes` | live | W3-T3. The survivorship caveat renders beside the number, not in a docstring |
 | Analysis | DCF / 3-statement | `dcf` | live | U13. Enterprise values with every substitution on the row. No row has zero: the ERP and the growth rate are constants on all of them, so the page opens at the cohort clean apart from those two |
-| Analysis | Pitch decks | `decks` | live | U14. What a deck would say before it is a file. Ten pages; the provenance footer runs on every one from a single code path |
+| Analysis | Pitch decks | `decks` | live | U14. What a deck would say before it is a file. Ten pages; the provenance footer runs on every one from a single code path. Rows whose filer has a rendered deck link to it, from a directory listing taken as the page is written &mdash; never a stored index, because the prune deletes runs. See "Decks on promotion" |
 
 #### Blocking issue, ahead of the backfill
 
@@ -1924,6 +1934,194 @@ Also corrected on the way through: `tests/test_repo_invariants.py` globbed
 `sources/*.py` non-recursively, so a source that is a *package* was invisible to
 all three repo rules — no URL check, no freshness check, no ban on
 non-deterministic row picks. Nothing failed, which is the problem.
+
+### Decks on promotion — measured 2026-09-13
+
+`mr decks` took a CIK or an archetype, and the module docstring said "on demand
+and never on a schedule": 2,569 valuations is 2,569 files nobody opens, and a
+directory generated nightly is indistinguishable from one where the generator
+broke last Tuesday. Both halves of that still hold and `--all` still does not
+exist. What was missing was the population *between* one filer and the whole
+valued universe — the names Tier 2 is sized for.
+
+`screens/promote.py` computes it. Three legs, deliberately different in kind:
+
+| leg | keyed on | visible when |
+|---|---|---|
+| `volatility` | ticker → CIK through `company_tickers` | the session it moved |
+| `deal_filing` | the `deals.cik` column | the day it was filed |
+| `form4_cluster` | the CIK inside `signals.accession` | see the window note |
+
+Against the session of 2026-09-11, which is an ordinary Friday:
+
+```
+sentinel hits           353   every screen row, deal filing and cluster
+not an ETF              216  -137  38.8%   files no 10-K, has no CIK
+keyed on a CIK          191  - 25  11.6%   never through a name
+distinct filers         186  -  5   2.6%   share classes collapsing
+has a valuation          27  -159  85.5%   the one input a deck cannot fake
+```
+
+By leg before the union: volatility 178 filers, deals 7 of the 8 filed that day
+(one was `unclassified`), clusters 1. By leg through the gate: volatility 25 of
+178 (14%), deals 2 of 7 (29%).
+
+**85% of the promoted set cannot produce a deck, and that is the headline.** A
+filer with no valuation renders ten pages of "no valuation", "no peer set",
+"-- --" and an empty candle chart. A deck is the easiest artifact in this system
+to mistake for an authoritative one — every other surface carries its caveats
+structurally and a slide is a rectangle with a big number on it — so a directory
+of 159 hollow ones is worse than no directory. The gate reports the count and
+writes nothing.
+
+The gate is *one* condition, not four. A valuation already implies fundamentals,
+because the DCF cannot run without free cash flow; and comps, insiders, deals and
+prices each have a page that says "none on record" rather than a page that goes
+blank. Their counts are reported beside the run — "27 decks, 24 with a peer set"
+— rather than used to exclude.
+
+**27 is not a coincidence, and it is also not robust.** It lands inside the
+15–40 band the architecture sizes Tier 2 at because the DCF population is 2,569
+of 6,431 operating filers and a mover list is mostly sub-$1 names and ETFs. Load
+more quarters and the numerator grows; the band is an observation about today's
+data, not a property of the design.
+
+#### Cost, since that is what decided it
+
+| | measured |
+|---|---|
+| shared reads, once per run | 57–60 s |
+| rendering | 0.48 s per deck |
+| 27 decks, end to end | ~72 s |
+| 40 decks, projected | ~80 s |
+| disk | 58 KB per deck |
+| 30 runs of 40 | ~68 MB |
+
+The first measurement was **9–11 seconds of subject assembly against 0.4–0.8
+seconds of rendering**, because `_deck_subject` called
+`volatility.read_all_prices` itself — a union over eleven remote R2 partitions,
+once per deck. Forty decks would have been six minutes of re-reading the same
+eleven files to draw twenty seconds of slides. The fix is `_DeckInputs`: every
+whole-population read happens once per invocation, the prices are filtered to the
+run's tickers inside that one pass and materialised locally, and the action audit
+runs over the same local table rather than over the market. Rendering is now the
+majority of the marginal cost, which is the shape a per-item job should have.
+
+Disk is pruned by **run rather than by age**, keeping the newest 30 dated
+directories. A month of retention measured in days is 21 runs after a stretch of
+long weekends, and the number somebody means by "keep a month" is the number of
+mornings they can look back on.
+
+**No LLM quota.** `decks.py` renders from stored rows and makes no model call, so
+27 a night costs nothing against the 3–5/day good-tier budget in §1. That budget
+is for narrative analysis, which is not built.
+
+#### The Form 4 window is seven days, and it is measured
+
+`signals.occurred_at` for a cluster is `Cluster.first` — the earliest *purchase*
+in it, not the day it became knowable. Form 4s are filed up to two business days
+after the trade and a cluster spans several of them. Over 19,127 historical
+clusters the gap from `first` to visible is a **median of 3 days and a p90 of 7**.
+
+So a job asking for clusters whose `occurred_at` is today finds almost nothing on
+almost every day, which is exactly what the first run did: **0 clusters on
+2026-09-11 with 28 in the table.** The leg takes a window, it defaults to the
+measured p90, and the run's output states the decile it drops. The remaining 10%
+is a late filing; closing it means storing a visibility date the loader does not
+currently write. Same shape as the Form 5500 reporting lag — a row that is not
+there *yet* and a row that is there and small are different facts, and the
+arithmetic that treats them alike never errors.
+
+#### A filer's symbols are not interchangeable
+
+Caught by the three-runs-identical check against real data, not by the suite:
+the promoted set came back different on the third run for five filers. Each one
+had **both its common share and a warrant in the same day's screen**, under one
+CIK, and the row took whichever the database returned first. `company_tickers`
+had no `order by` to give it and DuckDB's Postgres scanner is parallel.
+
+Alliance Entertainment on 2026-09-11: **AENTW +24.6% in the sub-$1 band, +617
+ticks; AENT +16.5% in the $1-10 band, +91 ticks.** Same company, and not the
+same number, band or tick count. The other four were COLA/COLAR/COLAU,
+HUBC/HUBCZ, USDE/USDEW and BIAF/BIAFW.
+
+Ordering the reads fixes the determinism and not the question, which is *which
+symbol is the company*. It is not answerable from what is stored. Measured
+2026-09-13: 1,452 of 8,005 filers carry more than one symbol, and on **527 of
+them the shortest is not a prefix of the rest** — preferred series (`AILIH`,
+`AILIM`, `AILIN`…), ADR classes (`AKZOF` and `AKZOY`), share classes (`BF-A`,
+`BF-B`). `company_tickers` holds no exchange and no primary flag, and
+shortest-then-alphabetical resolves JPMorgan to **`AMJB`**, a structured note.
+
+So promotion keys on the CIK, carries **every** symbol the screen listed, and
+names the one with the largest move — "the symbol that put the name in front of
+you", which is a fact about the session rather than a guess at a listing. It can
+therefore be a warrant, and where it is, the reason line says so beside the
+number: *"AENTW +24.6% … 2 of this filer's symbols were in the screen (AENT,
+AENTW), and a warrant does not move with its common share."* The deck's price
+page draws that symbol; its fundamentals are the filer's. Stating the mismatch is
+the honest option, and inventing a primary-listing rule is the one that would
+fail silently.
+
+`_deck_ticker`, which serves `--cik` runs where nothing promoted anything, still
+picks by `last_seen desc, ticker`. Deterministic, arbitrary among classes, and
+all that is available.
+
+#### Two casts and a key, all three silent
+
+Three defects found while building this, none of which raised anything:
+
+1. **`occurred_at::date` through the attached alias is a day early.** DuckDB does
+   the cast and renders a timestamptz in the machine's zone, so a cluster stored
+   at `2026-09-08 00:00:00+00` read as 2026-09-07 on a US-Central box — on every
+   row. `edgar_rss` casts the same column inside a `postgres_query` string, where
+   Postgres does the cast and the zone is its own. The two paths are not
+   interchangeable; this one needs `at time zone 'UTC'`.
+
+2. **`mr decks --cik` had never worked.** `_cmd_decks` built `by_cik` from the
+   DCF rows' *unpadded* CIKs and looked up a padded key, so
+   `uv run mr decks --cik 0000066740` — the command in `docs/operating.md` —
+   answered "has no valuation, so there is nothing to draw" for a filer that has
+   one, in both spellings. Every deck that exists was produced through
+   `--archetype`.
+
+3. **Four of the ten pages were blank on every deck ever rendered.**
+   `_deck_subject` read `where lpad(cast(cik as varchar), 10, '0') = ?` and passed
+   the unpadded CIK: 0 rows for `'66740'`, 56 for `'0000066740'`. The column went
+   through `cik_sql` and the *parameter* did not.
+
+   The sixth occurrence of the CIK representation failure and the first on the
+   parameter side, which `test_no_join_compares_a_raw_cik_column` cannot see —
+   there is no join, and the column *is* wrapped. `cik_sql('?')` was already the
+   idiom two queries away in the same function.
+
+   And it went further than blank. 3M's cash-flow page printed "Absent capex is
+   not zero capex … this free cash flow is an upper bound" for a filer reporting
+   $910M of capex, because `capex.status != "stated"` is true of a dict that a
+   failed join left empty. **A caveat fired by a broken join reads exactly like a
+   fact about the company** — the most authoritative-looking wrong thing in the
+   deck, printed by the machinery that exists to keep the deck honest.
+
+   `test_no_cik_comparison_wraps_only_its_column` now rejects `cik_sql(col) = ?`
+   as its own shape.
+
+#### And the decks were in git
+
+Six `.pptx` files were committed in `3083eb8` to a **public** repo. A deck's
+price page is 2,688 sessions of raw Tiingo OHLCV and its fundamentals page is
+XBRL, which makes the file vendor data in portable form — the exact thing the R2
+boundary exists for, and the exact reason `.dashboard/` is gitignored.
+
+The existing rules could not catch it. `test_gitignore_covers_secrets_and_data`
+checks that *patterns* are present, and `*.parquet`, `*.zip` and `.dashboard/`
+all were; a deck is none of them. `.gitattributes` even carried a
+`*.pptx binary` line, written so a force-added deck would not be line-ending
+mangled — the repo had thought about the file type and only about its encoding.
+
+`test_no_rendered_vendor_artifact_is_tracked` asks the question a pattern list
+cannot: is one tracked right now, read from `git ls-files` rather than from
+`.gitignore`. Untracking them removes them from `HEAD`; **they remain in the
+history**, which is a rewrite-and-force-push decision rather than a code change.
 
 ### Comps — peer sets, measured 2026-09-12
 
