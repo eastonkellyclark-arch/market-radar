@@ -56,6 +56,15 @@ node_modules/
 Thumbs.db
 desktop.ini
 
+# Rendered decks. **Six of these were committed in 3083eb8 and are in the
+# history.** A deck's price page is 2,688 sessions of raw Tiingo OHLCV and its
+# fundamentals page is XBRL, so a deck is vendor data in a portable file --
+# exactly what the R2 boundary exists for, and a public repo makes a committed
+# one redistribution. `mr decks --promoted` writes about forty a night, which
+# would have turned one licensing mistake into a recurring one.
+.decks/
+*.pptx
+
 # Dashboard output. The screens are computed from Tiingo prices, so the
 # rendered file is vendor data in browsable form -- never committed, never
 # published, never a Release asset. Same boundary that put prices in R2.
