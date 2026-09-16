@@ -28,5 +28,5 @@ REM /ri 60 /du 08:00` makes it retry hourly through the morning instead, which
 REM is the right answer for a laptop that sleeps.
 cd /d "C:\Users\oj\Market Radar"
 echo ==== %DATE% %TIME% ==== >> ".decks\run.log"
-".venv\Scripts\python.exe" -m marketradar.cli decks --promoted --out ".decks" --keep-runs 30 >> ".decks\run.log" 2>&1
+uv run mr decks --promoted --out ".decks" --keep-runs 30 >> ".decks\run.log" 2>&1
 echo exit=%ERRORLEVEL% >> ".decks\run.log"

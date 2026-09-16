@@ -60,8 +60,17 @@ desktop.ini
 # history.** A deck's price page is 2,688 sessions of raw Tiingo OHLCV and its
 # fundamentals page is XBRL, so a deck is vendor data in a portable file --
 # exactly what the R2 boundary exists for, and a public repo makes a committed
-# one redistribution. `mr decks --promoted` writes about forty a night, which
-# would have turned one licensing mistake into a recurring one.
+# one redistribution. `mr decks --promoted` writes 27 a night (186 promoted, 27
+# with a valuation to draw -- measured 2026-09-11), which would have turned one
+# licensing mistake into a recurring one.
+#
+# "about forty a night" stood here until 2026-09-16 and was wrong twice over:
+# the measured figure is 27 in both docs/operating.md and docs/build-spec.md,
+# and *nothing was writing any of them* -- scripts/run_decks.cmd existed and
+# the schtasks line was in the docs, but the task had never been registered,
+# so .decks/run.log did not exist and the only decks on disk came from one
+# hand-run. A rate in a comment is not a scheduler; see docs/operating.md for
+# where the schedule actually lives.
 .decks/
 *.pptx
 
