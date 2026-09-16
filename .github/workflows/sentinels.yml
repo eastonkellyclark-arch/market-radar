@@ -1,0 +1,169 @@
+name: sentinels
+
+# Tier 1, on a schedule at last. Three jobs that had no scheduler at all until
+# 2026-09-16 -- `signals` had not been written since 2026-09-09 and `companies`
+# since 2026-09-07, with nothing red anywhere, because nothing was scheduled to
+# go red.
+#
+# **Everything here reads the daily index, not the RSS feed.** `edgar-poll.yml`
+# is the tripwire and can miss filings by construction (the feed caps at 100 a
+# form type and 8-K saturates that in ~85 minutes). These read the whole-day
+# bulk file, so they are the completeness path. If the two ever disagree, this
+# one is right.
+
+on:
+  # Daily, chained on the sweep *finishing* rather than on a clock -- the same
+  # reasoning as digest.yml. The sweep starts at 03:30 UTC, takes ~95 minutes,
+  # and has fired 4h47m late; any fixed hour here would sometimes run before it.
+  workflow_run:
+    workflows: ["prices"]
+    types: [completed]
+  schedule:
+    # Weekly companies refresh. Sunday 09:07 UTC -- off the hour, for the same
+    # documented high-load reason as edgar-poll's :07/:37.
+    - cron: "7 9 * * 0"
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Which job to run"
+        required: false
+        default: "both"
+        type: choice
+        options: [both, daily, companies]
+
+concurrency:
+  group: sentinels
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  daily:
+    name: daily (form4 + deals)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    # Only after a sweep that actually succeeded, and never on the weekly cron.
+    # A red sweep is not a reason to skip EDGAR -- these read SEC, not our
+    # prices -- but a red sweep usually means the runner or the network is
+    # having a bad morning, and the next successful sweep re-runs this over the
+    # same five days anyway. Idempotent on accession, so the overlap is free.
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.only != 'companies')
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Form 4 clusters
+        id: form4
+        # `--days 5`, not 1, and the overlap is the point. A Form 4 is due two
+        # business days after the trade and arrives later than that often
+        # enough; a one-day window would read only what was filed yesterday and
+        # silently drop the late ones. Storage keys on accession, which EDGAR
+        # assigns and never reuses, so re-reading four days costs nothing and
+        # cannot duplicate.
+        #
+        # Measured 2026-09-16: 324s for 5 days -- 2,351 Form 4s parsed, 12
+        # clusters found.
+        env:
+          MR_ENV: ci
+          MR_SEC_USER_AGENT: ${{ secrets.MR_SEC_USER_AGENT }}
+          MR_POSTGRES_DSN: ${{ secrets.MR_POSTGRES_DSN }}
+        run: uv run mr form4 --days 5
+
+      - name: 8-K deals
+        id: deals
+        # Runs even if Form 4 failed. They share a source and nothing else --
+        # different forms, different tables, no ordering between them -- so
+        # letting one failure skip the other would be the digest/manifest
+        # mistake again: a guard switched off by an unrelated step.
+        #
+        # Measured 2026-09-16: 132s for 5 days. With Form 4's 324s the daily
+        # chain is about 7.6 minutes; the 45-minute job timeout is headroom for
+        # a slow runner and an SEC backoff, not an estimate.
+        if: success() || failure()
+        env:
+          MR_ENV: ci
+          MR_SEC_USER_AGENT: ${{ secrets.MR_SEC_USER_AGENT }}
+          MR_POSTGRES_DSN: ${{ secrets.MR_POSTGRES_DSN }}
+        run: uv run mr deals --days 5
+
+      - name: Summary
+        if: success() || failure()
+        run: |
+          {
+            echo "### sentinels / daily"
+            echo ""
+            echo "- upstream sweep: \`${{ github.event.workflow_run.conclusion || 'n/a' }}\`"
+            echo "- form4: \`${{ steps.form4.outcome }}\`"
+            echo "- deals: \`${{ steps.deals.outcome }}\`"
+            echo ""
+            echo "Both read the EDGAR daily index over a 5-day window."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  companies:
+    name: weekly (companies refresh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.only != 'daily')
+
+    # `mr sec-tickers` publishes the CIK/ticker map to a GitHub Release. SEC
+    # data is public domain, so a public Release is correct and this is the one
+    # job here that writes to the repo.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Refresh the CIK/ticker map
+        id: tickers
+        # Weekly rather than nightly because the map barely moves and every
+        # write is an upsert over ~10,000 rows. It had gone nine days without a
+        # refresh when this workflow was written, and the digest could not tell:
+        # its `companies` health line prints a row count with no max-age, so a
+        # frozen table reads exactly like a healthy one.
+        env:
+          MR_ENV: ci
+          MR_SEC_USER_AGENT: ${{ secrets.MR_SEC_USER_AGENT }}
+          MR_POSTGRES_DSN: ${{ secrets.MR_POSTGRES_DSN }}
+          MR_GITHUB_REPO: ${{ github.repository }}
+          # `publish_release_asset` shells out to `gh`, which is preinstalled
+          # on the runner and reads GH_TOKEN.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: uv run mr sec-tickers
+
+      - name: Summary
+        if: success() || failure()
+        run: |
+          {
+            echo "### sentinels / weekly"
+            echo ""
+            echo "- sec-tickers: \`${{ steps.tickers.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

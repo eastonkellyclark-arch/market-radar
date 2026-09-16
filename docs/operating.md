@@ -7,15 +7,34 @@ what to do when something is red.
 
 ## What runs unattended
 
-Two workflows in the cloud, chained, plus one scheduled task on this machine.
+Four workflows in the cloud and one scheduled task on this machine.
 
 | | when | what it does |
 |---|---|---|
 | **`prices`** | `30 3 * * 2-6` — 03:30 UTC, Tue–Sat | Sweeps the whole market from Tiingo (~12k requests, ~95 min), publishes the year partition to R2, writes `dataset_stats`. |
 | **`digest`** | when `prices` **succeeds** | `mr fred`, renders and sends the email, then `mr manifest --verify`. |
+| **`edgar-poll`** | `7,37 12-23 * * 1-5` — every 30 min across the US filing day | `mr edgar`: polls EDGAR `getcurrent` for the watched form types into `signals`. **A tripwire, not the completeness path** — see below. 15s a run. |
+| **`sentinels` / daily** | when `prices` **succeeds** | `mr form4 --days 5` then `mr deals --days 5`, both off the EDGAR **daily index**. Measured 324s + 132s = ~7.6 min. The 5-day overlap catches late filings; storage keys on accession, so it cannot duplicate. |
+| **`sentinels` / weekly** | `7 9 * * 0` — Sundays | `mr sec-tickers`: refreshes `companies` and `company_tickers` and republishes the CIK/ticker map to its Release. |
 | **`Market Radar decks`** | daily 01:30 local, **local scheduled task** | `mr decks --promoted`: renders a deck for every name three sentinels promoted and gated, prunes runs past the newest 30. Logs to `.decks/run.log`. |
 
-**Why the deck job is local and not a third workflow.** A deck's price page is
+**Why the RSS poll is not the guarantee.** `edgar-poll` reads
+`getcurrent`, which caps at 100 entries per form type. Measured 2026-09-16 at
+the post-close peak, 8-K came back **99 of 100 spanning 85 minutes** -- the feed
+is saturated, so anything slower than that window loses filings off the end. And
+a cron cannot promise to beat it: GitHub's own docs say scheduled runs are
+delayed at high load and "some queued jobs may be dropped". So the poll shortens
+the gap between a filing and our seeing it, and `sentinels` -- reading the
+whole-day bulk index -- is the reason we know about it at all. Where the two
+disagree, `sentinels` is right.
+
+**Scheduled workflows switch themselves off.** "In a public repository,
+scheduled workflows are automatically disabled when no repository activity has
+occurred in 60 days." Four crons now depend on this repo seeing a push every
+couple of months. That is a scheduler that stops without failing, which is the
+thing this page exists to make visible.
+
+**Why the deck job is local and not a fifth workflow.** A deck's price page is
 raw Tiingo OHLCV and its fundamentals page is XBRL, so the file is vendor data.
 Release assets on a public repo are downloadable, which would make publishing one
 redistribution; and a static dashboard opened from `file://` cannot read the

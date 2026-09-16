@@ -1,0 +1,96 @@
+name: edgar-poll
+
+# The EDGAR tripwire. Polls `getcurrent` for the watched form types and stores
+# what it has not seen before.
+#
+# **This is a latency device, not the completeness path, and the distinction is
+# load-bearing.** Two measurements say so:
+#
+#   1. The feed caps at 100 entries per form type (ENTRIES_PER_FORM). Measured
+#      2026-09-16 at the post-close peak, 8-K came back **99 of 100 across 85
+#      minutes** -- saturated. Poll less often than that window and 8-Ks fall
+#      off the end having never been seen.
+#   2. GitHub's own docs: "The `schedule` event can be delayed during periods
+#      of high loads... If the load is sufficiently high enough, some queued
+#      jobs may be dropped." So no cron interval can *guarantee* beating an
+#      85-minute window.
+#
+# Those two together mean a poll can never be the guarantee. The guarantee is
+# `sentinels.yml`, where `mr deals` and `mr form4` read the **daily index** --
+# the whole-day bulk file, which cannot miss a filing. This job exists to
+# shorten the gap between a merger filing and it appearing, not to be the
+# reason we know about it. Same split manifest.toml already describes:
+# "`current` ... is a tripwire, not a history."
+
+on:
+  schedule:
+    # Every 30 minutes across the US filing day (12:00-23:59 UTC ~ 08:00-19:59
+    # ET), weekdays. 2.8x margin on the measured 85-minute 8-K window.
+    #
+    # Minutes :07 and :37 rather than :00 and :30 deliberately. GitHub names
+    # "the start of every hour" as a high-load window where runs are delayed or
+    # dropped, and :30 is the next most crowded. An off-peak minute costs
+    # nothing and is the one scheduling choice here that is free to get right.
+    - cron: "7,37 12-23 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      no_load:
+        description: "Fetch and report, store nothing"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # Never cancel a poll in flight: it is mid-upsert into `signals`, and the
+  # next one is 30 minutes away regardless.
+  group: edgar-poll
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    # 15 seconds of work measured. Ten minutes is entirely for a slow runner
+    # or an SEC backoff, and a poll that has not finished in ten is one the
+    # next poll supersedes anyway.
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Poll
+        id: poll
+        # No `continue-on-error`. `edgar_rss` raises when a poll returns zero
+        # filings at all -- EDGAR takes thousands a day and Form 4s alone run
+        # ~900, so an empty poll is a broken poll and not a quiet market. That
+        # is the same rule as assert_fresh, one tier up.
+        env:
+          MR_ENV: ci
+          MR_SEC_USER_AGENT: ${{ secrets.MR_SEC_USER_AGENT }}
+          MR_POSTGRES_DSN: ${{ secrets.MR_POSTGRES_DSN }}
+        run: uv run mr edgar ${{ inputs.no_load && '--no-load' || '' }}
+
+      - name: Summary
+        if: success() || failure()
+        run: |
+          {
+            echo "### edgar-poll"
+            echo ""
+            echo "- outcome: \`${{ steps.poll.outcome }}\`"
+            echo "- trigger: \`${{ github.event_name }}\`"
+            echo "- store: \`${{ inputs.no_load && 'no-load' || 'stored' }}\`"
+            echo ""
+            echo "Tripwire only. Completeness comes from \`sentinels.yml\`,"
+            echo "which reads the daily index."
+          } >> "$GITHUB_STEP_SUMMARY"
