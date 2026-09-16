@@ -1042,3 +1042,99 @@ def test_the_caveat_is_not_hover_only_in_the_panel() -> None:
     assert needle in visible, (
         "the survivorship caveat renders only inside an attribute (a tooltip), so a "
         "reader sees the number and not the population it is measured on")
+
+
+# ---------------------------------------------------------------------------
+# A guard must not be switchable off by an unrelated step.
+# ---------------------------------------------------------------------------
+
+#: Steps that are *gates* — they exist to fail the build on a condition the
+#: rest of the job knows nothing about. A gate placed after a step that can
+#: fail for its own reasons must declare `if: always()`, or the earlier
+#: failure silently disarms it.
+GATE_STEPS: Final[dict[str, str]] = {
+    "Verify every declared location": (
+        "the manifest drift gate: a declared location that stopped resolving"
+    ),
+}
+
+
+def _workflow_steps(text: str) -> list[dict[str, str]]:
+    """Split a workflow's YAML into per-step blocks, keyed by `- name:`.
+
+    A hand-rolled split rather than a yaml parse: pyyaml is not a project
+    dependency and adding one to read three files would be a real Actions
+    install cost for a test. The shape here is stable -- every step in this
+    repo opens with `      - name:` at a fixed indent.
+    """
+    steps: list[dict[str, str]] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if re.match(r"^      - name:", line):
+            if current is not None:
+                steps.append({"raw": "\n".join(current)})
+            current = [line]
+        elif current is not None:
+            if line and not line.startswith("       ") and not line.startswith("      "):
+                steps.append({"raw": "\n".join(current)})
+                current = None
+            else:
+                current.append(line)
+    if current is not None:
+        steps.append({"raw": "\n".join(current)})
+    for s in steps:
+        m = re.search(r"- name:\s*(.+)", s["raw"])
+        s["name"] = m.group(1).strip() if m else ""
+    return steps
+
+
+def test_a_gate_step_is_not_disarmed_by_an_earlier_failure() -> None:
+    """Every gate step declares `if: always()`.
+
+    **Mutation, 2026-09-16.** This is not hypothetical and it is the reason the
+    test exists. `Verify every declared location` shipped with no `if:`, which
+    means GitHub's default `if: success()`. The step before it -- the digest
+    send -- exits non-zero when `MR_RESEND_API_KEY` is unset, which it was for
+    the whole life of the workflow. Result: **six consecutive nightly runs
+    reported "manifest verify: skipped" and the drift gate had never once
+    run.** Nothing was ever red about the manifest. The manifest was never
+    asked.
+
+    Removing `if: always()` from digest.yml takes this test from passing to
+    failing with "declares no `if:`, so GitHub defaults it to success()".
+    Verified by doing exactly that before committing it.
+
+    Same shape as `--drop-zips` deleting the reference quarter and taking the
+    XBRL drift test from *passing* to *skipped* in one commit: an unrelated
+    change disarms a guard, and a skipped check looks nothing like a failing
+    one in any summary anybody reads.
+    """
+    workflows = sorted((REPO / ".github" / "workflows").glob("*.yml"))
+    assert workflows, "no workflows found; this check would pass vacuously"
+
+    found: dict[str, Path] = {}
+    problems: list[str] = []
+    for path in workflows:
+        for step in _workflow_steps(path.read_text(encoding="utf-8")):
+            if step["name"] not in GATE_STEPS:
+                continue
+            found[step["name"]] = path
+            body = step["raw"]
+            if not re.search(r"^\s+if:\s*always\(\)\s*$", body, re.M):
+                declared = re.search(r"^\s+if:\s*(.+)$", body, re.M)
+                problems.append(
+                    f"{path.name}: step {step['name']!r} "
+                    f"({GATE_STEPS[step['name']]}) "
+                    + (f"declares `if: {declared.group(1).strip()}`"
+                       if declared else
+                       "declares no `if:`, so GitHub defaults it to success()")
+                    + " -- an earlier step failing skips it, which disarms the"
+                      " gate without anything going red"
+                )
+
+    missing = set(GATE_STEPS) - set(found)
+    assert not missing, (
+        f"gate step(s) {sorted(missing)} are named in GATE_STEPS but appear in no "
+        "workflow -- either the step was renamed (update GATE_STEPS) or deleted "
+        "(that is the thing this test exists to notice)")
+    assert not problems, "\n".join(problems)

@@ -88,7 +88,24 @@ jobs:
       # Both are needed because they fail at different times. 35 declared
       # locations held nothing for weeks: the write-time check did not exist,
       # and nothing ran a drift check either. Non-zero exit, so this is a gate.
+      #
+      # `if: always()` because a gate that a *different* step can switch off is
+      # not a gate. Measured 2026-09-16: this step had never run in CI. The
+      # send above exits non-zero when MR_RESEND_API_KEY is unset, the default
+      # `if: success()` skipped this, and six nightly runs reported
+      # "manifest verify: skipped" while the drift check the step exists to
+      # perform went unperformed. Nothing was red about the manifest -- the
+      # manifest was simply never asked.
+      #
+      # Same shape as `--drop-zips` deleting the reference quarter and taking
+      # the XBRL drift test from passing to *skipped* in the same commit: in
+      # both, an unrelated change disarms a guard and the disarming is silent
+      # because a skipped check looks nothing like a failing one.
+      #
+      # This runs on its own credentials and reads nothing the digest wrote, so
+      # there is no ordering reason for it to depend on the send at all.
       - name: Verify every declared location
+        if: always()
         id: manifest
         env:
           MR_R2_ACCOUNT_ID: ${{ secrets.MR_R2_ACCOUNT_ID }}
