@@ -306,6 +306,31 @@ def check_health(
         items.append(
             HealthItem("day-over-day", f"comparing against {prior_day.isoformat()}")
         )
+    # Scheduled jobs. Not a dataset check -- `assert_fresh` already covers
+    # whether the *data* grew, and every item above it is about data. This is
+    # whether the *job* ran, which is a different question and the one this
+    # system kept failing silently: on 2026-09-16 the EDGAR sentinel, Form 4
+    # clustering and the companies refresh had been stopped for eight, seven
+    # and nine days with nothing red anywhere.
+    #
+    # Reported per job rather than as one rolled-up line. A single
+    # "sentinels: ok" would go red for whichever job broke and say nothing
+    # about which, and the thing the reader has to do next depends entirely
+    # on which.
+    try:
+        from marketradar import heartbeat
+
+        for status in heartbeat.check(con):
+            items.append(
+                HealthItem(status.job, status.detail,
+                           ok=status.ok, note=status.note)
+            )
+    except Exception as exc:  # a probe must not stop the digest
+        log.warning("heartbeat check failed: %s", exc)
+        items.append(
+            HealthItem("scheduled jobs", f"unavailable: {exc}"[:80], ok=False)
+        )
+
 
     return Health(items=items)
 
@@ -536,10 +561,15 @@ def _text_lines(digest: Digest) -> Iterator[str]:
     yield ""
 
     yield f"HEALTH  {digest.health.status}"
+    # Width from the longest name present rather than a constant. The job
+    # heartbeats added names up to 21 characters (`sentinels.sec-tickers`) and
+    # the hardcoded 18 ran their detail into the name, which is exactly the
+    # column a reader scans down to find the one marked `!`.
+    width = max((len(i.name) for i in digest.health.items), default=18)
     for item in digest.health.items:
         mark = " " if item.ok else "!"
         note = f"   <- {item.note}" if item.note else ""
-        yield f"  {mark} {item.name:<18} {item.detail}{note}"
+        yield f"  {mark} {item.name:<{width}} {item.detail}{note}"
     yield ""
 
     yield "MACRO"

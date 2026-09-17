@@ -73,6 +73,49 @@ fails rather than skips without node.
 
 ---
 
+### Every scheduled job writes a heartbeat
+
+`job_heartbeat` holds one row per completed run: the job, when, and **how many
+rows it wrote**. The digest health block checks each one against its own
+cadence and says so per job, not as one rolled-up line.
+
+Two things are checked, and the second is the one that matters here.
+
+**Age, against that job's fire times rather than a flat maximum.** A flat
+"daily" would be red every Tuesday: `prices` runs Tue-Sat, so on a Tuesday
+morning the newest sentinels heartbeat is Saturday's, three days old and
+perfectly healthy. The check asks "has it run since it was last due", which a
+max-age cannot express.
+
+**Rows written, because a job that ran and wrote nothing is the failure that
+keeps recurring here.** `mr proxy` printed "3 documents located" and wrote zero
+rows three times; `mr symbols` could not run at all with a green test beside it;
+35 declared Release locations held nothing for weeks. A heartbeat that only said
+"I ran" would have passed all three.
+
+Which makes the choice of *count* the load-bearing decision, and it differs per
+job. `sentinels.form4` records **Form 4s parsed**, not clusters found -- a week
+with no insider cluster is an ordinary week (12 in the sample) and a week with
+no Form 4s is a broken reader. `edgar-poll` records **filings returned**, not
+filings stored: a real poll on 2026-09-16 returned 163 and stored 6, and stores
+0 whenever the previous poll already had them. Each cadence in
+`src/marketradar/heartbeat.py` states its count and why zero means broken, and
+both strings are rendered into the failure, so a red line says what the number
+is and whether zero is normal for it.
+
+**The deck job is the one nothing in CI can see.** It is a Windows scheduled
+task on one laptop; no workflow runs `mr decks` and a test asserts none ever
+will, because a deck is vendor data. So no static check can tell whether the
+task is registered, still registered, or whether the machine was awake at 01:30
+-- and registering it is not proof either: on 2026-09-16 `schtasks` reported
+SUCCESS for a command line that had silently truncated at the space in "Market
+Radar". The only thing that can answer "did the decks get made" is a row the job
+wrote after making them. The same holds in weaker form for the cloud jobs, since
+GitHub disables a public repo's scheduled workflows after 60 days of inactivity
+and no test can observe that either.
+
+---
+
 ## What you run by hand
 
 **The daily one, if any:**
@@ -182,6 +225,8 @@ did its job, and the fix is upstream of the code.
 |---|---|---|
 | **No digest, `prices` red** | Sweep failed mid-market. Partition may be half-written. | Re-run the workflow. It resumes from the checkpoint; it will not re-fetch the first 9,000. |
 | **`StaleDataError`** | Row count or max timestamp missed expectation. | Believe it. Check the source actually published — do not widen the threshold to make it pass. |
+| **A job line reads `STALE`** | That job has not run since it was last due. The note gives the due time. | For `edgar-poll`/`sentinels.*`, check the workflow run list -- and check whether GitHub disabled the cron for 60 days of inactivity. For `decks`, it is `schtasks` on this machine: confirm the task exists, then read `.decks/run.log`. |
+| **A job line reads `ran ... and wrote NOTHING`** | Worse than stale, and the louder of the two. The job fired on time, exited 0, and produced no output -- the shape that has bitten this codebase three times. | Run the command by hand and read what it prints. The note says why zero is not normal for that particular job. |
 | **`mr manifest --verify` non-zero** | A declared location does not resolve. The nightly runs this after publishing, so it catches drift as well as a bad write. | Check the manifest entry against where the file actually is. |
 | **429 from Groq asking for a long `retry-after`** | The **per-day** token cap (200k per model) is spent, not the per-minute one. `x-ratelimit-remaining-tokens` will still read healthy — it is lying. | Stop for the day. A 429 asking for twelve minutes is a closed door, not a queue. |
 | **A provider is down** | The router falls through to the next one. | Nothing, unless the job needed a *specific* model — capability-dependent jobs pin their model, because a weaker model fails as a plausible absence rather than an error. |

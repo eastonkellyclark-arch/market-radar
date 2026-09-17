@@ -22,6 +22,7 @@ from typing import Any, Final
 
 from marketradar.entities.cik import cik_key, cik_sql
 from marketradar.screens import promote
+from marketradar import heartbeat
 from marketradar import __version__
 
 EXIT_OK = 0
@@ -693,6 +694,13 @@ def _cmd_sec_tickers(args: argparse.Namespace) -> int:
           f"(+{stats['companies_inserted']:,})")
     print(f"  tickers   : {stats['tickers_before']:,} -> {stats['tickers_after']:,} "
           f"(+{stats['tickers_inserted']:,})")
+    # Rows upserted, not rows *inserted*. The map barely moves week to week,
+    # so inserted is a handful and legitimately zero; the count that proves
+    # the fetch and the parse both worked is how many rows were written.
+    heartbeat.record("sentinels.sec-tickers", stats["tickers_after"],
+                     detail=f"{stats['companies_after']:,} companies, "
+                            f"+{stats['tickers_inserted']:,} new tickers",
+                     con=con)
     return EXIT_OK
 
 
@@ -2030,6 +2038,11 @@ def _cmd_decks(args: argparse.Namespace) -> int:
             # real answer, and the funnel above says which stage it died at.
             print("mr decks: nothing in today's promoted set has a valuation, so "
                   "no deck is written. The funnel above says where it went.")
+            # Zero decks is a heartbeat, not a missing one. This path is the
+            # exact shape of the failure the table exists for: the job ran,
+            # exited 0, printed a reasonable sentence and produced no file.
+            heartbeat.record("decks", 0,
+                             detail="promoted set had no valuation to draw")
             return EXIT_OK
     elif not wanted:
         print("mr decks: name a --cik, an --archetype, or --promoted for today's "
@@ -2085,6 +2098,13 @@ def _cmd_decks(args: argparse.Namespace) -> int:
           f"({total / 1024 / max(1, len(made)):.0f} KB per deck)")
 
     if args.promoted:
+        # Only `--promoted` is the scheduled run. A hand-typed `--cik` must
+        # not write a heartbeat: it would mark the nightly job healthy on the
+        # strength of somebody opening one deck by hand, which is the
+        # scheduler equivalent of a green test that examines nothing.
+        heartbeat.record("decks", len(made),
+                         detail=f"{len(wanted)} subject(s) had a valuation; "
+                                f"{total / 1024:.0f} KB written")
         freed, dropped = _prune_promoted(Path(args.out) / PROMOTED_DIR,
                                          keep=args.keep_runs)
         if dropped:
@@ -2982,6 +3002,13 @@ def _cmd_deals(args: argparse.Namespace) -> int:
     found = deals.fetch(start, end, read_exhibits=not args.no_exhibits)
     if not found:
         print("no deal candidates in that window")
+        # A zero, not a missing row. Writing nothing here would leave the
+        # digest to notice the *absence* of a heartbeat and call it stale,
+        # which reads as "the job stopped" when what happened is "the job ran
+        # and found nothing". Different facts; the zero check says which.
+        if not args.no_load:
+            heartbeat.record("sentinels.deals", 0,
+                             detail=f"{start} to {end}, nothing matched")
         return EXIT_OK
 
     agree = [d for d in found if d.classifiers_agree]
@@ -3021,6 +3048,8 @@ def _cmd_deals(args: argparse.Namespace) -> int:
     print(f"\nstored: {stats['inserted']} new, "
           f"{stats['candidates'] - stats['inserted']} updated, "
           f"{stats['after']} total")
+    heartbeat.record("sentinels.deals", len(found),
+                     detail=f"{stats['inserted']} new, {len(agree)} agreed")
     return EXIT_OK
 
 
@@ -3076,9 +3105,16 @@ def _cmd_form4(args: argparse.Namespace) -> int:
     if not args.no_load:
         from marketradar import storage
 
-        stats = form4.load(found, con=storage.connect())
+        con = storage.connect()
+        stats = form4.load(found, con=con)
         print(f"\nsignals: {stats['before']:,} -> {stats['after']:,} clusters "
               f"(+{stats['inserted']:,}); stored unfiltered, floors are display")
+        # Documents *parsed*, not clusters found. Five days with no insider
+        # cluster is an ordinary week (12 in the sample); five days with no
+        # Form 4s is a broken reader.
+        heartbeat.record("sentinels.form4", len(filings),
+                         detail=f"{len(found)} clusters, {failed} parse failures",
+                         con=con)
 
     for role, floor in ((form4.INSIDER, args.insider_floor),
                         (form4.TEN_PERCENT, args.tenpct_floor)):
@@ -3140,9 +3176,15 @@ def _cmd_edgar(args: argparse.Namespace) -> int:
         print("\n--no-load: nothing stored")
         return EXIT_OK
 
-    stats = edgar_rss.load(filings, con=storage.connect())
+    con = storage.connect()
+    stats = edgar_rss.load(filings, con=con)
     print(f"\nsignals: {stats['before']:,} -> {stats['after']:,} "
           f"(+{stats['inserted']:,} new)")
+    # Filings *returned*, not filings inserted. A poll finding nothing new is
+    # an ordinary poll -- the one 30 minutes ago already had them -- and a poll
+    # returning nothing at all is a broken reader.
+    heartbeat.record("edgar-poll", len(filings),
+                     detail=f"{stats['inserted']} new into signals", con=con)
     return EXIT_OK
 
 
