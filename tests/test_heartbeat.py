@@ -257,3 +257,35 @@ def test_the_cadences_match_the_crons_the_workflows_actually_declare() -> None:
     assert '- cron: "7 9 * * 0"' in text, "the weekly cron moved"
     weekly = CADENCES["sentinels.sec-tickers"]
     assert weekly.weekdays == frozenset({6}) and weekly.minutes_utc == (9 * 60 + 7,)
+
+
+def test_every_cadence_has_a_record_call_and_every_call_has_a_cadence() -> None:
+    """The two halves must match, and they fail in opposite directions.
+
+    A cadence with no `heartbeat.record` behind it reports "never run" forever
+    -- loud, but a false alarm that trains the reader to ignore the block. A
+    `record` call whose job is not in CADENCES raises at runtime, which is
+    better, but only on the night the job next runs.
+
+    Mutations: delete the `heartbeat.record("decks", len(made), ...)` call from
+    cli.py and this reports decks as declared-but-never-written; add a call with
+    a typo'd name and it reports the reverse.
+    """
+    src = REPO / "src" / "marketradar"
+    called: set[str] = set()
+    for path in sorted(src.rglob("*.py")):
+        if path.name == "heartbeat.py":
+            continue
+        called |= set(re.findall(r'heartbeat\.record\(\s*"([^"]+)"',
+                                 path.read_text(encoding="utf-8")))
+    assert called, "no heartbeat.record calls found in src/; check the regex"
+
+    declared = set(CADENCES)
+    missing_call = declared - called
+    assert not missing_call, (
+        f"declared in CADENCES but nothing writes them: {sorted(missing_call)} -- "
+        "the digest will report these as 'never run' every night, forever")
+    unknown_job = called - declared
+    assert not unknown_job, (
+        f"heartbeat.record called with no cadence: {sorted(unknown_job)} -- "
+        "record() raises on these at runtime, on the night the job next runs")
